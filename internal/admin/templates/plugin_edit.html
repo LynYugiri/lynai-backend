@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 编辑插件</title>
+{{template "layout-css"}}
+</head>
+<body>
+{{template "admin-sidebar" .}}
+<div class="main">
+  {{$p := .Plugin}}
+  <h1 style="margin-bottom: 24px;">编辑插件 {{$p.ID}}</h1>
+  <div class="card">
+    <form method="POST" action="/admin/plugins/{{$p.ID}}/edit">
+      <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
+      <div class="form-group"><label>名称</label><input type="text" name="name" value="{{$p.Name}}" required></div>
+      <div class="form-group"><label>版本</label><input type="text" name="version" value="{{$p.Version}}" required></div>
+      <div class="form-group"><label>分类</label><input type="text" name="category" value="{{$p.Category}}"></div>
+      <div class="form-group"><label>描述</label><textarea name="description" rows="6" required>{{$p.Description}}</textarea></div>
+      <button type="submit" class="btn btn-primary">保存</button>
+      <a href="/admin/plugins/{{$p.ID}}" class="btn btn-secondary">取消</a>
+    </form>
+  </div>
+</div>
+</body>
+</html>

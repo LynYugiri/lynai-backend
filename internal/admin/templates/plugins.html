@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 全部插件</title>
+{{template "layout-css"}}
+</head>
+<body>
+{{template "admin-sidebar" .}}
+<div class="main">
+  <h1 style="margin-bottom: 24px;">全部插件</h1>
+  <div class="card" style="overflow-x:auto;">
+    <table>
+      <thead><tr><th>ID</th><th>名称</th><th>版本</th><th>作者</th><th>状态</th><th>下载量</th><th>提交者</th><th>更新时间</th></tr></thead>
+      <tbody>
+        {{range .Plugins}}
+        <tr>
+          <td>{{.ID}}</td>
+          <td><a href="/admin/plugins/{{.ID}}">{{.Name}}</a></td>
+          <td>v{{.Version}}</td>
+          <td>{{.Author}}</td>
+          <td>{{template "status-badge" .Status}}</td>
+          <td>{{.DownloadCount}}</td>
+          <td>{{.SubmittedBy}}</td>
+          <td>{{.UpdatedAt.Format "2006-01-02 15:04"}}</td>
+        </tr>
+        {{else}}
+        <tr><td colspan="8" class="empty">暂无插件</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>

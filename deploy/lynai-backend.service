@@ -1,0 +1,33 @@
+[Unit]
+Description=LynAI Backend
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=lynai
+WorkingDirectory=/opt/lynai-backend
+ExecStart=/opt/lynai-backend/bin/lynai-backend
+Restart=always
+RestartSec=5
+
+# Required environment variables. Replace CHANGE-ME values on the server before starting.
+Environment="DB_DSN=host=/var/run/postgresql port=5432 user=lynai dbname=lynai sslmode=disable"
+Environment="JWT_SECRET=CHANGE-ME-to-a-random-long-string"
+Environment="ADMIN_PASSWORD=CHANGE-ME-to-a-strong-password"
+
+# Optional environment variables.
+Environment="PORT=8080"
+Environment="STORAGE_DIR=/opt/lynai-backend/storage"
+Environment="ADMIN_PHONE=0000000000"
+Environment="ADMIN_DISPLAY_NAME=管理员"
+Environment="ADMIN_TEMPLATES=/opt/lynai-backend/templates"
+
+# Basic hardening. The service only needs write access to STORAGE_DIR.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/lynai-backend/storage
+
+[Install]
+WantedBy=multi-user.target

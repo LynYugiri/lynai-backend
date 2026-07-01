@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 待审核</title>
+{{template "layout-css"}}
+<style>.reject-form { display: inline; }</style>
+</head>
+<body>
+{{template "admin-sidebar" .}}
+<div class="main">
+  <h1 style="margin-bottom: 24px;">待审核插件</h1>
+  {{if .Error}}<p class="error-msg">{{.Error}}</p>{{end}}
+  {{if not .Plugins}}
+    <div class="card empty">暂无待审核插件</div>
+  {{else}}
+    {{range .Plugins}}
+    <div class="card">
+      <h3><a href="/admin/plugins/{{.ID}}">{{.Name}}</a> <span class="muted" style="font-weight:400;">v{{.Version}}</span></h3>
+      <p class="muted" style="margin:4px 0;">ID: {{.ID}} · 作者: {{.Author}}</p>
+      <p style="margin:8px 0;">{{.Description}}</p>
+      <div class="actions" style="margin-top:16px;">
+        <form method="POST" action="/admin/plugins/{{.ID}}/approve">
+          <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+          <input type="hidden" name="redirect" value="/admin/pending">
+          <button type="submit" class="btn btn-primary">批准上架</button>
+        </form>
+        <button type="button" class="btn btn-danger" onclick="document.getElementById('reject-{{.ID}}').style.display='block'">驳回</button>
+        <div id="reject-{{.ID}}" style="display:none;margin-top:12px;">
+          <form method="POST" action="/admin/plugins/{{.ID}}/reject" class="reject-form">
+            <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+            <input type="hidden" name="redirect" value="/admin/pending">
+            <textarea name="reason" rows="2" placeholder="驳回理由（可选）"></textarea>
+            <div style="margin-top:8px;"><button type="submit" class="btn btn-danger">确认驳回</button></div>
+          </form>
+        </div>
+      </div>
+    </div>
+    {{end}}
+  {{end}}
+</div>
+</body>
+</html>

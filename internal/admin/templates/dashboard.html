@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 概览</title>
+{{template "layout-css"}}
+</head>
+<body>
+{{template "admin-sidebar" .}}
+<div class="main">
+  <h1 style="margin-bottom: 24px;">概览</h1>
+  <div class="stat-grid">
+    <div class="stat-card"><div class="num">{{.PendingCount}}</div><div class="label">待审核插件</div></div>
+    <div class="stat-card"><div class="num">{{.ApprovedCount}}</div><div class="label">已上架插件</div></div>
+    <div class="stat-card"><div class="num">{{.UserCount}}</div><div class="label">注册用户</div></div>
+  </div>
+  <div class="card" style="margin-top: 20px;">
+    <h3 style="margin-bottom: 12px;">快捷操作</h3>
+    <p><a href="/admin/pending">查看待审核插件 ({{.PendingCount}})</a></p>
+    <p><a href="/admin/plugins">管理全部插件</a></p>
+    <p><a href="/admin/users">管理用户与管理员</a></p>
+  </div>
+</div>
+</body>
+</html>

@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 插件详情</title>
+{{template "layout-css"}}
+</head>
+<body>
+{{template "admin-sidebar" .}}
+<div class="main">
+  {{$p := .Plugin}}
+  <h1 style="margin-bottom: 24px;">{{$p.Name}} <span class="muted" style="font-size:20px;">v{{$p.Version}}</span></h1>
+  <div class="card">
+    <p><strong>ID：</strong>{{$p.ID}}</p>
+    <p><strong>作者：</strong>{{$p.Author}}</p>
+    <p><strong>分类：</strong>{{$p.Category}}</p>
+    <p><strong>状态：</strong>{{template "status-badge" $p.Status}}</p>
+    <p><strong>下载量：</strong>{{$p.DownloadCount}}</p>
+    <p><strong>提交者：</strong>{{$p.SubmittedBy}}</p>
+    <p><strong>审核者：</strong>{{if $p.ReviewedBy}}{{$p.ReviewedBy}}{{else}}-{{end}}</p>
+    <p><strong>审核备注：</strong>{{if $p.ReviewNote}}{{$p.ReviewNote}}{{else}}-{{end}}</p>
+    <p><strong>SHA256：</strong>{{if $p.SHA256}}{{$p.SHA256}}{{else}}-{{end}}</p>
+    <p><strong>ZIP：</strong>{{$p.ZipPath}}</p>
+    <p><strong>创建：</strong>{{$p.CreatedAt.Format "2006-01-02 15:04"}} · <strong>更新：</strong>{{$p.UpdatedAt.Format "2006-01-02 15:04"}}</p>
+  </div>
+  <div class="card"><h3 style="margin-bottom:12px;">描述</h3><p>{{$p.Description}}</p></div>
+  <div class="card"><h3 style="margin-bottom:12px;">权限</h3>{{range $p.Permissions}}<span class="badge">{{.Permission}}</span> {{else}}<span class="muted">无</span>{{end}}</div>
+  <div class="card"><h3 style="margin-bottom:12px;">截图</h3>{{range $p.Screenshots}}<p><a href="{{.URL}}">{{.URL}}</a></p>{{else}}<span class="muted">无</span>{{end}}</div>
+  <div class="card actions">
+    <a href="/admin/plugins/{{$p.ID}}/edit" class="btn btn-secondary">编辑</a>
+    {{if eq $p.Status "pending"}}
+    <form method="POST" action="/admin/plugins/{{$p.ID}}/approve"><input type="hidden" name="_csrf" value="{{.CSRFToken}}"><input type="hidden" name="redirect" value="/admin/plugins/{{$p.ID}}"><button class="btn btn-primary">批准上架</button></form>
+    <form method="POST" action="/admin/plugins/{{$p.ID}}/reject"><input type="hidden" name="_csrf" value="{{.CSRFToken}}"><input type="hidden" name="redirect" value="/admin/plugins/{{$p.ID}}"><input type="hidden" name="reason" value="管理员驳回"><button class="btn btn-danger">驳回</button></form>
+    {{end}}
+    {{if eq $p.Status "approved"}}
+    <form method="POST" action="/admin/plugins/{{$p.ID}}/unpublish"><input type="hidden" name="_csrf" value="{{.CSRFToken}}"><button class="btn btn-danger">下架并回到待审核</button></form>
+    {{end}}
+    <form method="POST" action="/admin/plugins/{{$p.ID}}/delete" onsubmit="return confirm('确认删除插件 {{$p.ID}}？');"><input type="hidden" name="_csrf" value="{{.CSRFToken}}"><button class="btn btn-danger">删除</button></form>
+  </div>
+</div>
+</body>
+</html>

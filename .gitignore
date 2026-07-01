@@ -1,0 +1,8 @@
+bin/
+storage/plugins/*
+!storage/plugins/.gitkeep
+*.exe
+*.dll
+*.so
+*.dylib
+.env
