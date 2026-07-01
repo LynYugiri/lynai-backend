@@ -3,6 +3,7 @@ package admin
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"html/template"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"github.com/lynai/backend/internal/auth"
 	"github.com/lynai/backend/internal/database"
 	"github.com/lynai/backend/internal/market"
+	"github.com/lynai/backend/internal/relay"
 	"gorm.io/gorm"
 )
 
@@ -80,6 +82,13 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, jwtMgr *auth.JWTManager) {
 		protected.POST("/plugins/:id/edit", h.EditPlugin)
 		protected.POST("/plugins/:id/unpublish", h.UnpublishPlugin)
 		protected.POST("/plugins/:id/delete", h.DeletePlugin)
+		protected.GET("/relay", h.RelayProviders)
+		protected.GET("/relay/new", h.NewRelayProviderForm)
+		protected.POST("/relay/new", h.CreateRelayProvider)
+		protected.GET("/relay/:id/edit", h.EditRelayProviderForm)
+		protected.POST("/relay/:id/edit", h.UpdateRelayProvider)
+		protected.POST("/relay/:id/toggle", h.ToggleRelayProvider)
+		protected.POST("/relay/:id/delete", h.DeleteRelayProvider)
 	}
 }
 
@@ -311,6 +320,202 @@ func (h *Handler) DeletePlugin(c *gin.Context) {
 	c.Redirect(http.StatusFound, "/admin/plugins")
 }
 
+// --- Relay providers ---
+
+type relayProviderView struct {
+	Provider   database.RelayProvider
+	ModelsText string
+	MaskedKey  string
+}
+
+func (h *Handler) RelayProviders(c *gin.Context) {
+	var providers []database.RelayProvider
+	h.db.Order("updated_at DESC").Find(&providers)
+	views := make([]relayProviderView, 0, len(providers))
+	for _, provider := range providers {
+		views = append(views, relayProviderView{
+			Provider:   provider,
+			ModelsText: relayModelsText(provider.Models),
+			MaskedKey:  maskAPIKey(provider.APIKey),
+		})
+	}
+	h.render(c, "relay.html", h.pageData(c, "relay", map[string]interface{}{"Providers": views, "Error": c.Query("error")}))
+}
+
+func (h *Handler) NewRelayProviderForm(c *gin.Context) {
+	h.render(c, "relay_edit.html", h.pageData(c, "relay", map[string]interface{}{
+		"Title":     "新增中转上游",
+		"Action":    "/admin/relay/new",
+		"APIFormat": "openai",
+		"Enabled":   true,
+		"Error":     c.Query("error"),
+	}))
+}
+
+func (h *Handler) CreateRelayProvider(c *gin.Context) {
+	modelsJSON, err := relayModelsJSON(c.PostForm("models"))
+	if err != nil {
+		h.redirectRelayNewWithError(c, "模型列表格式错误")
+		return
+	}
+	provider := database.RelayProvider{
+		Name:      strings.TrimSpace(c.PostForm("name")),
+		Endpoint:  strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/"),
+		APIKey:    strings.TrimSpace(c.PostForm("apiKey")),
+		APIFormat: normalizeRelayAPIFormat(c.PostForm("apiFormat")),
+		Models:    modelsJSON,
+		Enabled:   c.PostForm("enabled") == "on",
+	}
+	if provider.APIFormat != relay.APIFormatOpenAI {
+		h.redirectRelayNewWithError(c, "当前仅支持 openai API Type")
+		return
+	}
+	if provider.Name == "" || provider.Endpoint == "" || provider.APIKey == "" {
+		h.redirectRelayNewWithError(c, "名称、Endpoint、API Key 必填")
+		return
+	}
+	if err := h.db.Create(&provider).Error; err != nil {
+		h.redirectRelayNewWithError(c, "创建中转上游失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay")
+}
+
+func (h *Handler) EditRelayProviderForm(c *gin.Context) {
+	provider, ok := h.loadRelayProvider(c)
+	if !ok {
+		return
+	}
+	h.render(c, "relay_edit.html", h.pageData(c, "relay", map[string]interface{}{
+		"Title":      "编辑中转上游",
+		"Action":     "/admin/relay/" + c.Param("id") + "/edit",
+		"Provider":   provider,
+		"Name":       provider.Name,
+		"Endpoint":   provider.Endpoint,
+		"APIFormat":  provider.APIFormat,
+		"ModelsText": relayModelsText(provider.Models),
+		"Enabled":    provider.Enabled,
+		"Error":      c.Query("error"),
+	}))
+}
+
+func (h *Handler) UpdateRelayProvider(c *gin.Context) {
+	provider, ok := h.loadRelayProvider(c)
+	if !ok {
+		return
+	}
+	modelsJSON, err := relayModelsJSON(c.PostForm("models"))
+	if err != nil {
+		h.redirectRelayEditWithError(c, "模型列表格式错误")
+		return
+	}
+	provider.Name = strings.TrimSpace(c.PostForm("name"))
+	provider.Endpoint = strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/")
+	provider.APIFormat = normalizeRelayAPIFormat(c.PostForm("apiFormat"))
+	provider.Models = modelsJSON
+	provider.Enabled = c.PostForm("enabled") == "on"
+	if provider.APIFormat != relay.APIFormatOpenAI {
+		h.redirectRelayEditWithError(c, "当前仅支持 openai API Type")
+		return
+	}
+	if key := strings.TrimSpace(c.PostForm("apiKey")); key != "" {
+		provider.APIKey = key
+	}
+	if provider.Name == "" || provider.Endpoint == "" || provider.APIKey == "" {
+		h.redirectRelayEditWithError(c, "名称、Endpoint、API Key 必填")
+		return
+	}
+	if err := h.db.Save(&provider).Error; err != nil {
+		h.redirectRelayEditWithError(c, "保存中转上游失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay")
+}
+
+func (h *Handler) ToggleRelayProvider(c *gin.Context) {
+	provider, ok := h.loadRelayProvider(c)
+	if !ok {
+		return
+	}
+	provider.Enabled = !provider.Enabled
+	if err := h.db.Save(&provider).Error; err != nil {
+		h.redirectRelayWithError(c, "切换中转上游失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay")
+}
+
+func (h *Handler) DeleteRelayProvider(c *gin.Context) {
+	provider, ok := h.loadRelayProvider(c)
+	if !ok {
+		return
+	}
+	if err := h.db.Delete(&provider).Error; err != nil {
+		h.redirectRelayWithError(c, "删除中转上游失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay")
+}
+
+func (h *Handler) loadRelayProvider(c *gin.Context) (database.RelayProvider, bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return database.RelayProvider{}, false
+	}
+	var provider database.RelayProvider
+	if err := h.db.First(&provider, "id = ?", id).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return database.RelayProvider{}, false
+	}
+	return provider, true
+}
+
+func relayModelsJSON(text string) (string, error) {
+	lines := strings.Split(text, "\n")
+	models := make([]string, 0, len(lines))
+	seen := map[string]struct{}{}
+	for _, line := range lines {
+		model := strings.TrimSpace(line)
+		if model == "" {
+			continue
+		}
+		if _, ok := seen[model]; ok {
+			continue
+		}
+		seen[model] = struct{}{}
+		models = append(models, model)
+	}
+	raw, err := json.Marshal(models)
+	return string(raw), err
+}
+
+func relayModelsText(raw string) string {
+	var models []string
+	if err := json.Unmarshal([]byte(raw), &models); err != nil {
+		return ""
+	}
+	return strings.Join(models, "\n")
+}
+
+func normalizeRelayAPIFormat(value string) string {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return relay.APIFormatOpenAI
+	}
+	return value
+}
+
+func maskAPIKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	if len(key) <= 8 {
+		return "••••"
+	}
+	return key[:4] + "••••" + key[len(key)-4:]
+}
+
 // --- Approve ---
 
 func (h *Handler) Approve(c *gin.Context) {
@@ -352,6 +557,18 @@ func (h *Handler) pageData(c *gin.Context, active string, values map[string]inte
 
 func (h *Handler) redirectUsersWithError(c *gin.Context, message string) {
 	c.Redirect(http.StatusFound, "/admin/users?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectRelayWithError(c *gin.Context, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectRelayNewWithError(c *gin.Context, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay/new?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectRelayEditWithError(c *gin.Context, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay/"+c.Param("id")+"/edit?error="+url.QueryEscape(message))
 }
 
 func redirectBack(c *gin.Context, fallback string) string {

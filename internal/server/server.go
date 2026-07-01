@@ -5,6 +5,7 @@ import (
 	"github.com/lynai/backend/internal/admin"
 	"github.com/lynai/backend/internal/auth"
 	"github.com/lynai/backend/internal/market"
+	"github.com/lynai/backend/internal/relay"
 	"github.com/lynai/backend/internal/sync"
 )
 
@@ -14,6 +15,7 @@ func Setup(
 	jwtMgr *auth.JWTManager,
 	marketHandler *market.Handler,
 	syncHandler *sync.Handler,
+	relayHandler *relay.Handler,
 	adminHandler *admin.Handler,
 ) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
@@ -85,6 +87,16 @@ func Setup(
 		syncAuth.GET("/blobs", syncHandler.ListBlobs)
 		syncAuth.POST("/blobs/:sha256", syncHandler.UploadBlob)
 		syncAuth.GET("/blobs/:sha256", syncHandler.DownloadBlob)
+	}
+
+	// --- Relay API (authenticated) ---
+	if relayHandler != nil {
+		relayAuth := r.Group("/relay")
+		relayAuth.Use(auth.AuthMiddleware(jwtMgr))
+		{
+			relayAuth.POST("/chat", relayHandler.Chat)
+			relayAuth.GET("/models", relayHandler.Models)
+		}
 	}
 
 	// --- Admin Web Panel ---

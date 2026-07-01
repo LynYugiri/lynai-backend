@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 中转上游</title>
+{{template "layout-css"}}
+</head>
+<body>
+{{template "admin-sidebar" .}}
+<div class="main">
+  <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:24px;">
+    <h1>中转上游</h1>
+    <a class="btn btn-primary" href="/admin/relay/new">新增上游</a>
+  </div>
+  {{if .Error}}<div class="error-msg">{{.Error}}</div>{{end}}
+  <div class="card" style="overflow-x:auto;">
+    <table>
+      <thead><tr><th>名称</th><th>API Type</th><th>Endpoint</th><th>API Key</th><th>模型</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+      <tbody>
+        {{range .Providers}}
+        {{$p := .Provider}}
+        <tr>
+          <td>{{$p.Name}}</td>
+          <td>{{$p.APIFormat}}</td>
+          <td>{{$p.Endpoint}}</td>
+          <td>{{.MaskedKey}}</td>
+          <td><pre style="white-space:pre-wrap;margin:0;">{{.ModelsText}}</pre></td>
+          <td>{{if $p.Enabled}}<span class="badge badge-approved">启用</span>{{else}}<span class="badge badge-rejected">停用</span>{{end}}</td>
+          <td>{{$p.UpdatedAt.Format "2006-01-02 15:04"}}</td>
+          <td class="actions">
+            <a class="btn btn-sm btn-secondary" href="/admin/relay/{{$p.ID}}/edit">编辑</a>
+            <form method="POST" action="/admin/relay/{{$p.ID}}/toggle">
+              <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+              <button type="submit" class="btn btn-sm btn-secondary">{{if $p.Enabled}}停用{{else}}启用{{end}}</button>
+            </form>
+            <form method="POST" action="/admin/relay/{{$p.ID}}/delete" onsubmit="return confirm('确定删除该中转上游？');">
+              <input type="hidden" name="_csrf" value="{{$.CSRFToken}}">
+              <button type="submit" class="btn btn-sm btn-danger">删除</button>
+            </form>
+          </td>
+        </tr>
+        {{else}}
+        <tr><td colspan="8" class="empty">暂无中转上游</td></tr>
+        {{end}}
+      </tbody>
+    </table>
+  </div>
+</div>
+</body>
+</html>

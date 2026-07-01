@@ -103,6 +103,33 @@ func TestAdminPanelPluginManage(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestAdminPanelRelayProviderManage(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+
+	client := adminClient(t)
+	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
+
+	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
+	csrf := extractCSRF(t, body)
+	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
+		"_csrf":     {csrf},
+		"name":      {"OpenAI Test"},
+		"endpoint":  {"https://api.example.com/v1"},
+		"apiFormat": {"openai"},
+		"apiKey":    {"secret-key"},
+		"models":    {"gpt-test\ngpt-other"},
+		"enabled":   {"on"},
+	})
+	body = getAdminPage(t, client, ts.URL+"/admin/relay")
+	if !strings.Contains(body, "OpenAI Test") || !strings.Contains(body, "gpt-test") || !strings.Contains(body, "openai") {
+		t.Fatal("created relay provider is not visible")
+	}
+	if strings.Contains(body, "secret-key") {
+		t.Fatal("relay provider page leaked api key")
+	}
+}
+
 func adminClient(t *testing.T) *http.Client {
 	t.Helper()
 	jar, err := cookiejar.New(nil)

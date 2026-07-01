@@ -119,6 +119,24 @@ curl -X POST http://localhost:8080/auth/refresh \
   -d '{"refreshToken":"eyJ..."}'
 ```
 
+### LynAI 中转
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| POST | `/relay/chat` | Bearer | 登录用户调用 LynAI 中转；请求体为 OpenAI Chat Completions 兼容 JSON，并包含 `api_type`（如 `openai`）。服务端按 `api_type` 和 `model` 路由到管理员配置的上游，转发前会剥离 `api_type`。支持流式 SSE 透传。 |
+| GET | `/relay/models` | Bearer | 返回可用模型列表，格式为 OpenAI 兼容 `object=list`，每个模型额外包含 `api_type`。 |
+
+上游 Provider 由管理员在 `/admin/relay` 配置，包含名称、Endpoint、API Type、API Key、模型列表和启用状态。当前 MVP 仅实现 OpenAI 兼容上游；计费、额度和协议翻译留待后续上线。
+
+**中转请求示例：**
+
+```bash
+curl -X POST http://localhost:8080/relay/chat \
+  -H "Authorization: Bearer <accessToken>" \
+  -H "Content-Type: application/json" \
+  -d '{"api_type":"openai","model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
 ### 插件市场
 
 | 方法 | 路径 | 鉴权 | 说明 |
@@ -187,6 +205,7 @@ curl -X POST http://localhost:8080/market/updates \
 - 概览页：待审核数、已上架数、注册用户数
 - 待审核页：查看插件详情、批准上架、驳回（可填理由）
 - 全部插件页：查看所有插件，进入详情页后可编辑元数据、下架、删除
+- 中转上游页：配置 LynAI 中转使用的上游 Endpoint、API Type、API Key 和模型列表
 - 用户页：查看用户列表、提升/取消管理员、创建新管理员账号
 
 管理面板用 cookie 认证（HttpOnly，30 天有效期），与 API 的 Bearer token 互相独立。面板 POST 表单使用双层 CSRF token 校验；HTTPS 请求下 cookie 自动启用 Secure 属性。管理员 cookie 在剩余有效期低于 7 天时自动续期。
@@ -202,6 +221,7 @@ internal/
   database/                     # GORM 连接 + 模型定义
   auth/                         # JWT、注册/登录/刷新、中间件
   market/                       # 市场查询、提交、审核、存储
+  relay/                        # 登录用户可用的 LynAI 中转
   admin/                        # Admin Web 面板（HTML 模板）
   server/                       # 路由注册
   testutil/                     # 测试工具（SQLite 内存数据库）

@@ -9,6 +9,7 @@ import (
 	"github.com/lynai/backend/internal/auth"
 	"github.com/lynai/backend/internal/database"
 	"github.com/lynai/backend/internal/market"
+	"github.com/lynai/backend/internal/relay"
 	"github.com/lynai/backend/internal/server"
 	"github.com/lynai/backend/internal/sync"
 	"gorm.io/driver/sqlite"
@@ -72,10 +73,12 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *httpt
 	authSvc := auth.NewService(db, jwtMgr, snowflake)
 	marketSvc := market.NewService(db, storage)
 	syncSvc := sync.NewService(db, blobStorage)
+	relaySvc := relay.NewService(db)
 
 	authHandler := auth.NewHandler(authSvc)
 	marketHandler := market.NewHandler(marketSvc)
 	syncHandler := sync.NewHandler(syncSvc)
+	relayHandler := relay.NewHandler(relaySvc)
 
 	var adminHandler *admin.Handler
 	if withAdminPanel {
@@ -85,7 +88,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *httpt
 		}
 	}
 
-	r := server.Setup(authHandler, jwtMgr, marketHandler, syncHandler, adminHandler)
+	r := server.Setup(authHandler, jwtMgr, marketHandler, syncHandler, relayHandler, adminHandler)
 	ts = httptest.NewServer(r)
 
 	cleanup = func() {

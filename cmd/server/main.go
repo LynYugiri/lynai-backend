@@ -11,6 +11,7 @@ import (
 	"github.com/lynai/backend/internal/config"
 	"github.com/lynai/backend/internal/database"
 	"github.com/lynai/backend/internal/market"
+	"github.com/lynai/backend/internal/relay"
 	"github.com/lynai/backend/internal/server"
 	"github.com/lynai/backend/internal/sync"
 )
@@ -60,11 +61,13 @@ func main() {
 		log.Fatalf("blob storage: %v", err)
 	}
 	syncSvc := sync.NewService(db, blobStorage)
+	relaySvc := relay.NewService(db)
 
 	// Handlers
 	authHandler := auth.NewHandler(authSvc)
 	marketHandler := market.NewHandler(marketSvc)
 	syncHandler := sync.NewHandler(syncSvc)
+	relayHandler := relay.NewHandler(relaySvc)
 
 	// Admin panel
 	templateDir := envOr("ADMIN_TEMPLATES", defaultTemplateDir())
@@ -74,7 +77,7 @@ func main() {
 	}
 
 	// Server
-	r := server.Setup(authHandler, jwtMgr, marketHandler, syncHandler, adminHandler)
+	r := server.Setup(authHandler, jwtMgr, marketHandler, syncHandler, relayHandler, adminHandler)
 
 	addr := ":" + cfg.Port
 	fmt.Printf("LynAI backend listening on %s\n", addr)

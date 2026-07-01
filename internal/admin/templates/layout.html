@@ -30,7 +30,7 @@ th { font-weight: 600; color: #666; font-size: 13px; text-transform: uppercase; 
 .btn-sm { padding: 4px 12px; font-size: 13px; }
 .form-group { margin-bottom: 16px; }
 .form-group label { display: block; margin-bottom: 4px; font-weight: 500; font-size: 14px; }
-.form-group input, .form-group textarea { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 15px; }
+.form-group input, .form-group textarea, .form-group select { width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 15px; }
 textarea { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius: 6px; font-size: 14px; }
 .error, .error-msg { color: #c62828; margin-bottom: 12px; }
 .empty { text-align: center; padding: 40px; color: #888; }
@@ -45,6 +45,7 @@ textarea { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius
   <a href="/admin/" class="{{if eq .Active "dashboard"}}active{{end}}">概览</a>
   <a href="/admin/pending" class="{{if eq .Active "pending"}}active{{end}}">待审核</a>
   <a href="/admin/plugins" class="{{if eq .Active "plugins"}}active{{end}}">全部插件</a>
+  <a href="/admin/relay" class="{{if eq .Active "relay"}}active{{end}}">中转上游</a>
   <a href="/admin/users" class="{{if eq .Active "users"}}active{{end}}">用户</a>
 </div>
 <div class="user-bar">{{.Username}} · <form method="POST" action="/admin/logout" style="display:inline;"><input type="hidden" name="_csrf" value="{{.CSRFToken}}"><button type="submit" style="border:0;background:transparent;color:#1976d2;cursor:pointer;">退出</button></form></div>
