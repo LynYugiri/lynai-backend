@@ -130,6 +130,57 @@ func TestAdminPanelRelayProviderManage(t *testing.T) {
 	}
 }
 
+func TestAdminPanelRelayProviderModelRows(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+
+	client := adminClient(t)
+	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
+
+	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
+	csrf := extractCSRF(t, body)
+	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
+		"_csrf":            {csrf},
+		"name":             {"Rich OpenAI"},
+		"endpoint":         {"https://api.example.com/v1"},
+		"apiFormat":        {"openai"},
+		"apiKey":           {"secret-key"},
+		"modelId":          {"gpt-admin", "whisper-admin"},
+		"displayName":      {"GPT Admin", "Whisper Admin"},
+		"description":      {"chat entry", "speech entry"},
+		"category":         {"chat", "speech"},
+		"maxTokens":        {"4096", ""},
+		"temperature":      {"0.2", ""},
+		"topP":             {"0.9", ""},
+		"presencePenalty":  {"0.1", ""},
+		"frequencyPenalty": {"0.2", ""},
+		"seed":             {"42", ""},
+		"stop":             {"END", ""},
+		"user":             {"local-user", ""},
+		"supportsVision_0": {"on"},
+		"supportsTools_0":  {"on"},
+		"debugSse_0":       {"on"},
+		"modelEnabled_0":   {"on"},
+		"modelEnabled_1":   {"on"},
+		"enabled":          {"on"},
+	})
+
+	body = getAdminPage(t, client, ts.URL+"/admin/relay")
+	if !strings.Contains(body, "Rich OpenAI") || !strings.Contains(body, "gpt-admin (chat)") || !strings.Contains(body, "whisper-admin (speech)") {
+		t.Fatalf("created relay model rows are not visible: %s", body)
+	}
+	match := regexp.MustCompile(`/admin/relay/(\d+)/edit`).FindStringSubmatch(body)
+	if len(match) != 2 {
+		t.Fatal("edit link not found")
+	}
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/"+match[1]+"/edit")
+	for _, want := range []string{"GPT Admin", "Whisper Admin", "value=\"4096\"", "value=\"0.2\"", "value=\"0.9\"", "value=\"42\"", "value=\"END\"", "value=\"local-user\""} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("edit form missing %q", want)
+		}
+	}
+}
+
 func adminClient(t *testing.T) *http.Client {
 	t.Helper()
 	jar, err := cookiejar.New(nil)

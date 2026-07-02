@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"mime/multipart"
 	"net/http"
 	"strings"
 	"time"
@@ -15,11 +17,44 @@ import (
 
 const APIFormatOpenAI = "openai"
 
+const (
+	CategoryChat            = "chat"
+	CategoryOCR             = "ocr"
+	CategorySpeech          = "speech"
+	CategoryImageGeneration = "image_generation"
+)
+
 var (
 	ErrProviderNotFound = errors.New("relay provider not found")
 	ErrUnsupportedType  = errors.New("unsupported relay api type")
 	ErrInvalidModels    = errors.New("invalid relay provider models")
 )
+
+// ModelCapabilities describes optional behavior exposed by a relay model.
+type ModelCapabilities struct {
+	Vision   bool `json:"vision"`
+	Thinking bool `json:"thinking"`
+	Tools    bool `json:"tools"`
+}
+
+// ModelAdvancedParams is the server default for compatible model parameters.
+type ModelAdvancedParams struct {
+	MaxTokens        *int     `json:"maxTokens,omitempty"`
+	Temperature      *float64 `json:"temperature,omitempty"`
+	TopP             *float64 `json:"topP,omitempty"`
+	PresencePenalty  *float64 `json:"presencePenalty,omitempty"`
+	FrequencyPenalty *float64 `json:"frequencyPenalty,omitempty"`
+	Seed             *int     `json:"seed,omitempty"`
+	Stop             *string  `json:"stop,omitempty"`
+	User             *string  `json:"user,omitempty"`
+	DebugSSE         bool     `json:"debugSse,omitempty"`
+}
+
+// ResolvedModel is the upstream provider plus the concrete model metadata.
+type ResolvedModel struct {
+	Provider database.RelayProvider
+	Model    database.RelayModel
+}
 
 // Service resolves relay providers and forwards requests to upstream APIs.
 type Service struct {
@@ -41,12 +76,17 @@ func NewService(db *gorm.DB) *Service {
 // ListEnabled returns all enabled relay providers.
 func (s *Service) ListEnabled() ([]database.RelayProvider, error) {
 	var providers []database.RelayProvider
-	err := s.db.Where("enabled = ?", true).Order("created_at ASC").Find(&providers).Error
+	err := s.db.Preload("Entries", "enabled = ?", true).Where("enabled = ?", true).Order("created_at ASC").Find(&providers).Error
 	return providers, err
 }
 
+// ListConfig returns every enabled provider and enabled model entry for client configuration.
+func (s *Service) ListConfig() ([]database.RelayProvider, error) {
+	return s.ListEnabled()
+}
+
 // Resolve finds an enabled provider matching apiType and model.
-func (s *Service) Resolve(apiType, model string) (*database.RelayProvider, error) {
+func (s *Service) Resolve(apiType, model string) (*ResolvedModel, error) {
 	apiType = normalizeAPIType(apiType)
 	if apiType != APIFormatOpenAI {
 		return nil, ErrUnsupportedType
@@ -56,6 +96,21 @@ func (s *Service) Resolve(apiType, model string) (*database.RelayProvider, error
 		return nil, ErrProviderNotFound
 	}
 
+	var entry database.RelayModel
+	if err := s.db.Joins("JOIN relay_providers ON relay_providers.id = relay_models.provider_id").
+		Where("relay_models.enabled = ? AND relay_models.model_id = ? AND relay_providers.enabled = ? AND relay_providers.api_format = ?", true, model, true, apiType).
+		Order("relay_providers.created_at ASC, relay_models.created_at ASC").
+		First(&entry).Error; err == nil {
+		var provider database.RelayProvider
+		if err := s.db.First(&provider, "id = ?", entry.ProviderID).Error; err != nil {
+			return nil, err
+		}
+		return &ResolvedModel{Provider: provider, Model: entry}, nil
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, err
+	}
+
+	// Legacy fallback for providers that have not been expanded into RelayModel rows yet.
 	var providers []database.RelayProvider
 	if err := s.db.Where("enabled = ? AND api_format = ?", true, apiType).Order("created_at ASC").Find(&providers).Error; err != nil {
 		return nil, err
@@ -67,7 +122,7 @@ func (s *Service) Resolve(apiType, model string) (*database.RelayProvider, error
 		}
 		for _, candidate := range models {
 			if candidate == model {
-				return &providers[i], nil
+				return &ResolvedModel{Provider: providers[i], Model: database.RelayModel{ProviderID: providers[i].ID, ModelID: model, Category: CategoryChat, Enabled: true}}, nil
 			}
 		}
 	}
@@ -84,6 +139,99 @@ func (s *Service) ForwardChat(ctx context.Context, provider *database.RelayProvi
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 	return s.client.Do(req)
+}
+
+// ForwardJSON sends a JSON request to an OpenAI-compatible upstream path.
+func (s *Service) ForwardJSON(ctx context.Context, provider *database.RelayProvider, path string, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+path, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	return s.client.Do(req)
+}
+
+// ForwardMultipart sends multipart data to an OpenAI-compatible upstream path.
+func (s *Service) ForwardMultipart(ctx context.Context, provider *database.RelayProvider, path string, body io.Reader, contentType string) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+path, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	return s.client.Do(req)
+}
+
+func EncodeCapabilities(cap ModelCapabilities) string {
+	raw, _ := json.Marshal(cap)
+	return string(raw)
+}
+
+func DecodeCapabilities(raw string) ModelCapabilities {
+	var cap ModelCapabilities
+	_ = json.Unmarshal([]byte(raw), &cap)
+	return cap
+}
+
+func EncodeAdvancedParams(params ModelAdvancedParams) string {
+	raw, _ := json.Marshal(params)
+	return string(raw)
+}
+
+func DecodeAdvancedParams(raw string) ModelAdvancedParams {
+	var params ModelAdvancedParams
+	_ = json.Unmarshal([]byte(raw), &params)
+	return params
+}
+
+func NormalizeCategory(category string) string {
+	switch strings.ToLower(strings.TrimSpace(category)) {
+	case CategoryOCR:
+		return CategoryOCR
+	case CategorySpeech:
+		return CategorySpeech
+	case CategoryImageGeneration:
+		return CategoryImageGeneration
+	default:
+		return CategoryChat
+	}
+}
+
+func CloneMultipartForm(src *multipart.Form) (*bytes.Buffer, string, error) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	for key, values := range src.Value {
+		for _, value := range values {
+			if err := w.WriteField(key, value); err != nil {
+				return nil, "", err
+			}
+		}
+	}
+	for key, files := range src.File {
+		for _, fileHeader := range files {
+			file, err := fileHeader.Open()
+			if err != nil {
+				return nil, "", err
+			}
+			part, err := w.CreateFormFile(key, fileHeader.Filename)
+			if err != nil {
+				_ = file.Close()
+				return nil, "", err
+			}
+			_, copyErr := io.Copy(part, file)
+			_ = file.Close()
+			if copyErr != nil {
+				return nil, "", copyErr
+			}
+		}
+	}
+	if err := w.Close(); err != nil {
+		return nil, "", err
+	}
+	return &buf, w.FormDataContentType(), nil
 }
 
 // DecodeModels parses the provider model list.

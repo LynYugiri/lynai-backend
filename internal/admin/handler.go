@@ -325,17 +325,43 @@ func (h *Handler) DeletePlugin(c *gin.Context) {
 type relayProviderView struct {
 	Provider   database.RelayProvider
 	ModelsText string
+	ModelCount int
+	Categories string
 	MaskedKey  string
+}
+
+type relayModelFormRow struct {
+	Index            int
+	ModelID          string
+	DisplayName      string
+	Description      string
+	Category         string
+	SupportsVision   bool
+	SupportsThinking bool
+	SupportsTools    bool
+	MaxTokens        string
+	Temperature      string
+	TopP             string
+	PresencePenalty  string
+	FrequencyPenalty string
+	Seed             string
+	Stop             string
+	User             string
+	DebugSSE         bool
+	Enabled          bool
 }
 
 func (h *Handler) RelayProviders(c *gin.Context) {
 	var providers []database.RelayProvider
-	h.db.Order("updated_at DESC").Find(&providers)
+	h.db.Preload("Entries").Order("updated_at DESC").Find(&providers)
 	views := make([]relayProviderView, 0, len(providers))
 	for _, provider := range providers {
+		models, _ := relayModelRowsFromProvider(provider)
 		views = append(views, relayProviderView{
 			Provider:   provider,
-			ModelsText: relayModelsText(provider.Models),
+			ModelsText: relayModelSummary(models),
+			ModelCount: len(models),
+			Categories: relayCategorySummary(models),
 			MaskedKey:  maskAPIKey(provider.APIKey),
 		})
 	}
@@ -348,12 +374,13 @@ func (h *Handler) NewRelayProviderForm(c *gin.Context) {
 		"Action":    "/admin/relay/new",
 		"APIFormat": "openai",
 		"Enabled":   true,
+		"ModelRows": defaultRelayModelRows(nil),
 		"Error":     c.Query("error"),
 	}))
 }
 
 func (h *Handler) CreateRelayProvider(c *gin.Context) {
-	modelsJSON, err := relayModelsJSON(c.PostForm("models"))
+	models, err := parseRelayModelForm(c)
 	if err != nil {
 		h.redirectRelayNewWithError(c, "模型列表格式错误")
 		return
@@ -363,7 +390,6 @@ func (h *Handler) CreateRelayProvider(c *gin.Context) {
 		Endpoint:  strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/"),
 		APIKey:    strings.TrimSpace(c.PostForm("apiKey")),
 		APIFormat: normalizeRelayAPIFormat(c.PostForm("apiFormat")),
-		Models:    modelsJSON,
 		Enabled:   c.PostForm("enabled") == "on",
 	}
 	if provider.APIFormat != relay.APIFormatOpenAI {
@@ -374,7 +400,12 @@ func (h *Handler) CreateRelayProvider(c *gin.Context) {
 		h.redirectRelayNewWithError(c, "名称、Endpoint、API Key 必填")
 		return
 	}
-	if err := h.db.Create(&provider).Error; err != nil {
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		if err := tx.Create(&provider).Error; err != nil {
+			return err
+		}
+		return replaceRelayModelsTx(tx, provider.ID, models)
+	}); err != nil {
 		h.redirectRelayNewWithError(c, "创建中转上游失败")
 		return
 	}
@@ -386,16 +417,17 @@ func (h *Handler) EditRelayProviderForm(c *gin.Context) {
 	if !ok {
 		return
 	}
+	models, _ := relayModelRowsFromProvider(provider)
 	h.render(c, "relay_edit.html", h.pageData(c, "relay", map[string]interface{}{
-		"Title":      "编辑中转上游",
-		"Action":     "/admin/relay/" + c.Param("id") + "/edit",
-		"Provider":   provider,
-		"Name":       provider.Name,
-		"Endpoint":   provider.Endpoint,
-		"APIFormat":  provider.APIFormat,
-		"ModelsText": relayModelsText(provider.Models),
-		"Enabled":    provider.Enabled,
-		"Error":      c.Query("error"),
+		"Title":     "编辑中转上游",
+		"Action":    "/admin/relay/" + c.Param("id") + "/edit",
+		"Provider":  provider,
+		"Name":      provider.Name,
+		"Endpoint":  provider.Endpoint,
+		"APIFormat": provider.APIFormat,
+		"ModelRows": defaultRelayModelRows(models),
+		"Enabled":   provider.Enabled,
+		"Error":     c.Query("error"),
 	}))
 }
 
@@ -404,7 +436,7 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 	if !ok {
 		return
 	}
-	modelsJSON, err := relayModelsJSON(c.PostForm("models"))
+	models, err := parseRelayModelForm(c)
 	if err != nil {
 		h.redirectRelayEditWithError(c, "模型列表格式错误")
 		return
@@ -412,7 +444,6 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 	provider.Name = strings.TrimSpace(c.PostForm("name"))
 	provider.Endpoint = strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/")
 	provider.APIFormat = normalizeRelayAPIFormat(c.PostForm("apiFormat"))
-	provider.Models = modelsJSON
 	provider.Enabled = c.PostForm("enabled") == "on"
 	if provider.APIFormat != relay.APIFormatOpenAI {
 		h.redirectRelayEditWithError(c, "当前仅支持 openai API Type")
@@ -427,6 +458,10 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 	}
 	if err := h.db.Save(&provider).Error; err != nil {
 		h.redirectRelayEditWithError(c, "保存中转上游失败")
+		return
+	}
+	if err := h.replaceRelayModels(provider.ID, models); err != nil {
+		h.redirectRelayEditWithError(c, "保存模型配置失败")
 		return
 	}
 	c.Redirect(http.StatusFound, "/admin/relay")
@@ -464,7 +499,7 @@ func (h *Handler) loadRelayProvider(c *gin.Context) (database.RelayProvider, boo
 		return database.RelayProvider{}, false
 	}
 	var provider database.RelayProvider
-	if err := h.db.First(&provider, "id = ?", id).Error; err != nil {
+	if err := h.db.Preload("Entries").First(&provider, "id = ?", id).Error; err != nil {
 		c.Status(http.StatusNotFound)
 		return database.RelayProvider{}, false
 	}
@@ -496,6 +531,238 @@ func relayModelsText(raw string) string {
 		return ""
 	}
 	return strings.Join(models, "\n")
+}
+
+func relayModelRowsFromProvider(provider database.RelayProvider) ([]relayModelFormRow, error) {
+	if len(provider.Entries) > 0 {
+		rows := make([]relayModelFormRow, 0, len(provider.Entries))
+		for i, entry := range provider.Entries {
+			cap := relay.DecodeCapabilities(entry.Capabilities)
+			params := relay.DecodeAdvancedParams(entry.AdvancedParams)
+			rows = append(rows, relayModelFormRow{
+				Index:            i,
+				ModelID:          entry.ModelID,
+				DisplayName:      entry.DisplayName,
+				Description:      entry.Description,
+				Category:         relay.NormalizeCategory(entry.Category),
+				SupportsVision:   cap.Vision,
+				SupportsThinking: cap.Thinking,
+				SupportsTools:    cap.Tools,
+				MaxTokens:        intPtrString(params.MaxTokens),
+				Temperature:      floatPtrString(params.Temperature),
+				TopP:             floatPtrString(params.TopP),
+				PresencePenalty:  floatPtrString(params.PresencePenalty),
+				FrequencyPenalty: floatPtrString(params.FrequencyPenalty),
+				Seed:             intPtrString(params.Seed),
+				Stop:             stringPtrString(params.Stop),
+				User:             stringPtrString(params.User),
+				DebugSSE:         params.DebugSSE,
+				Enabled:          entry.Enabled,
+			})
+		}
+		return rows, nil
+	}
+	models, err := relay.DecodeModels(provider.Models)
+	if err != nil {
+		return nil, err
+	}
+	rows := make([]relayModelFormRow, 0, len(models))
+	for i, model := range models {
+		rows = append(rows, relayModelFormRow{Index: i, ModelID: model, Category: relay.CategoryChat, Enabled: true})
+	}
+	return rows, nil
+}
+
+func defaultRelayModelRows(rows []relayModelFormRow) []relayModelFormRow {
+	for len(rows) < 6 {
+		rows = append(rows, relayModelFormRow{Index: len(rows), Category: relay.CategoryChat, Enabled: true})
+	}
+	for i := range rows {
+		rows[i].Index = i
+		if rows[i].Category == "" {
+			rows[i].Category = relay.CategoryChat
+		}
+	}
+	return rows
+}
+
+func parseRelayModelForm(c *gin.Context) ([]database.RelayModel, error) {
+	ids := c.PostFormArray("modelId")
+	if len(ids) == 0 && strings.TrimSpace(c.PostForm("models")) != "" {
+		legacy, err := relay.DecodeModels(mustRelayModelsJSON(c.PostForm("models")))
+		if err != nil {
+			return nil, err
+		}
+		models := make([]database.RelayModel, 0, len(legacy))
+		for _, model := range legacy {
+			models = append(models, database.RelayModel{ModelID: model, Category: relay.CategoryChat, Capabilities: relay.EncodeCapabilities(relay.ModelCapabilities{}), AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}), Enabled: true})
+		}
+		return models, nil
+	}
+	models := make([]database.RelayModel, 0, len(ids))
+	seen := map[string]struct{}{}
+	for i, id := range ids {
+		modelID := strings.TrimSpace(id)
+		if modelID == "" {
+			continue
+		}
+		if _, ok := seen[modelID]; ok {
+			continue
+		}
+		seen[modelID] = struct{}{}
+		params, err := parseAdvancedParams(c, i)
+		if err != nil {
+			return nil, err
+		}
+		models = append(models, database.RelayModel{
+			ModelID:        modelID,
+			DisplayName:    indexedPostForm(c, "displayName", i),
+			Description:    indexedPostForm(c, "description", i),
+			Category:       relay.NormalizeCategory(indexedPostForm(c, "category", i)),
+			Capabilities:   relay.EncodeCapabilities(relay.ModelCapabilities{Vision: c.PostForm("supportsVision_"+strconv.Itoa(i)) == "on", Thinking: c.PostForm("supportsThinking_"+strconv.Itoa(i)) == "on", Tools: c.PostForm("supportsTools_"+strconv.Itoa(i)) == "on"}),
+			AdvancedParams: relay.EncodeAdvancedParams(params),
+			Enabled:        c.PostForm("modelEnabled_"+strconv.Itoa(i)) == "on",
+		})
+	}
+	return models, nil
+}
+
+func mustRelayModelsJSON(text string) string {
+	raw, err := relayModelsJSON(text)
+	if err != nil {
+		return "[]"
+	}
+	return raw
+}
+
+func (h *Handler) replaceRelayModels(providerID int64, models []database.RelayModel) error {
+	return h.db.Transaction(func(tx *gorm.DB) error {
+		return replaceRelayModelsTx(tx, providerID, models)
+	})
+}
+
+func replaceRelayModelsTx(tx *gorm.DB, providerID int64, models []database.RelayModel) error {
+	if err := tx.Where("provider_id = ?", providerID).Delete(&database.RelayModel{}).Error; err != nil {
+		return err
+	}
+	for i := range models {
+		models[i].ProviderID = providerID
+		if err := tx.Create(&models[i]).Error; err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func parseAdvancedParams(c *gin.Context, i int) (relay.ModelAdvancedParams, error) {
+	var params relay.ModelAdvancedParams
+	if v := strings.TrimSpace(indexedPostForm(c, "maxTokens", i)); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return params, err
+		}
+		params.MaxTokens = &parsed
+	}
+	if v, err := parseOptionalFloat(indexedPostForm(c, "temperature", i)); err != nil {
+		return params, err
+	} else {
+		params.Temperature = v
+	}
+	if v, err := parseOptionalFloat(indexedPostForm(c, "topP", i)); err != nil {
+		return params, err
+	} else {
+		params.TopP = v
+	}
+	if v, err := parseOptionalFloat(indexedPostForm(c, "presencePenalty", i)); err != nil {
+		return params, err
+	} else {
+		params.PresencePenalty = v
+	}
+	if v, err := parseOptionalFloat(indexedPostForm(c, "frequencyPenalty", i)); err != nil {
+		return params, err
+	} else {
+		params.FrequencyPenalty = v
+	}
+	if v := strings.TrimSpace(indexedPostForm(c, "seed", i)); v != "" {
+		parsed, err := strconv.Atoi(v)
+		if err != nil {
+			return params, err
+		}
+		params.Seed = &parsed
+	}
+	if v := strings.TrimSpace(indexedPostForm(c, "stop", i)); v != "" {
+		params.Stop = &v
+	}
+	if v := strings.TrimSpace(indexedPostForm(c, "user", i)); v != "" {
+		params.User = &v
+	}
+	params.DebugSSE = c.PostForm("debugSse_"+strconv.Itoa(i)) == "on"
+	return params, nil
+}
+
+func indexedPostForm(c *gin.Context, key string, i int) string {
+	values := c.PostFormArray(key)
+	if i < 0 || i >= len(values) {
+		return ""
+	}
+	return strings.TrimSpace(values[i])
+}
+
+func parseOptionalFloat(raw string) (*float64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	parsed, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return nil, err
+	}
+	return &parsed, nil
+}
+
+func intPtrString(v *int) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.Itoa(*v)
+}
+
+func floatPtrString(v *float64) string {
+	if v == nil {
+		return ""
+	}
+	return strconv.FormatFloat(*v, 'f', -1, 64)
+}
+
+func stringPtrString(v *string) string {
+	if v == nil {
+		return ""
+	}
+	return *v
+}
+
+func relayModelSummary(rows []relayModelFormRow) string {
+	parts := make([]string, 0, len(rows))
+	for _, row := range rows {
+		if row.ModelID != "" {
+			parts = append(parts, row.ModelID+" ("+row.Category+")")
+		}
+	}
+	return strings.Join(parts, "\n")
+}
+
+func relayCategorySummary(rows []relayModelFormRow) string {
+	seen := map[string]struct{}{}
+	categories := make([]string, 0, 4)
+	for _, row := range rows {
+		category := relay.NormalizeCategory(row.Category)
+		if _, ok := seen[category]; ok {
+			continue
+		}
+		seen[category] = struct{}{}
+		categories = append(categories, category)
+	}
+	return strings.Join(categories, ", ")
 }
 
 func normalizeRelayAPIFormat(value string) string {

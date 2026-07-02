@@ -22,7 +22,45 @@
         </select>
       </div>
       <div class="form-group"><label>API Key {{if .Provider}}<span class="muted">（留空表示不修改）</span>{{end}}</label><input type="password" name="apiKey" {{if not .Provider}}required{{end}} autocomplete="off"></div>
-      <div class="form-group"><label>模型列表 <span class="muted">（每行一个模型 ID）</span></label><textarea name="models" rows="8">{{.ModelsText}}</textarea></div>
+      <div class="form-group">
+        <label>模型配置 <span class="muted">（留空的模型 ID 行会被忽略；云端启用后会同步到用户端并默认启用）</span></label>
+        <div style="display:flex;flex-direction:column;gap:16px;">
+          {{range .ModelRows}}
+          <div style="border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fafafa;">
+            <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr auto;gap:10px;align-items:end;">
+              <div><label>模型 ID</label><input type="text" name="modelId" value="{{.ModelID}}" placeholder="gpt-4o"></div>
+              <div><label>显示名称</label><input type="text" name="displayName" value="{{.DisplayName}}" placeholder="可选"></div>
+              <div><label>分类</label>
+                <select name="category">
+                  <option value="chat" {{if eq .Category "chat"}}selected{{end}}>Chat</option>
+                  <option value="ocr" {{if eq .Category "ocr"}}selected{{end}}>OCR</option>
+                  <option value="speech" {{if eq .Category "speech"}}selected{{end}}>语音转文字</option>
+                  <option value="image_generation" {{if eq .Category "image_generation"}}selected{{end}}>图片生成</option>
+                </select>
+              </div>
+              <label style="white-space:nowrap;"><input type="checkbox" name="modelEnabled_{{.Index}}" {{if .Enabled}}checked{{end}} style="width:auto;"> 启用</label>
+            </div>
+            <div style="margin-top:10px;"><label>描述</label><input type="text" name="description" value="{{.Description}}" placeholder="可选"></div>
+            <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;">
+              <label><input type="checkbox" name="supportsVision_{{.Index}}" {{if .SupportsVision}}checked{{end}} style="width:auto;"> 视觉</label>
+              <label><input type="checkbox" name="supportsThinking_{{.Index}}" {{if .SupportsThinking}}checked{{end}} style="width:auto;"> 思考</label>
+              <label><input type="checkbox" name="supportsTools_{{.Index}}" {{if .SupportsTools}}checked{{end}} style="width:auto;"> 工具使用</label>
+              <label><input type="checkbox" name="debugSse_{{.Index}}" {{if .DebugSSE}}checked{{end}} style="width:auto;"> SSE 调试日志</label>
+            </div>
+            <div style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:10px;">
+              <div><label>Max Tokens</label><input type="number" name="maxTokens" value="{{.MaxTokens}}" min="1"></div>
+              <div><label>Temperature</label><input type="number" name="temperature" value="{{.Temperature}}" step="0.01"></div>
+              <div><label>Top P</label><input type="number" name="topP" value="{{.TopP}}" step="0.01"></div>
+              <div><label>Seed</label><input type="number" name="seed" value="{{.Seed}}"></div>
+              <div><label>Presence Penalty</label><input type="number" name="presencePenalty" value="{{.PresencePenalty}}" step="0.01"></div>
+              <div><label>Frequency Penalty</label><input type="number" name="frequencyPenalty" value="{{.FrequencyPenalty}}" step="0.01"></div>
+              <div><label>Stop</label><input type="text" name="stop" value="{{.Stop}}"></div>
+              <div><label>User</label><input type="text" name="user" value="{{.User}}"></div>
+            </div>
+          </div>
+          {{end}}
+        </div>
+      </div>
       <div class="form-group"><label><input type="checkbox" name="enabled" {{if .Enabled}}checked{{end}} style="width:auto;"> 启用</label></div>
       <button type="submit" class="btn btn-primary">保存</button>
       <a href="/admin/relay" class="btn btn-secondary">取消</a>

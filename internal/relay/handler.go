@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/lynai/backend/internal/database"
 )
 
 const maxRelayBodyBytes = 8 << 20
@@ -37,7 +38,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		return
 	}
 
-	provider, err := h.svc.Resolve(apiType, model)
+	resolved, err := h.svc.Resolve(apiType, model)
 	if err != nil {
 		if errors.Is(err, ErrUnsupportedType) {
 			writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "unsupported api_type")
@@ -51,7 +52,12 @@ func (h *Handler) Chat(c *gin.Context) {
 		return
 	}
 
-	resp, err := h.svc.ForwardChat(c.Request.Context(), provider, forwardBody)
+	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
+		return
+	}
+
+	resp, err := h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, forwardBody)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
@@ -71,7 +77,77 @@ func (h *Handler) Chat(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
-// Models returns enabled relay models in an OpenAI-compatible list with api_type metadata.
+// Transcribe forwards an OpenAI-compatible audio transcription request.
+func (h *Handler) Transcribe(c *gin.Context) {
+	if err := c.Request.ParseMultipartForm(maxRelayBodyBytes); err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
+		return
+	}
+	model := strings.TrimSpace(c.Request.FormValue("model"))
+	apiType := normalizeAPIType(c.Request.FormValue("api_type"))
+	if model == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+		return
+	}
+	resolved, err := h.svc.Resolve(apiType, model)
+	if err != nil {
+		h.writeResolveError(c, err)
+		return
+	}
+	if resolved.Model.Category != CategorySpeech {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a speech-to-text model")
+		return
+	}
+	delete(c.Request.MultipartForm.Value, "api_type")
+	body, contentType, err := CloneMultipartForm(c.Request.MultipartForm)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to prepare multipart request")
+		return
+	}
+	resp, err := h.svc.ForwardMultipart(c.Request.Context(), &resolved.Provider, "/audio/transcriptions", body, contentType)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	copyResponseHeaders(c, resp.Header)
+	c.Status(resp.StatusCode)
+	_, _ = io.Copy(c.Writer, resp.Body)
+}
+
+// ImageGenerations forwards an OpenAI-compatible image generation request.
+func (h *Handler) ImageGenerations(c *gin.Context) {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxRelayBodyBytes))
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
+		return
+	}
+	forwardBody, apiType, model, _, err := prepareForwardBody(body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	resolved, err := h.svc.Resolve(apiType, model)
+	if err != nil {
+		h.writeResolveError(c, err)
+		return
+	}
+	if resolved.Model.Category != CategoryImageGeneration {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not an image generation model")
+		return
+	}
+	resp, err := h.svc.ForwardJSON(c.Request.Context(), &resolved.Provider, "/images/generations", forwardBody)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	copyResponseHeaders(c, resp.Header)
+	c.Status(resp.StatusCode)
+	_, _ = io.Copy(c.Writer, resp.Body)
+}
+
+// Models returns enabled relay models in an OpenAI-compatible list with LynAI metadata.
 func (h *Handler) Models(c *gin.Context) {
 	providers, err := h.svc.ListEnabled()
 	if err != nil {
@@ -85,25 +161,60 @@ func (h *Handler) Models(c *gin.Context) {
 		if apiType != APIFormatOpenAI {
 			continue
 		}
-		models, err := DecodeModels(provider.Models)
-		if err != nil {
-			writeOpenAIError(c, http.StatusInternalServerError, "server_error", "invalid relay provider model list")
-			return
+		entries := provider.Entries
+		if len(entries) == 0 {
+			legacy, err := legacyEntries(provider)
+			if err != nil {
+				writeOpenAIError(c, http.StatusInternalServerError, "server_error", "invalid relay provider model list")
+				return
+			}
+			entries = legacy
 		}
-		for _, model := range models {
-			key := apiType + "\x00" + model
+		for _, entry := range entries {
+			key := apiType + "\x00" + entry.ModelID
 			if _, ok := seen[key]; ok {
 				continue
 			}
 			seen[key] = struct{}{}
-			data = append(data, gin.H{
-				"id":       model,
-				"object":   "model",
-				"api_type": apiType,
-			})
+			data = append(data, modelPayload(provider, entry))
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
+}
+
+// Config returns the full enabled relay configuration for managed frontend providers.
+func (h *Handler) Config(c *gin.Context) {
+	providers, err := h.svc.ListConfig()
+	if err != nil {
+		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to list relay config")
+		return
+	}
+	data := make([]gin.H, 0, len(providers))
+	for _, provider := range providers {
+		entries := provider.Entries
+		if len(entries) == 0 {
+			legacy, err := legacyEntries(provider)
+			if err != nil {
+				writeOpenAIError(c, http.StatusInternalServerError, "server_error", "invalid relay provider model list")
+				return
+			}
+			entries = legacy
+		}
+		models := make([]gin.H, 0, len(entries))
+		for _, entry := range entries {
+			models = append(models, modelPayload(provider, entry))
+		}
+		data = append(data, gin.H{
+			"id":        fmt.Sprintf("%d", provider.ID),
+			"name":      provider.Name,
+			"endpoint":  provider.Endpoint,
+			"apiType":   normalizeAPIType(provider.APIFormat),
+			"enabled":   provider.Enabled,
+			"models":    models,
+			"updatedAt": provider.UpdatedAt,
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"object": "relay_config", "data": data})
 }
 
 func prepareForwardBody(raw []byte) ([]byte, string, string, bool, error) {
@@ -129,6 +240,46 @@ func prepareForwardBody(raw []byte) ([]byte, string, string, bool, error) {
 
 func writeOpenAIError(c *gin.Context, status int, typ, message string) {
 	c.JSON(status, gin.H{"error": gin.H{"message": message, "type": typ}})
+}
+
+func (h *Handler) writeResolveError(c *gin.Context, err error) {
+	if errors.Is(err, ErrUnsupportedType) {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "unsupported api_type")
+		return
+	}
+	if errors.Is(err, ErrProviderNotFound) {
+		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "no relay provider is configured for the requested api_type and model")
+		return
+	}
+	writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to resolve relay provider")
+}
+
+func modelPayload(provider database.RelayProvider, entry database.RelayModel) gin.H {
+	return gin.H{
+		"id":             entry.ModelID,
+		"object":         "model",
+		"api_type":       normalizeAPIType(provider.APIFormat),
+		"category":       NormalizeCategory(entry.Category),
+		"displayName":    entry.DisplayName,
+		"description":    entry.Description,
+		"capabilities":   DecodeCapabilities(entry.Capabilities),
+		"advancedParams": DecodeAdvancedParams(entry.AdvancedParams),
+		"enabled":        entry.Enabled && provider.Enabled,
+		"providerId":     fmt.Sprintf("%d", provider.ID),
+		"providerName":   provider.Name,
+	}
+}
+
+func legacyEntries(provider database.RelayProvider) ([]database.RelayModel, error) {
+	models, err := DecodeModels(provider.Models)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]database.RelayModel, 0, len(models))
+	for _, model := range models {
+		entries = append(entries, database.RelayModel{ProviderID: provider.ID, ModelID: model, Category: CategoryChat, Enabled: true})
+	}
+	return entries, nil
 }
 
 func copyResponseHeaders(c *gin.Context, headers http.Header) {

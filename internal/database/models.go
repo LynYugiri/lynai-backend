@@ -96,15 +96,32 @@ type SyncBlob struct {
 
 // RelayProvider stores an admin-managed upstream provider for LynAI relay.
 type RelayProvider struct {
-	ID        int64     `gorm:"primaryKey" json:"id,string"`
-	Name      string    `gorm:"not null" json:"name"`
-	Endpoint  string    `gorm:"not null" json:"endpoint"`
-	APIKey    string    `gorm:"not null" json:"-"`
-	APIFormat string    `gorm:"not null;index" json:"apiFormat"`
-	Models    string    `gorm:"type:text" json:"models"`
-	Enabled   bool      `gorm:"default:true;index" json:"enabled"`
-	CreatedAt time.Time `json:"createdAt"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	ID        int64  `gorm:"primaryKey" json:"id,string"`
+	Name      string `gorm:"not null" json:"name"`
+	Endpoint  string `gorm:"not null" json:"endpoint"`
+	APIKey    string `gorm:"not null" json:"-"`
+	APIFormat string `gorm:"not null;index" json:"apiFormat"`
+	// Models is kept only for migrating legacy newline/JSON model lists into RelayModel rows.
+	Models    string       `gorm:"type:text" json:"-"`
+	Enabled   bool         `gorm:"default:true;index" json:"enabled"`
+	Entries   []RelayModel `gorm:"foreignKey:ProviderID;constraint:OnDelete:CASCADE" json:"entries"`
+	CreatedAt time.Time    `json:"createdAt"`
+	UpdatedAt time.Time    `json:"updatedAt"`
+}
+
+// RelayModel is one admin-managed model exposed to clients by the relay.
+type RelayModel struct {
+	ID             int64     `gorm:"primaryKey;autoIncrement" json:"id,string"`
+	ProviderID     int64     `gorm:"not null;index:idx_relay_model_provider_name,unique" json:"providerId,string"`
+	ModelID        string    `gorm:"not null;index:idx_relay_model_provider_name,unique" json:"modelId"`
+	DisplayName    string    `json:"displayName"`
+	Description    string    `gorm:"type:text" json:"description"`
+	Category       string    `gorm:"not null;default:chat;index" json:"category"`
+	Capabilities   string    `gorm:"type:text" json:"capabilities"`
+	AdvancedParams string    `gorm:"type:text" json:"advancedParams"`
+	Enabled        bool      `gorm:"default:true;index" json:"enabled"`
+	CreatedAt      time.Time `json:"createdAt"`
+	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
 // AllModels returns every model that should be auto-migrated.
@@ -118,6 +135,7 @@ func AllModels() []interface{} {
 		&SyncChange{},
 		&SyncBlob{},
 		&RelayProvider{},
+		&RelayModel{},
 	}
 }
 

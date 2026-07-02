@@ -16,13 +16,14 @@
   {{if .Error}}<div class="error-msg">{{.Error}}</div>{{end}}
   <div class="card" style="overflow-x:auto;">
     <table>
-      <thead><tr><th>名称</th><th>API Type</th><th>Endpoint</th><th>API Key</th><th>模型</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
+      <thead><tr><th>名称</th><th>API Type</th><th>分类</th><th>Endpoint</th><th>API Key</th><th>模型</th><th>状态</th><th>更新时间</th><th>操作</th></tr></thead>
       <tbody>
         {{range .Providers}}
         {{$p := .Provider}}
         <tr>
           <td>{{$p.Name}}</td>
           <td>{{$p.APIFormat}}</td>
+          <td>{{.Categories}}</td>
           <td>{{$p.Endpoint}}</td>
           <td>{{.MaskedKey}}</td>
           <td><pre style="white-space:pre-wrap;margin:0;">{{.ModelsText}}</pre></td>
@@ -41,7 +42,7 @@
           </td>
         </tr>
         {{else}}
-        <tr><td colspan="8" class="empty">暂无中转上游</td></tr>
+        <tr><td colspan="9" class="empty">暂无中转上游</td></tr>
         {{end}}
       </tbody>
     </table>

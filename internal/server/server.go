@@ -95,7 +95,10 @@ func Setup(
 		relayAuth.Use(auth.AuthMiddleware(jwtMgr))
 		{
 			relayAuth.POST("/chat", relayHandler.Chat)
+			relayAuth.POST("/transcribe", relayHandler.Transcribe)
+			relayAuth.POST("/images/generations", relayHandler.ImageGenerations)
 			relayAuth.GET("/models", relayHandler.Models)
+			relayAuth.GET("/config", relayHandler.Config)
 		}
 	}
 
