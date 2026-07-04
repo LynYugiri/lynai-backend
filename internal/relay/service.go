@@ -8,6 +8,8 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,7 +17,16 @@ import (
 	"gorm.io/gorm"
 )
 
-const APIFormatOpenAI = "openai"
+const (
+	APIFormatOpenAI       = "openai"
+	APIFormatAnthropic    = "anthropic"
+	APIFormatOllama       = "ollama"
+	APIFormatOpenAIImage  = "openai_image"
+	APIFormatVivoImage    = "vivo_image"
+	APIFormatOpenAISpeech = "openai_speech"
+	APIFormatVivoLASR     = "vivo_lasr"
+	APIFormatVivoOCR      = "vivo_ocr"
+)
 
 const (
 	CategoryChat            = "chat"
@@ -29,6 +40,23 @@ var (
 	ErrUnsupportedType  = errors.New("unsupported relay api type")
 	ErrInvalidModels    = errors.New("invalid relay provider models")
 )
+
+var supportedAPIFormats = map[string]struct{}{
+	APIFormatOpenAI:       {},
+	APIFormatAnthropic:    {},
+	APIFormatOllama:       {},
+	APIFormatOpenAIImage:  {},
+	APIFormatVivoImage:    {},
+	APIFormatOpenAISpeech: {},
+	APIFormatVivoLASR:     {},
+	APIFormatVivoOCR:      {},
+}
+
+// IsSupportedAPIFormat reports whether apiType can be managed by the relay.
+func IsSupportedAPIFormat(apiType string) bool {
+	_, ok := supportedAPIFormats[normalizeAPIType(apiType)]
+	return ok
+}
 
 // ModelCapabilities describes optional behavior exposed by a relay model.
 type ModelCapabilities struct {
@@ -88,7 +116,7 @@ func (s *Service) ListConfig() ([]database.RelayProvider, error) {
 // Resolve finds an enabled provider matching apiType and model.
 func (s *Service) Resolve(apiType, model string) (*ResolvedModel, error) {
 	apiType = normalizeAPIType(apiType)
-	if apiType != APIFormatOpenAI {
+	if !IsSupportedAPIFormat(apiType) {
 		return nil, ErrUnsupportedType
 	}
 	model = strings.TrimSpace(model)
@@ -139,6 +167,113 @@ func (s *Service) ForwardChat(ctx context.Context, provider *database.RelayProvi
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
 	return s.client.Do(req)
+}
+
+// ForwardAnthropicMessages sends an Anthropic Messages request to upstream.
+func (s *Service) ForwardAnthropicMessages(ctx context.Context, provider *database.RelayProvider, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/messages", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("x-api-key", provider.APIKey)
+	req.Header.Set("anthropic-version", "2023-06-01")
+	return s.client.Do(req)
+}
+
+// ForwardOllamaChat sends an Ollama chat request to upstream.
+func (s *Service) ForwardOllamaChat(ctx context.Context, provider *database.RelayProvider, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/api/chat", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	return s.client.Do(req)
+}
+
+// ForwardVivoImage sends a vivo image-generation request to upstream.
+func (s *Service) ForwardVivoImage(ctx context.Context, provider *database.RelayProvider, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, err
+	}
+	query := u.Query()
+	query.Set("module", "aigc")
+	now := time.Now()
+	query.Set("request_id", strconv.FormatInt(now.UnixNano(), 10))
+	query.Set("system_time", strconv.FormatInt(now.Unix(), 10))
+	u.RawQuery = query.Encode()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	return s.client.Do(req)
+}
+
+// ForwardVivoJSON sends a JSON request to a vivo-style upstream path with query parameters.
+func (s *Service) ForwardVivoJSON(ctx context.Context, provider *database.RelayProvider, path string, query url.Values, body []byte) (*http.Response, error) {
+	u, err := vivoURL(provider.Endpoint, path, query)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	return s.client.Do(req)
+}
+
+// ForwardVivoMultipart sends multipart data to a vivo-style upstream path.
+func (s *Service) ForwardVivoMultipart(ctx context.Context, provider *database.RelayProvider, path string, query url.Values, body io.Reader, contentType string) (*http.Response, error) {
+	u, err := vivoURL(provider.Endpoint, path, query)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, body)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	return s.client.Do(req)
+}
+
+// ForwardVivoForm sends form data to a vivo-style upstream path.
+func (s *Service) ForwardVivoForm(ctx context.Context, provider *database.RelayProvider, path string, query url.Values, form url.Values) (*http.Response, error) {
+	u, err := vivoURL(provider.Endpoint, path, query)
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	return s.client.Do(req)
+}
+
+func vivoURL(endpoint, path string, query url.Values) (string, error) {
+	base := strings.TrimRight(strings.TrimSpace(endpoint), "/")
+	u, err := url.Parse(base + path)
+	if err != nil {
+		return "", err
+	}
+	q := u.Query()
+	for key, values := range query {
+		for _, value := range values {
+			q.Add(key, value)
+		}
+	}
+	u.RawQuery = q.Encode()
+	return u.String(), nil
 }
 
 // ForwardJSON sends a JSON request to an OpenAI-compatible upstream path.

@@ -392,10 +392,6 @@ func (h *Handler) CreateRelayProvider(c *gin.Context) {
 		APIFormat: normalizeRelayAPIFormat(c.PostForm("apiFormat")),
 		Enabled:   c.PostForm("enabled") == "on",
 	}
-	if provider.APIFormat != relay.APIFormatOpenAI {
-		h.redirectRelayNewWithError(c, "当前仅支持 openai API Type")
-		return
-	}
 	if provider.Name == "" || provider.Endpoint == "" || provider.APIKey == "" {
 		h.redirectRelayNewWithError(c, "名称、Endpoint、API Key 必填")
 		return
@@ -445,10 +441,6 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 	provider.Endpoint = strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/")
 	provider.APIFormat = normalizeRelayAPIFormat(c.PostForm("apiFormat"))
 	provider.Enabled = c.PostForm("enabled") == "on"
-	if provider.APIFormat != relay.APIFormatOpenAI {
-		h.redirectRelayEditWithError(c, "当前仅支持 openai API Type")
-		return
-	}
 	if key := strings.TrimSpace(c.PostForm("apiKey")); key != "" {
 		provider.APIKey = key
 	}
@@ -574,9 +566,7 @@ func relayModelRowsFromProvider(provider database.RelayProvider) ([]relayModelFo
 }
 
 func defaultRelayModelRows(rows []relayModelFormRow) []relayModelFormRow {
-	for len(rows) < 6 {
-		rows = append(rows, relayModelFormRow{Index: len(rows), Category: relay.CategoryChat, Enabled: true})
-	}
+	rows = append(rows, relayModelFormRow{Index: len(rows), Category: relay.CategoryChat, Enabled: true})
 	for i := range rows {
 		rows[i].Index = i
 		if rows[i].Category == "" {
@@ -768,6 +758,9 @@ func relayCategorySummary(rows []relayModelFormRow) string {
 func normalizeRelayAPIFormat(value string) string {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
+		return relay.APIFormatOpenAI
+	}
+	if !relay.IsSupportedAPIFormat(value) {
 		return relay.APIFormatOpenAI
 	}
 	return value

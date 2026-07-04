@@ -61,7 +61,10 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*httptest.Server, 
 	g := r.Group("/relay")
 	g.Use(auth.AuthMiddleware(jwtMgr))
 	g.POST("/chat", handler.Chat)
+	g.POST("/messages", handler.Messages)
+	g.POST("/api/chat", handler.OllamaChat)
 	g.POST("/transcribe", handler.Transcribe)
+	g.POST("/ocr", handler.OCR)
 	g.POST("/images/generations", handler.ImageGenerations)
 	g.GET("/models", handler.Models)
 	g.GET("/config", handler.Config)
@@ -222,7 +225,7 @@ func TestChatRejectsUnsupportedAPIType(t *testing.T) {
 		t.Fatal("upstream should not be called")
 	})
 
-	body := []byte(`{"model":"gpt-test","api_type":"anthropic","messages":[{"role":"user","content":"ping"}]}`)
+	body := []byte(`{"model":"gpt-test","api_type":"unsupported","messages":[{"role":"user","content":"ping"}]}`)
 	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/chat", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
@@ -234,6 +237,71 @@ func TestChatRejectsUnsupportedAPIType(t *testing.T) {
 	if resp.StatusCode != http.StatusBadRequest {
 		raw, _ := io.ReadAll(resp.Body)
 		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestMessagesForwardsAnthropic(t *testing.T) {
+	var seenKey, seenVersion string
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/messages" {
+			t.Fatalf("upstream path = %s, want /messages", r.URL.Path)
+		}
+		seenKey = r.Header.Get("x-api-key")
+		seenVersion = r.Header.Get("anthropic-version")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"pong"}]}`))
+	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("api_format", relay.APIFormatAnthropic).Error; err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"ping"}]}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/messages", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("messages: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	if seenKey != "upstream-secret" || seenVersion == "" {
+		t.Fatalf("anthropic headers = %q/%q", seenKey, seenVersion)
+	}
+}
+
+func TestOllamaChatForwards(t *testing.T) {
+	var seenAuth string
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/chat" {
+			t.Fatalf("upstream path = %s, want /api/chat", r.URL.Path)
+		}
+		seenAuth = r.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"message":{"content":"pong"},"done":true}`))
+	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("api_format", relay.APIFormatOllama).Error; err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"ping"}],"stream":false}`)
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/api/chat", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("ollama: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	if seenAuth != "" {
+		t.Fatalf("ollama auth = %q, want empty", seenAuth)
 	}
 }
 

@@ -12,21 +12,28 @@
   <h1 style="margin-bottom: 24px;">{{.Title}}</h1>
   {{if .Error}}<div class="error-msg">{{.Error}}</div>{{end}}
   <div class="card">
-    <form method="POST" action="{{.Action}}">
+    <form id="relayForm" method="POST" action="{{.Action}}">
       <input type="hidden" name="_csrf" value="{{.CSRFToken}}">
       <div class="form-group"><label>名称</label><input type="text" name="name" value="{{.Name}}" required></div>
       <div class="form-group"><label>Endpoint</label><input type="url" name="endpoint" value="{{.Endpoint}}" placeholder="https://api.openai.com/v1" required></div>
       <div class="form-group"><label>API Type</label>
         <select name="apiFormat">
           <option value="openai" {{if eq .APIFormat "openai"}}selected{{end}}>openai</option>
+          <option value="anthropic" {{if eq .APIFormat "anthropic"}}selected{{end}}>anthropic</option>
+          <option value="ollama" {{if eq .APIFormat "ollama"}}selected{{end}}>ollama</option>
+          <option value="openai_image" {{if eq .APIFormat "openai_image"}}selected{{end}}>openai_image</option>
+          <option value="vivo_image" {{if eq .APIFormat "vivo_image"}}selected{{end}}>vivo_image</option>
+          <option value="openai_speech" {{if eq .APIFormat "openai_speech"}}selected{{end}}>openai_speech</option>
+          <option value="vivo_lasr" {{if eq .APIFormat "vivo_lasr"}}selected{{end}}>vivo_lasr</option>
+          <option value="vivo_ocr" {{if eq .APIFormat "vivo_ocr"}}selected{{end}}>vivo_ocr</option>
         </select>
       </div>
       <div class="form-group"><label>API Key {{if .Provider}}<span class="muted">（留空表示不修改）</span>{{end}}</label><input type="password" name="apiKey" {{if not .Provider}}required{{end}} autocomplete="off"></div>
       <div class="form-group">
         <label>模型配置 <span class="muted">（留空的模型 ID 行会被忽略；云端启用后会同步到用户端并默认启用）</span></label>
-        <div style="display:flex;flex-direction:column;gap:16px;">
+        <div id="modelRows" style="display:flex;flex-direction:column;gap:16px;">
           {{range .ModelRows}}
-          <div style="border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fafafa;">
+          <div class="model-row" style="border:1px solid #e5e7eb;border-radius:12px;padding:14px;background:#fafafa;">
             <div style="display:grid;grid-template-columns:1.2fr 1fr 1fr auto;gap:10px;align-items:end;">
               <div><label>模型 ID</label><input type="text" name="modelId" value="{{.ModelID}}" placeholder="gpt-4o"></div>
               <div><label>显示名称</label><input type="text" name="displayName" value="{{.DisplayName}}" placeholder="可选"></div>
@@ -57,9 +64,11 @@
               <div><label>Stop</label><input type="text" name="stop" value="{{.Stop}}"></div>
               <div><label>User</label><input type="text" name="user" value="{{.User}}"></div>
             </div>
+            <button type="button" class="btn btn-sm btn-danger remove-model-row" style="margin-top:10px;">删除此行</button>
           </div>
           {{end}}
         </div>
+        <button type="button" id="addModelRow" class="btn btn-secondary" style="margin-top:12px;">新增模型行</button>
       </div>
       <div class="form-group"><label><input type="checkbox" name="enabled" {{if .Enabled}}checked{{end}} style="width:auto;"> 启用</label></div>
       <button type="submit" class="btn btn-primary">保存</button>
@@ -67,5 +76,58 @@
     </form>
   </div>
 </div>
+<script>
+(function () {
+  const rows = document.getElementById('modelRows');
+  const addButton = document.getElementById('addModelRow');
+  const form = document.getElementById('relayForm');
+
+  function reindexRows() {
+    Array.from(rows.querySelectorAll('.model-row')).forEach((row, index) => {
+      ['modelEnabled', 'supportsVision', 'supportsThinking', 'supportsTools', 'debugSse'].forEach((name) => {
+        const input = row.querySelector(`input[name^="${name}_"]`);
+        if (input) input.name = `${name}_${index}`;
+      });
+    });
+  }
+
+  function clearRow(row) {
+    row.querySelectorAll('input').forEach((input) => {
+      if (input.type === 'checkbox') {
+        input.checked = input.name.startsWith('modelEnabled_');
+      } else {
+        input.value = '';
+      }
+    });
+    const category = row.querySelector('select[name="category"]');
+    if (category) category.value = 'chat';
+  }
+
+  function bindRemove(row) {
+    const button = row.querySelector('.remove-model-row');
+    if (!button) return;
+    button.onclick = function () {
+      if (rows.querySelectorAll('.model-row').length <= 1) {
+        clearRow(row);
+      } else {
+        row.remove();
+      }
+      reindexRows();
+    };
+  }
+
+  Array.from(rows.querySelectorAll('.model-row')).forEach(bindRemove);
+  addButton.onclick = function () {
+    const source = rows.querySelector('.model-row');
+    if (!source) return;
+    const clone = source.cloneNode(true);
+    clearRow(clone);
+    rows.appendChild(clone);
+    bindRemove(clone);
+    reindexRows();
+  };
+  form.onsubmit = reindexRows;
+})();
+</script>
 </body>
 </html>

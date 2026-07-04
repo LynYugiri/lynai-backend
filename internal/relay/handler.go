@@ -1,12 +1,18 @@
 package relay
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/database"
@@ -16,12 +22,83 @@ const maxRelayBodyBytes = 8 << 20
 
 // Handler serves authenticated relay endpoints.
 type Handler struct {
-	svc *Service
+	svc      *Service
+	speechMu sync.Mutex
+	speech   map[string]*speechSession
+}
+
+// Messages forwards an Anthropic-compatible messages request.
+func (h *Handler) Messages(c *gin.Context) {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxRelayBodyBytes))
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
+		return
+	}
+	model, stream, err := modelAndStreamFromJSON(body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	resolved, err := h.svc.Resolve(APIFormatAnthropic, model)
+	if err != nil {
+		h.writeResolveError(c, err)
+		return
+	}
+	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
+		return
+	}
+	resp, err := h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	writeUpstreamResponse(c, resp, stream)
+}
+
+// OllamaChat forwards an Ollama chat request.
+func (h *Handler) OllamaChat(c *gin.Context) {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxRelayBodyBytes))
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
+		return
+	}
+	model, stream, err := modelAndStreamFromJSON(body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	resolved, err := h.svc.Resolve(APIFormatOllama, model)
+	if err != nil {
+		h.writeResolveError(c, err)
+		return
+	}
+	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
+		return
+	}
+	resp, err := h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	writeUpstreamResponse(c, resp, stream)
 }
 
 // NewHandler creates a relay handler.
 func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc}
+	return &Handler{svc: svc, speech: map[string]*speechSession{}}
+}
+
+type speechSession struct {
+	Provider        database.RelayProvider
+	Model           database.RelayModel
+	AppID           string
+	UpstreamAudioID string
+	TaskID          string
+	CreatedAt       time.Time
 }
 
 // Chat forwards an OpenAI-compatible chat request to an admin-managed upstream.
@@ -54,6 +131,10 @@ func (h *Handler) Chat(c *gin.Context) {
 
 	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
+		return
+	}
+	if normalizeAPIType(resolved.Provider.APIFormat) != APIFormatOpenAI {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "use the relay endpoint matching the requested api_type")
 		return
 	}
 
@@ -115,6 +196,152 @@ func (h *Handler) Transcribe(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
+// OCR forwards an image OCR request to a managed OCR or vision-chat upstream.
+func (h *Handler) OCR(c *gin.Context) {
+	if err := c.Request.ParseMultipartForm(maxRelayBodyBytes); err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
+		return
+	}
+	model := strings.TrimSpace(c.Request.FormValue("model"))
+	apiType := normalizeAPIType(c.Request.FormValue("api_type"))
+	if model == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
+		return
+	}
+	resolved, err := h.svc.Resolve(apiType, model)
+	if err != nil {
+		h.writeResolveError(c, err)
+		return
+	}
+	file, _, err := c.Request.FormFile("file")
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "file is required")
+		return
+	}
+	defer file.Close()
+	image, err := io.ReadAll(file)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to read file")
+		return
+	}
+	if normalizeAPIType(resolved.Provider.APIFormat) == APIFormatVivoOCR {
+		h.forwardVivoOCR(c, resolved, image)
+		return
+	}
+	h.forwardVisionOCR(c, resolved, image)
+}
+
+// SpeechCreate starts a managed long-running speech transcription session.
+func (h *Handler) SpeechCreate(c *gin.Context) {
+	var body map[string]interface{}
+	if err := c.BindJSON(&body); err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid JSON body")
+		return
+	}
+	model := strings.TrimSpace(fmt.Sprint(body["model"]))
+	apiType := normalizeAPIType(fmt.Sprint(body["api_type"]))
+	resolved, err := h.svc.Resolve(apiType, model)
+	if err != nil {
+		h.writeResolveError(c, err)
+		return
+	}
+	if normalizeAPIType(resolved.Provider.APIFormat) != APIFormatVivoLASR {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "speech session is only supported for vivo_lasr")
+		return
+	}
+	appID := relayModelAppID(resolved.Model)
+	if appID == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_lasr requires AppID in model User advanced parameter")
+		return
+	}
+	sessionID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	query := vivoSpeechQuery(appID, resolved.Model.ModelID)
+	upstreamBody := map[string]interface{}{
+		"audio_type":  fmt.Sprint(body["audio_type"]),
+		"x-sessionId": sessionID,
+		"slice_num":   body["slice_num"],
+	}
+	raw, _ := json.Marshal(upstreamBody)
+	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &resolved.Provider, "/lasr/create", query, raw)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	upstream, rawResp, err := decodeJSONResponse(resp)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(rawResp))
+		return
+	}
+	upstreamAudioID, _ := nestedString(upstream, "data", "audio_id")
+	if upstreamAudioID == "" {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "vivo_lasr create did not return audio_id")
+		return
+	}
+	h.speechMu.Lock()
+	h.speech[sessionID] = &speechSession{Provider: resolved.Provider, Model: resolved.Model, AppID: appID, UpstreamAudioID: upstreamAudioID, CreatedAt: time.Now()}
+	h.speechMu.Unlock()
+	c.JSON(http.StatusOK, gin.H{"data": gin.H{"audio_id": sessionID}})
+}
+
+func (h *Handler) SpeechUpload(c *gin.Context) {
+	session := h.loadSpeechSession(c)
+	if session == nil {
+		return
+	}
+	if err := c.Request.ParseMultipartForm(maxRelayBodyBytes); err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
+		return
+	}
+	body, contentType, err := CloneMultipartForm(c.Request.MultipartForm)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to prepare multipart request")
+		return
+	}
+	query := vivoSpeechQuery(session.AppID, session.Model.ModelID)
+	query.Set("audio_id", session.UpstreamAudioID)
+	query.Set("x-sessionId", c.Param("audioId"))
+	query.Set("slice_index", c.DefaultQuery("slice_index", c.Request.FormValue("slice_index")))
+	resp, err := h.svc.ForwardVivoMultipart(c.Request.Context(), &session.Provider, "/lasr/upload", query, body, contentType)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	writeUpstreamResponse(c, resp, false)
+}
+
+func (h *Handler) SpeechRun(c *gin.Context) {
+	session := h.loadSpeechSession(c)
+	if session == nil {
+		return
+	}
+	raw, _ := json.Marshal(gin.H{"audio_id": session.UpstreamAudioID, "x-sessionId": c.Param("audioId")})
+	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, "/lasr/run", vivoSpeechQuery(session.AppID, session.Model.ModelID), raw)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	payload, rawResp, err := decodeJSONResponse(resp)
+	if err == nil {
+		if taskID, _ := nestedString(payload, "data", "task_id"); taskID != "" {
+			h.speechMu.Lock()
+			session.TaskID = taskID
+			h.speechMu.Unlock()
+		}
+	}
+	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), rawResp)
+}
+
+func (h *Handler) SpeechProgress(c *gin.Context) {
+	h.forwardSpeechTaskJSON(c, "/lasr/progress", false)
+}
+
+func (h *Handler) SpeechResult(c *gin.Context) {
+	h.forwardSpeechTaskJSON(c, "/lasr/result", true)
+}
+
 // ImageGenerations forwards an OpenAI-compatible image generation request.
 func (h *Handler) ImageGenerations(c *gin.Context) {
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxRelayBodyBytes))
@@ -136,12 +363,21 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not an image generation model")
 		return
 	}
-	resp, err := h.svc.ForwardJSON(c.Request.Context(), &resolved.Provider, "/images/generations", forwardBody)
+	var resp *http.Response
+	if normalizeAPIType(resolved.Provider.APIFormat) == APIFormatVivoImage {
+		resp, err = h.svc.ForwardVivoImage(c.Request.Context(), &resolved.Provider, forwardBody)
+	} else {
+		resp, err = h.svc.ForwardJSON(c.Request.Context(), &resolved.Provider, "/images/generations", forwardBody)
+	}
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
 	defer resp.Body.Close()
+	if normalizeAPIType(resolved.Provider.APIFormat) == APIFormatVivoImage {
+		h.writeVivoImageResponse(c, resp)
+		return
+	}
 	copyResponseHeaders(c, resp.Header)
 	c.Status(resp.StatusCode)
 	_, _ = io.Copy(c.Writer, resp.Body)
@@ -158,9 +394,6 @@ func (h *Handler) Models(c *gin.Context) {
 	data := make([]gin.H, 0)
 	for _, provider := range providers {
 		apiType := normalizeAPIType(provider.APIFormat)
-		if apiType != APIFormatOpenAI {
-			continue
-		}
 		entries := provider.Entries
 		if len(entries) == 0 {
 			legacy, err := legacyEntries(provider)
@@ -180,6 +413,72 @@ func (h *Handler) Models(c *gin.Context) {
 		}
 	}
 	c.JSON(http.StatusOK, gin.H{"object": "list", "data": data})
+}
+
+func (h *Handler) writeVivoImageResponse(c *gin.Context, resp *http.Response) {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to read upstream response")
+		return
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		copyResponseHeaders(c, resp.Header)
+		c.Status(resp.StatusCode)
+		_, _ = io.Copy(c.Writer, bytes.NewReader(raw))
+		return
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "invalid vivo image response")
+		return
+	}
+	if code, ok := payload["code"].(float64); ok && code != 0 {
+		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"message": string(raw), "type": "upstream_error"}})
+		return
+	}
+	data := make([]gin.H, 0)
+	if result, ok := payload["data"].(map[string]interface{}); ok {
+		if images, ok := result["images"].([]interface{}); ok {
+			for _, image := range images {
+				if item, ok := image.(map[string]interface{}); ok {
+					if u, ok := item["url"].(string); ok && u != "" {
+						data = append(data, gin.H{"url": u})
+					}
+				}
+			}
+		}
+		if u, ok := result["image"].(string); ok && u != "" && len(data) == 0 {
+			data = append(data, gin.H{"url": u})
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"created": 0, "data": data})
+}
+
+func modelAndStreamFromJSON(raw []byte) (string, bool, error) {
+	var body map[string]interface{}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return "", false, fmt.Errorf("invalid JSON body")
+	}
+	model, _ := body["model"].(string)
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return "", false, fmt.Errorf("model is required")
+	}
+	stream, _ := body["stream"].(bool)
+	return model, stream, nil
+}
+
+func writeUpstreamResponse(c *gin.Context, resp *http.Response, stream bool) {
+	copyResponseHeaders(c, resp.Header)
+	c.Status(resp.StatusCode)
+	if stream || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+		c.Header("X-Accel-Buffering", "no")
+		streamCopy(c, resp.Body)
+		return
+	}
+	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
 // Config returns the full enabled relay configuration for managed frontend providers.
@@ -215,6 +514,203 @@ func (h *Handler) Config(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"object": "relay_config", "data": data})
+}
+
+func (h *Handler) forwardVivoOCR(c *gin.Context, resolved *ResolvedModel, image []byte) {
+	appID := relayModelAppID(resolved.Model)
+	if appID == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_ocr requires AppID in model User advanced parameter")
+		return
+	}
+	query := url.Values{}
+	query.Set("requestId", strconv.FormatInt(time.Now().UnixNano(), 10))
+	form := url.Values{}
+	form.Set("image", base64.StdEncoding.EncodeToString(image))
+	form.Set("pos", "2")
+	form.Set("businessid", "aigc"+appID)
+	resp, err := h.svc.ForwardVivoForm(c.Request.Context(), &resolved.Provider, "", query, form)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	payload, raw, err := decodeJSONResponse(resp)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(raw))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"text": extractVivoOCRText(payload), "raw": payload})
+}
+
+func (h *Handler) forwardVisionOCR(c *gin.Context, resolved *ResolvedModel, image []byte) {
+	encoded := base64.StdEncoding.EncodeToString(image)
+	mime := "image/png"
+	apiType := normalizeAPIType(resolved.Provider.APIFormat)
+	prompt := "请识别图片中的文字，只返回识别到的文字内容。"
+	var body []byte
+	var resp *http.Response
+	var err error
+	switch apiType {
+	case APIFormatAnthropic:
+		body, _ = json.Marshal(gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image", "source": gin.H{"type": "base64", "media_type": mime, "data": encoded}}}}}})
+		resp, err = h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, body)
+	case APIFormatOllama:
+		body, _ = json.Marshal(gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": prompt, "images": []string{encoded}}}})
+		resp, err = h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, body)
+	default:
+		body, _ = json.Marshal(gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image_url", "image_url": gin.H{"url": "data:" + mime + ";base64," + encoded}}}}}})
+		resp, err = h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, body)
+	}
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	payload, raw, err := decodeJSONResponse(resp)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(raw))
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"text": extractChatText(apiType, payload), "raw": payload})
+}
+
+func (h *Handler) loadSpeechSession(c *gin.Context) *speechSession {
+	h.speechMu.Lock()
+	defer h.speechMu.Unlock()
+	session := h.speech[c.Param("audioId")]
+	if session == nil {
+		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "speech session not found")
+	}
+	return session
+}
+
+func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize bool) {
+	session := h.loadSpeechSession(c)
+	if session == nil {
+		return
+	}
+	if session.TaskID == "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "speech task has not been started")
+		return
+	}
+	raw, _ := json.Marshal(gin.H{"task_id": session.TaskID, "x-sessionId": c.Param("audioId")})
+	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, path, vivoSpeechQuery(session.AppID, session.Model.ModelID), raw)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	payload, rawResp, err := decodeJSONResponse(resp)
+	if err != nil || !normalize {
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), rawResp)
+		return
+	}
+	c.JSON(resp.StatusCode, gin.H{"text": extractVivoSpeechText(payload), "raw": payload})
+}
+
+func relayModelAppID(model database.RelayModel) string {
+	params := DecodeAdvancedParams(model.AdvancedParams)
+	if params.User == nil {
+		return ""
+	}
+	return strings.TrimSpace(*params.User)
+}
+
+func vivoSpeechQuery(appID, engineID string) url.Values {
+	query := url.Values{}
+	query.Set("client_version", "1.0.0")
+	query.Set("package", "lynai")
+	query.Set("user_id", strings.ToLower((appID + strings.Repeat("0", 32))[:32]))
+	query.Set("system_time", strconv.FormatInt(time.Now().UnixMilli(), 10))
+	query.Set("engineid", engineID)
+	query.Set("requestId", strconv.FormatInt(time.Now().UnixNano(), 10))
+	return query
+}
+
+func decodeJSONResponse(resp *http.Response) (map[string]interface{}, []byte, error) {
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, raw, err
+	}
+	var payload map[string]interface{}
+	err = json.Unmarshal(raw, &payload)
+	return payload, raw, err
+}
+
+func nestedString(payload map[string]interface{}, path ...string) (string, bool) {
+	var current interface{} = payload
+	for _, key := range path {
+		m, ok := current.(map[string]interface{})
+		if !ok {
+			return "", false
+		}
+		current = m[key]
+	}
+	value, ok := current.(string)
+	return value, ok
+}
+
+func extractChatText(apiType string, payload map[string]interface{}) string {
+	switch apiType {
+	case APIFormatAnthropic:
+		if content, ok := payload["content"].([]interface{}); ok {
+			parts := make([]string, 0, len(content))
+			for _, raw := range content {
+				if item, ok := raw.(map[string]interface{}); ok {
+					if text, ok := item["text"].(string); ok {
+						parts = append(parts, text)
+					}
+				}
+			}
+			return strings.Join(parts, "")
+		}
+	case APIFormatOllama:
+		if message, ok := payload["message"].(map[string]interface{}); ok {
+			if text, ok := message["content"].(string); ok {
+				return text
+			}
+		}
+	default:
+		if choices, ok := payload["choices"].([]interface{}); ok && len(choices) > 0 {
+			if choice, ok := choices[0].(map[string]interface{}); ok {
+				if message, ok := choice["message"].(map[string]interface{}); ok {
+					if text, ok := message["content"].(string); ok {
+						return text
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func extractVivoOCRText(payload map[string]interface{}) string {
+	if data, ok := payload["data"].(map[string]interface{}); ok {
+		if text, ok := data["text"].(string); ok {
+			return text
+		}
+	}
+	return extractVivoSpeechText(payload)
+}
+
+func extractVivoSpeechText(payload map[string]interface{}) string {
+	data, ok := payload["data"].(map[string]interface{})
+	if !ok {
+		return ""
+	}
+	result, ok := data["result"].([]interface{})
+	if !ok {
+		return ""
+	}
+	parts := make([]string, 0, len(result))
+	for _, raw := range result {
+		if item, ok := raw.(map[string]interface{}); ok {
+			if text, ok := item["onebest"].(string); ok {
+				parts = append(parts, text)
+			}
+		}
+	}
+	return strings.Join(parts, "")
 }
 
 func prepareForwardBody(raw []byte) ([]byte, string, string, bool, error) {
