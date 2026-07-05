@@ -2,8 +2,6 @@ package sync_test
 
 import (
 	"bytes"
-	"encoding/json"
-	"io"
 	"net/http"
 	stdsync "sync"
 	"testing"
@@ -13,33 +11,18 @@ import (
 
 const testPassword = "secret123"
 
-func registerAndGetToken(t *testing.T, tsURL, phone string) string {
-	t.Helper()
-	body, _ := json.Marshal(map[string]string{"phone": phone, "password": testPassword})
-	resp, _ := http.Post(tsURL+"/auth/register", "application/json", bytes.NewReader(body))
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	resp.Body.Close()
-	return result["token"].(map[string]interface{})["accessToken"].(string)
-}
-
 func TestSyncStatusEmpty(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndGetToken(t, ts.URL, "13100000001")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000001", testPassword)
 
-	req, _ := http.NewRequest("GET", ts.URL+"/sync/status", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("status = %d, want 200", resp.StatusCode)
-	}
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/sync/status", nil)
+	testutil.SetBearer(req, token)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 	if result["lastSeq"] != float64(0) {
 		t.Fatalf("lastSeq = %v, want 0", result["lastSeq"])
@@ -50,7 +33,7 @@ func TestUploadChanges(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndGetToken(t, ts.URL, "13100000002")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000002", testPassword)
 
 	changes := []map[string]interface{}{
 		{
@@ -66,19 +49,12 @@ func TestUploadChanges(t *testing.T) {
 			"data":     map[string]interface{}{"id": "msg-1", "content": "hello"},
 		},
 	}
-	body, _ := json.Marshal(map[string]interface{}{"changes": changes})
-	req, _ := http.NewRequest("POST", ts.URL+"/sync/changes", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("upload status = %d, want 200", resp.StatusCode)
-	}
+	req := testutil.NewJSONRequest(t, http.MethodPost, ts.URL+"/sync/changes", map[string]interface{}{"changes": changes})
+	testutil.SetBearer(req, token)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 
 	if result["latestSeq"] != float64(2) {
@@ -94,32 +70,26 @@ func TestGetChanges(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndGetToken(t, ts.URL, "13100000003")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000003", testPassword)
 
 	// Upload some changes
 	changes := []map[string]interface{}{
 		{"table": "conversations", "op": "upsert", "recordId": "c1", "data": map[string]interface{}{"id": "c1"}},
 		{"table": "messages", "op": "delete", "recordId": "m1"},
 	}
-	body, _ := json.Marshal(map[string]interface{}{"changes": changes})
-	req, _ := http.NewRequest("POST", ts.URL+"/sync/changes", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, _ := http.DefaultClient.Do(req)
+	req := testutil.NewJSONRequest(t, http.MethodPost, ts.URL+"/sync/changes", map[string]interface{}{"changes": changes})
+	testutil.SetBearer(req, token)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
 	// Get changes since seq=0
-	req, _ = http.NewRequest("GET", ts.URL+"/sync/changes?since=0", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("get changes status = %d, want 200", resp.StatusCode)
-	}
+	req = testutil.NewRequest(t, http.MethodGet, ts.URL+"/sync/changes?since=0", nil)
+	testutil.SetBearer(req, token)
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 
 	changeList, _ := result["changes"].([]interface{})
@@ -131,10 +101,11 @@ func TestGetChanges(t *testing.T) {
 	}
 
 	// Get changes since seq=1 — should only return seq=2
-	req, _ = http.NewRequest("GET", ts.URL+"/sync/changes?since=1", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, _ = http.DefaultClient.Do(req)
-	json.NewDecoder(resp.Body).Decode(&result)
+	req = testutil.NewRequest(t, http.MethodGet, ts.URL+"/sync/changes?since=1", nil)
+	testutil.SetBearer(req, token)
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 	changeList, _ = result["changes"].([]interface{})
 	if len(changeList) != 1 {
@@ -146,28 +117,24 @@ func TestSyncBlobs(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndGetToken(t, ts.URL, "13100000004")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000004", testPassword)
 
 	// Upload a blob
 	blobData := []byte("test blob content")
-	req, _ := http.NewRequest("POST", ts.URL+"/sync/blobs/abc123def456", bytes.NewReader(blobData))
-	req.Header.Set("Authorization", "Bearer "+token)
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/sync/blobs/abc123def456", bytes.NewReader(blobData))
+	testutil.SetBearer(req, token)
 	req.Header.Set("Content-Type", "application/octet-stream")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("upload blob status = %d, want 200", resp.StatusCode)
-	}
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
 	// List blobs
-	req, _ = http.NewRequest("GET", ts.URL+"/sync/blobs", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, _ = http.DefaultClient.Do(req)
+	req = testutil.NewRequest(t, http.MethodGet, ts.URL+"/sync/blobs", nil)
+	testutil.SetBearer(req, token)
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 	blobs, _ := result["blobs"].([]interface{})
 	if len(blobs) != 1 {
@@ -175,16 +142,11 @@ func TestSyncBlobs(t *testing.T) {
 	}
 
 	// Download the blob
-	req, _ = http.NewRequest("GET", ts.URL+"/sync/blobs/abc123def456", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("download blob status = %d, want 200", resp.StatusCode)
-	}
-	downloaded, _ := io.ReadAll(resp.Body)
+	req = testutil.NewRequest(t, http.MethodGet, ts.URL+"/sync/blobs/abc123def456", nil)
+	testutil.SetBearer(req, token)
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	downloaded := testutil.ReadAll(t, resp.Body)
 	resp.Body.Close()
 	if !bytes.Equal(downloaded, blobData) {
 		t.Fatalf("downloaded blob = %q, want %q", downloaded, blobData)
@@ -195,7 +157,7 @@ func TestConcurrentUploadChanges(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndGetToken(t, ts.URL, "13100000005")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000005", testPassword)
 
 	var wg stdsync.WaitGroup
 	errs := make(chan error, 2)
@@ -210,18 +172,12 @@ func TestConcurrentUploadChanges(t *testing.T) {
 				"recordId": "conv-concurrent-" + string(rune('a'+i)),
 				"data":     map[string]interface{}{"id": "conv-concurrent"},
 			}}
-			body, _ := json.Marshal(map[string]interface{}{"changes": changes})
-			req, _ := http.NewRequest("POST", ts.URL+"/sync/changes", bytes.NewReader(body))
-			req.Header.Set("Authorization", "Bearer "+token)
-			req.Header.Set("Content-Type", "application/json")
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
-				errs <- err
-				return
-			}
+			req := testutil.NewJSONRequest(t, http.MethodPost, ts.URL+"/sync/changes", map[string]interface{}{"changes": changes})
+			testutil.SetBearer(req, token)
+			resp := testutil.Do(t, req)
 			defer resp.Body.Close()
-			if resp.StatusCode != 200 {
-				data, _ := io.ReadAll(resp.Body)
+			if resp.StatusCode != http.StatusOK {
+				data := testutil.ReadAll(t, resp.Body)
 				errs <- &statusError{status: resp.StatusCode, body: string(data)}
 			}
 		}()
@@ -234,14 +190,12 @@ func TestConcurrentUploadChanges(t *testing.T) {
 		}
 	}
 
-	req, _ := http.NewRequest("GET", ts.URL+"/sync/changes?since=0", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/sync/changes?since=0", nil)
+	testutil.SetBearer(req, token)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 	if result["latestSeq"] != float64(2) {
 		t.Fatalf("latestSeq = %v, want 2", result["latestSeq"])
@@ -265,8 +219,6 @@ func TestSyncRequiresAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 401 {
-		t.Fatalf("sync without auth status = %d, want 401", resp.StatusCode)
-	}
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
 	resp.Body.Close()
 }

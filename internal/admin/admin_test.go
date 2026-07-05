@@ -4,7 +4,6 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
-	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/cookiejar"
@@ -56,7 +55,7 @@ func TestAdminPanelPluginManage(t *testing.T) {
 
 	client := adminClient(t)
 	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
-	userToken := registerAndGetToken(t, ts.URL, "13800000088")
+	userToken := testutil.RegisterAndGetToken(t, ts.URL, "13800000088", userPassword)
 	submitPlugin(t, ts.URL, userToken, "admin-test-plugin", "Admin Test", "1.0.0")
 
 	body := getAdminPage(t, client, ts.URL+"/admin/plugins/admin-test-plugin")
@@ -84,6 +83,12 @@ func TestAdminPanelPluginManage(t *testing.T) {
 		t.Fatal("plugin approve did not update status")
 	}
 	csrf = extractCSRF(t, body)
+
+	resp := postForm(t, client, ts.URL+"/admin/plugins/admin-test-plugin/approve", url.Values{"_csrf": {csrf}})
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("repeat approve status = %d, want 404", resp.StatusCode)
+	}
+	resp.Body.Close()
 
 	postFormFollow(t, client, ts.URL+"/admin/plugins/admin-test-plugin/unpublish", url.Values{"_csrf": {csrf}})
 	body = getAdminPage(t, client, ts.URL+"/admin/plugins/admin-test-plugin")
@@ -205,7 +210,7 @@ func getAdminPage(t *testing.T, client *http.Client, target string) string {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("get %s status = %d, want 200", target, resp.StatusCode)
 	}
-	body, _ := io.ReadAll(resp.Body)
+	body := testutil.ReadAll(t, resp.Body)
 	return string(body)
 }
 
@@ -236,19 +241,6 @@ func extractCSRF(t *testing.T, body string) string {
 	return matches[1]
 }
 
-func registerAndGetToken(t *testing.T, tsURL, phone string) string {
-	t.Helper()
-	body, _ := json.Marshal(map[string]string{"phone": phone, "password": userPassword})
-	resp, err := http.Post(tsURL+"/auth/register", "application/json", bytes.NewReader(body))
-	if err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	defer resp.Body.Close()
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	return result["token"].(map[string]interface{})["accessToken"].(string)
-}
-
 func submitPlugin(t *testing.T, tsURL, token, id, name, version string) {
 	t.Helper()
 	body := &bytes.Buffer{}
@@ -257,19 +249,18 @@ func submitPlugin(t *testing.T, tsURL, token, id, name, version string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	part.Write(createPluginZip(t, id, name, version))
-	writer.Close()
-	req, _ := http.NewRequest("POST", tsURL+"/market/plugins/submit", body)
-	req.Header.Set("Authorization", "Bearer "+token)
+	if _, err := part.Write(createPluginZip(t, id, name, version)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := testutil.NewRequest(t, http.MethodPost, tsURL+"/market/plugins/submit", body)
+	testutil.SetBearer(req, token)
 	req.Header.Set("Content-Type", writer.FormDataContentType())
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("submit plugin: %v", err)
-	}
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("submit plugin status = %d, want 200", resp.StatusCode)
-	}
+	testutil.RequireStatus(t, resp, http.StatusOK)
 }
 
 func createPluginZip(t *testing.T, id, name, version string) []byte {
@@ -284,17 +275,24 @@ func createPluginZip(t *testing.T, id, name, version string) []byte {
 		"description": "A test plugin",
 		"permissions": []string{"network"},
 	}
-	manifestJSON, _ := json.Marshal(manifest)
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
 	file, err := writer.Create("plugin.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	file.Write(manifestJSON)
+	if _, err := file.Write(manifestJSON); err != nil {
+		t.Fatal(err)
+	}
 	mainFile, err := writer.Create("main.lua")
 	if err != nil {
 		t.Fatal(err)
 	}
-	mainFile.Write([]byte("-- test plugin\n"))
+	if _, err := mainFile.Write([]byte("-- test plugin\n")); err != nil {
+		t.Fatal(err)
+	}
 	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -4,10 +4,8 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
-	"io"
 	"mime/multipart"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -31,19 +29,26 @@ func createPluginZip(t *testing.T, id, name, version string) []byte {
 		"description": "A test plugin",
 		"permissions": []string{"network", "storage"},
 	}
-	manifestJSON, _ := json.Marshal(manifest)
+	manifestJSON, err := json.Marshal(manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	f, err := w.Create("plugin.json")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f.Write(manifestJSON)
+	if _, err := f.Write(manifestJSON); err != nil {
+		t.Fatal(err)
+	}
 
 	f2, err := w.Create("main.lua")
 	if err != nil {
 		t.Fatal(err)
 	}
-	f2.Write([]byte("-- test plugin\n"))
+	if _, err := f2.Write([]byte("-- test plugin\n")); err != nil {
+		t.Fatal(err)
+	}
 
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
@@ -51,36 +56,8 @@ func createPluginZip(t *testing.T, id, name, version string) []byte {
 	return buf.Bytes()
 }
 
-// registerAndLogin registers a user and returns their Bearer token.
-func registerAndLogin(t *testing.T, ts *httptest.Server, phone string) string {
-	t.Helper()
-	body, _ := json.Marshal(map[string]string{
-		"phone":    phone,
-		"password": testPassword,
-	})
-	resp, _ := http.Post(ts.URL+"/auth/register", "application/json", bytes.NewReader(body))
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	resp.Body.Close()
-	return result["token"].(map[string]interface{})["accessToken"].(string)
-}
-
-// loginAdmin logs in as the seeded admin and returns the Bearer token.
-func loginAdmin(t *testing.T, ts *httptest.Server, adminPhone, adminPassword string) string {
-	t.Helper()
-	body, _ := json.Marshal(map[string]string{
-		"phone":    adminPhone,
-		"password": adminPassword,
-	})
-	resp, _ := http.Post(ts.URL+"/auth/login", "application/json", bytes.NewReader(body))
-	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	resp.Body.Close()
-	return result["token"].(map[string]interface{})["accessToken"].(string)
-}
-
 // submitPlugin uploads a plugin ZIP via multipart form and returns the response.
-func submitPlugin(t *testing.T, ts *httptest.Server, token string, zipBytes []byte) map[string]interface{} {
+func submitPlugin(t *testing.T, ts *testutil.TestServer, token string, zipBytes []byte) map[string]interface{} {
 	t.Helper()
 	body := &bytes.Buffer{}
 	mw := multipart.NewWriter(body)
@@ -88,23 +65,21 @@ func submitPlugin(t *testing.T, ts *httptest.Server, token string, zipBytes []by
 	if err != nil {
 		t.Fatal(err)
 	}
-	part.Write(zipBytes)
-	mw.Close()
-
-	req, _ := http.NewRequest("POST", ts.URL+"/market/plugins/submit", body)
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
+	if _, err := part.Write(zipBytes); err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("submit status = %d, body = %s", resp.StatusCode, b)
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
 	}
+
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/submit", body)
+	testutil.SetBearer(req, token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
-	resp.Body.Close()
+	testutil.DecodeJSON(t, resp, &result)
 	return result
 }
 
@@ -112,7 +87,7 @@ func TestSubmitPlugin(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndLogin(t, ts, "13800000001")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000001", testPassword)
 	zipBytes := createPluginZip(t, "test-plugin", "Test Plugin", "1.0.0")
 	result := submitPlugin(t, ts, token, zipBytes)
 
@@ -144,7 +119,7 @@ func TestSubmitRejectsUnsafeManifestPaths(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndLogin(t, ts, "13800000009")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000009", testPassword)
 	for _, tc := range []struct {
 		name    string
 		id      string
@@ -163,16 +138,17 @@ func TestSubmitRejectsUnsafeManifestPaths(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			part.Write(zipBytes)
-			mw.Close()
-
-			req, _ := http.NewRequest("POST", ts.URL+"/market/plugins/submit", body)
-			req.Header.Set("Authorization", "Bearer "+token)
-			req.Header.Set("Content-Type", mw.FormDataContentType())
-			resp, err := http.DefaultClient.Do(req)
-			if err != nil {
+			if _, err := part.Write(zipBytes); err != nil {
 				t.Fatal(err)
 			}
+			if err := mw.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/submit", body)
+			testutil.SetBearer(req, token)
+			req.Header.Set("Content-Type", mw.FormDataContentType())
+			resp := testutil.Do(t, req)
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusBadRequest {
 				t.Fatalf("submit unsafe manifest status = %d, want 400", resp.StatusCode)
@@ -185,14 +161,18 @@ func TestListPluginsOnlyApproved(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndLogin(t, ts, "13800000002")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000002", testPassword)
 	zipBytes := createPluginZip(t, "pending-plugin", "Pending", "1.0.0")
 	submitPlugin(t, ts, token, zipBytes)
 
 	// Public list should be empty — nothing approved yet
-	resp, _ := http.Get(ts.URL + "/market/plugins")
+	resp, err := http.Get(ts.URL + "/market/plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 
 	entries, _ := result["entries"].([]interface{})
@@ -206,27 +186,26 @@ func TestApproveFlow(t *testing.T) {
 	defer cleanup()
 
 	// Submit as regular user
-	token := registerAndLogin(t, ts, "13800000003")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000003", testPassword)
 	zipBytes := createPluginZip(t, "approve-me", "Approve Me", "1.0.0")
 	submitPlugin(t, ts, token, zipBytes)
 
 	// Admin approves
-	adminToken := loginAdmin(t, ts, adminPhone, adminPassword)
-	req, _ := http.NewRequest("POST", ts.URL+"/market/plugins/approve-me/approve", nil)
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("approve status = %d, want 200", resp.StatusCode)
-	}
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/approve-me/approve", nil)
+	testutil.SetBearer(req, adminToken)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
 	// Now public list should contain it
-	resp, _ = http.Get(ts.URL + "/market/plugins")
+	resp, err := http.Get(ts.URL + "/market/plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 	entries, _ := result["entries"].([]interface{})
 	if len(entries) != 1 {
@@ -242,28 +221,25 @@ func TestRejectFlow(t *testing.T) {
 	adminPhone, adminPassword, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndLogin(t, ts, "13800000004")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000004", testPassword)
 	zipBytes := createPluginZip(t, "reject-me", "Reject Me", "1.0.0")
 	submitPlugin(t, ts, token, zipBytes)
 
-	adminToken := loginAdmin(t, ts, adminPhone, adminPassword)
-	body, _ := json.Marshal(map[string]string{"reason": "bad plugin"})
-	req, _ := http.NewRequest("POST", ts.URL+"/market/plugins/reject-me/reject", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("reject status = %d, want 200", resp.StatusCode)
-	}
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	req := testutil.NewJSONRequest(t, http.MethodPost, ts.URL+"/market/plugins/reject-me/reject", map[string]string{"reason": "bad plugin"})
+	testutil.SetBearer(req, adminToken)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
 	// Public list should still be empty
-	resp, _ = http.Get(ts.URL + "/market/plugins")
+	resp, err := http.Get(ts.URL + "/market/plugins")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 	entries, _ := result["entries"].([]interface{})
 	if len(entries) != 0 {
@@ -271,25 +247,42 @@ func TestRejectFlow(t *testing.T) {
 	}
 }
 
+func TestRejectMalformedJSON(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000010", testPassword)
+	zipBytes := createPluginZip(t, "reject-bad-json", "Reject Bad JSON", "1.0.0")
+	submitPlugin(t, ts, token, zipBytes)
+
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	req := testutil.NewRequest(
+		t,
+		http.MethodPost,
+		ts.URL+"/market/plugins/reject-bad-json/reject",
+		strings.NewReader("{"),
+	)
+	testutil.SetBearer(req, adminToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusBadRequest)
+}
+
 func TestMySubmissions(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndLogin(t, ts, "13800000005")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000005", testPassword)
 	zipBytes := createPluginZip(t, "my-plugin", "My Plugin", "1.0.0")
 	submitPlugin(t, ts, token, zipBytes)
 
-	req, _ := http.NewRequest("GET", ts.URL+"/market/submissions/mine", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("mine status = %d, want 200", resp.StatusCode)
-	}
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/market/submissions/mine", nil)
+	testutil.SetBearer(req, token)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 
 	subs, _ := result["submissions"].([]interface{})
@@ -309,15 +302,16 @@ func TestDownloadPlugin(t *testing.T) {
 	adminPhone, adminPassword, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndLogin(t, ts, "13800000006")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000006", testPassword)
 	zipBytes := createPluginZip(t, "download-me", "Download Me", "1.0.0")
 	submitPlugin(t, ts, token, zipBytes)
 
 	// Approve it
-	adminToken := loginAdmin(t, ts, adminPhone, adminPassword)
-	req, _ := http.NewRequest("POST", ts.URL+"/market/plugins/download-me/approve", nil)
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-	resp, _ := http.DefaultClient.Do(req)
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/download-me/approve", nil)
+	testutil.SetBearer(req, adminToken)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
 	// Download
@@ -325,10 +319,8 @@ func TestDownloadPlugin(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("download status = %d, want 200", resp.StatusCode)
-	}
-	data, _ := io.ReadAll(resp.Body)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	data := testutil.ReadAll(t, resp.Body)
 	resp.Body.Close()
 
 	// Verify it's a valid ZIP
@@ -343,42 +335,37 @@ func TestCheckUpdates(t *testing.T) {
 	defer cleanup()
 
 	// Submit and approve version 1.0.0
-	token := registerAndLogin(t, ts, "13800000007")
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000007", testPassword)
 	zipBytes := createPluginZip(t, "update-me", "Update Me", "1.0.0")
 	submitPlugin(t, ts, token, zipBytes)
 
-	adminToken := loginAdmin(t, ts, adminPhone, adminPassword)
-	req, _ := http.NewRequest("POST", ts.URL+"/market/plugins/update-me/approve", nil)
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-	resp, _ := http.DefaultClient.Do(req)
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/update-me/approve", nil)
+	testutil.SetBearer(req, adminToken)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
 	// Submit version 2.0.0 and approve
 	zipBytes2 := createPluginZip(t, "update-me", "Update Me", "2.0.0")
 	submitPlugin(t, ts, token, zipBytes2)
-	req, _ = http.NewRequest("POST", ts.URL+"/market/plugins/update-me/approve", nil)
-	req.Header.Set("Authorization", "Bearer "+adminToken)
-	resp, _ = http.DefaultClient.Do(req)
+	req = testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/update-me/approve", nil)
+	testutil.SetBearer(req, adminToken)
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	resp.Body.Close()
 
 	// Check updates — installed is 1.0.0, market is 2.0.0
-	body, _ := json.Marshal(map[string]interface{}{
+	req = testutil.NewJSONRequest(t, http.MethodPost, ts.URL+"/market/updates", map[string]interface{}{
 		"installed": []map[string]string{
 			{"id": "update-me", "version": "1.0.0"},
 		},
 	})
-	req, _ = http.NewRequest("POST", ts.URL+"/market/updates", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 200 {
-		t.Fatalf("updates status = %d, want 200", resp.StatusCode)
-	}
+	testutil.SetBearer(req, token)
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
 	var result map[string]interface{}
-	json.NewDecoder(resp.Body).Decode(&result)
+	testutil.DecodeJSON(t, resp, &result)
 	resp.Body.Close()
 
 	updates, _ := result["updates"].([]interface{})
@@ -399,9 +386,7 @@ func TestSubmitRequiresAuth(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if resp.StatusCode != 401 {
-		t.Fatalf("submit without auth status = %d, want 401", resp.StatusCode)
-	}
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
 	resp.Body.Close()
 }
 
@@ -409,15 +394,10 @@ func TestPendingRequiresAdmin(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
 
-	token := registerAndLogin(t, ts, "13800000008")
-	req, _ := http.NewRequest("GET", ts.URL+"/market/plugins/pending", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != 403 {
-		t.Fatalf("pending as non-admin status = %d, want 403", resp.StatusCode)
-	}
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000008", testPassword)
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/market/plugins/pending", nil)
+	testutil.SetBearer(req, token)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusForbidden)
 	resp.Body.Close()
 }

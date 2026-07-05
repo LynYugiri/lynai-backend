@@ -261,7 +261,10 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		"x-sessionId": sessionID,
 		"slice_num":   body["slice_num"],
 	}
-	raw, _ := json.Marshal(upstreamBody)
+	raw, ok := marshalRelayJSON(c, upstreamBody)
+	if !ok {
+		return
+	}
 	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &resolved.Provider, "/lasr/create", query, raw)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
@@ -316,7 +319,10 @@ func (h *Handler) SpeechRun(c *gin.Context) {
 	if session == nil {
 		return
 	}
-	raw, _ := json.Marshal(gin.H{"audio_id": session.UpstreamAudioID, "x-sessionId": c.Param("audioId")})
+	raw, ok := marshalRelayJSON(c, gin.H{"audio_id": session.UpstreamAudioID, "x-sessionId": c.Param("audioId")})
+	if !ok {
+		return
+	}
 	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, "/lasr/run", vivoSpeechQuery(session.AppID, session.Model.ModelID), raw)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
@@ -550,15 +556,25 @@ func (h *Handler) forwardVisionOCR(c *gin.Context, resolved *ResolvedModel, imag
 	var body []byte
 	var resp *http.Response
 	var err error
+	var ok bool
 	switch apiType {
 	case APIFormatAnthropic:
-		body, _ = json.Marshal(gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image", "source": gin.H{"type": "base64", "media_type": mime, "data": encoded}}}}}})
+		body, ok = marshalRelayJSON(c, gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image", "source": gin.H{"type": "base64", "media_type": mime, "data": encoded}}}}}})
+		if !ok {
+			return
+		}
 		resp, err = h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, body)
 	case APIFormatOllama:
-		body, _ = json.Marshal(gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": prompt, "images": []string{encoded}}}})
+		body, ok = marshalRelayJSON(c, gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": prompt, "images": []string{encoded}}}})
+		if !ok {
+			return
+		}
 		resp, err = h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, body)
 	default:
-		body, _ = json.Marshal(gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image_url", "image_url": gin.H{"url": "data:" + mime + ";base64," + encoded}}}}}})
+		body, ok = marshalRelayJSON(c, gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image_url", "image_url": gin.H{"url": "data:" + mime + ";base64," + encoded}}}}}})
+		if !ok {
+			return
+		}
 		resp, err = h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, body)
 	}
 	if err != nil {
@@ -593,7 +609,10 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "speech task has not been started")
 		return
 	}
-	raw, _ := json.Marshal(gin.H{"task_id": session.TaskID, "x-sessionId": c.Param("audioId")})
+	raw, ok := marshalRelayJSON(c, gin.H{"task_id": session.TaskID, "x-sessionId": c.Param("audioId")})
+	if !ok {
+		return
+	}
 	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, path, vivoSpeechQuery(session.AppID, session.Model.ModelID), raw)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
@@ -648,6 +667,15 @@ func nestedString(payload map[string]interface{}, path ...string) (string, bool)
 	}
 	value, ok := current.(string)
 	return value, ok
+}
+
+func marshalRelayJSON(c *gin.Context, payload interface{}) ([]byte, bool) {
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to encode relay request")
+		return nil, false
+	}
+	return raw, true
 }
 
 func extractChatText(apiType string, payload map[string]interface{}) string {

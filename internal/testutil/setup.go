@@ -1,7 +1,7 @@
 package testutil
 
 import (
-	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"runtime"
 
@@ -21,16 +21,16 @@ import (
 // seeds an admin user, and returns a fully wired test server.
 //
 // The admin phone is returned for use in tests that need admin access.
-func SetupTest() (adminPhone, adminPassword string, ts *httptest.Server, cleanup func()) {
+func SetupTest() (adminPhone, adminPassword string, ts *TestServer, cleanup func()) {
 	return setupTest(false)
 }
 
 // SetupTestWithAdminPanel creates a test server with HTML admin routes enabled.
-func SetupTestWithAdminPanel() (adminPhone, adminPassword string, ts *httptest.Server, cleanup func()) {
+func SetupTestWithAdminPanel() (adminPhone, adminPassword string, ts *TestServer, cleanup func()) {
 	return setupTest(true)
 }
 
-func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *httptest.Server, cleanup func()) {
+func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestServer, cleanup func()) {
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{
 		Logger: logger.Default.LogMode(logger.Silent),
 	})
@@ -57,8 +57,11 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *httpt
 		panic("seed admin: " + err.Error())
 	}
 
-	// Storage in temp dir
-	tmpDir := filepath.Join("/tmp", "lynai-test-storage")
+	// 每个测试使用独立目录，避免插件 ZIP 和同步 blob 在用例之间串数据。
+	tmpDir, err := os.MkdirTemp("", "lynai-backend-test-storage-")
+	if err != nil {
+		panic("create temp storage: " + err.Error())
+	}
 	storage, err := market.NewStorage(tmpDir)
 	if err != nil {
 		panic("storage: " + err.Error())
@@ -89,10 +92,11 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *httpt
 	}
 
 	r := server.Setup(authHandler, jwtMgr, marketHandler, syncHandler, relayHandler, adminHandler)
-	ts = httptest.NewServer(r)
+	ts = NewTestServer(r)
 
 	cleanup = func() {
 		ts.Close()
+		_ = os.RemoveAll(tmpDir)
 	}
 
 	return adminPhone, adminPassword, ts, cleanup

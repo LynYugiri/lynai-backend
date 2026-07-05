@@ -92,12 +92,26 @@ type Service struct {
 
 // NewService creates a relay service.
 func NewService(db *gorm.DB) *Service {
+	return NewServiceWithClient(db, defaultHTTPClient())
+}
+
+// NewServiceWithClient 创建 relay service，并允许测试注入自定义 HTTP client。
+func NewServiceWithClient(db *gorm.DB, client *http.Client) *Service {
+	if client == nil {
+		client = defaultHTTPClient()
+	}
 	return &Service{
-		db: db,
-		client: &http.Client{Transport: &http.Transport{
+		db:     db,
+		client: client,
+	}
+}
+
+func defaultHTTPClient() *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			ResponseHeaderTimeout: 60 * time.Second,
-		}},
+		},
 	}
 }
 
@@ -301,7 +315,10 @@ func (s *Service) ForwardMultipart(ctx context.Context, provider *database.Relay
 }
 
 func EncodeCapabilities(cap ModelCapabilities) string {
-	raw, _ := json.Marshal(cap)
+	raw, err := json.Marshal(cap)
+	if err != nil {
+		return "{}"
+	}
 	return string(raw)
 }
 
@@ -312,7 +329,10 @@ func DecodeCapabilities(raw string) ModelCapabilities {
 }
 
 func EncodeAdvancedParams(params ModelAdvancedParams) string {
-	raw, _ := json.Marshal(params)
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return "{}"
+	}
 	return string(raw)
 }
 

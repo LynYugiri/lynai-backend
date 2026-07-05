@@ -781,7 +781,10 @@ func maskAPIKey(key string) string {
 func (h *Handler) Approve(c *gin.Context) {
 	id := c.Param("id")
 	reviewerID, _ := strconv.ParseInt(c.GetString("userID"), 10, 64)
-	_ = h.marketSvc.Approve(id, reviewerID)
+	if err := h.marketSvc.Approve(id, reviewerID); err != nil {
+		writeMarketActionError(c, err, "approve failed")
+		return
+	}
 	c.Redirect(http.StatusFound, redirectBack(c, "/admin/pending"))
 }
 
@@ -791,8 +794,19 @@ func (h *Handler) Reject(c *gin.Context) {
 	id := c.Param("id")
 	reason := c.PostForm("reason")
 	reviewerID, _ := strconv.ParseInt(c.GetString("userID"), 10, 64)
-	_ = h.marketSvc.Reject(id, reviewerID, reason)
+	if err := h.marketSvc.Reject(id, reviewerID, reason); err != nil {
+		writeMarketActionError(c, err, "reject failed")
+		return
+	}
 	c.Redirect(http.StatusFound, redirectBack(c, "/admin/pending"))
+}
+
+func writeMarketActionError(c *gin.Context, err error, message string) {
+	if errors.Is(err, market.ErrPluginNotFound) {
+		c.String(http.StatusNotFound, message)
+		return
+	}
+	c.String(http.StatusInternalServerError, message)
 }
 
 // render executes the named template with the given data.

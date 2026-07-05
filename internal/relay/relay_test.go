@@ -6,7 +6,6 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -14,12 +13,13 @@ import (
 	"github.com/lynai/backend/internal/auth"
 	"github.com/lynai/backend/internal/database"
 	"github.com/lynai/backend/internal/relay"
+	"github.com/lynai/backend/internal/testutil"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 	"gorm.io/gorm/logger"
 )
 
-func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*httptest.Server, string, *gorm.DB) {
+func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServer, string, *gorm.DB) {
 	t.Helper()
 	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
 	if err != nil {
@@ -32,10 +32,13 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*httptest.Server, 
 		t.Fatalf("migrate: %v", err)
 	}
 
-	upstreamServer := httptest.NewServer(upstream)
+	upstreamServer := testutil.NewTestServerFunc(upstream)
 	t.Cleanup(upstreamServer.Close)
 
-	models, _ := json.Marshal([]string{"gpt-test", "gpt-stream"})
+	models, err := json.Marshal([]string{"gpt-test", "gpt-stream"})
+	if err != nil {
+		t.Fatalf("encode relay models: %v", err)
+	}
 	if err := db.Create(&database.RelayProvider{
 		ID:        1,
 		Name:      "test upstream",
@@ -55,7 +58,7 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*httptest.Server, 
 		t.Fatalf("register: %v", err)
 	}
 
-	handler := relay.NewHandler(relay.NewService(db))
+	handler := relay.NewHandler(relay.NewServiceWithClient(db, testutil.NewHTTPClient()))
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	g := r.Group("/relay")
@@ -68,13 +71,13 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*httptest.Server, 
 	g.POST("/images/generations", handler.ImageGenerations)
 	g.GET("/models", handler.Models)
 	g.GET("/config", handler.Config)
-	server := httptest.NewServer(r)
+	server := testutil.NewTestServer(r)
 	t.Cleanup(server.Close)
 
 	return server, pair.AccessToken, db
 }
 
-func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*httptest.Server, string, *gorm.DB) {
+func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServer, string, *gorm.DB) {
 	t.Helper()
 	server, token, db := setupRelayTest(t, upstream)
 	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("models", "").Error; err != nil {
@@ -118,6 +121,16 @@ func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*httptest.Ser
 	return server, token, db
 }
 
+func authedRequest(t *testing.T, method, target, token, contentType string, body io.Reader) *http.Request {
+	t.Helper()
+	req := testutil.NewRequest(t, method, target, body)
+	testutil.SetBearer(req, token)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
+	return req
+}
+
 func TestModelsRequiresAuth(t *testing.T) {
 	server, _, _ := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {})
 	resp, err := http.Get(server.URL + "/relay/models")
@@ -132,20 +145,14 @@ func TestModelsRequiresAuth(t *testing.T) {
 
 func TestModelsReturnsAPIType(t *testing.T) {
 	server, token, _ := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {})
-	req, _ := http.NewRequest(http.MethodGet, server.URL+"/relay/models", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("models: %v", err)
-	}
+	req := authedRequest(t, http.MethodGet, server.URL+"/relay/models", token, "", nil)
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
 	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	testutil.DecodeJSON(t, resp, &payload)
 	data := payload["data"].([]interface{})
 	if len(data) != 2 {
 		t.Fatalf("model count = %d, want 2", len(data))
@@ -172,16 +179,11 @@ func TestChatStripsAPITypeAndForwards(t *testing.T) {
 	})
 
 	body := []byte(`{"model":"gpt-test","api_type":"openai","messages":[{"role":"user","content":"ping"}]}`)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/chat", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("chat: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
 	}
 	if seenAuth != "Bearer upstream-secret" {
@@ -203,15 +205,10 @@ func TestChatStreamsSSE(t *testing.T) {
 	})
 
 	body := []byte(`{"model":"gpt-stream","api_type":"openai","stream":true,"messages":[{"role":"user","content":"ping"}]}`)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/chat", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("chat: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw := testutil.ReadAll(t, resp.Body)
 	if got := string(raw); !strings.Contains(got, "data: one") || !strings.Contains(got, "data: [DONE]") {
 		t.Fatalf("stream body = %q", got)
 	}
@@ -226,16 +223,11 @@ func TestChatRejectsUnsupportedAPIType(t *testing.T) {
 	})
 
 	body := []byte(`{"model":"gpt-test","api_type":"unsupported","messages":[{"role":"user","content":"ping"}]}`)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/chat", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("chat: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
 	}
 }
@@ -256,16 +248,11 @@ func TestMessagesForwardsAnthropic(t *testing.T) {
 	}
 
 	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"ping"}]}`)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/messages", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("messages: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/messages", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
 	}
 	if seenKey != "upstream-secret" || seenVersion == "" {
@@ -288,16 +275,11 @@ func TestOllamaChatForwards(t *testing.T) {
 	}
 
 	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"ping"}],"stream":false}`)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/api/chat", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("ollama: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/api/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
 	}
 	if seenAuth != "" {
@@ -307,21 +289,15 @@ func TestOllamaChatForwards(t *testing.T) {
 
 func TestConfigReturnsRelayConfig(t *testing.T) {
 	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {})
-	req, _ := http.NewRequest(http.MethodGet, server.URL+"/relay/config", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("config: %v", err)
-	}
+	req := authedRequest(t, http.MethodGet, server.URL+"/relay/config", token, "", nil)
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
 	}
 	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	testutil.DecodeJSON(t, resp, &payload)
 	if payload["object"] != "relay_config" {
 		t.Fatalf("object = %v, want relay_config", payload["object"])
 	}
@@ -347,17 +323,11 @@ func TestConfigReturnsRelayConfig(t *testing.T) {
 
 func TestModelsReturnsRichPayloadFromRelayModels(t *testing.T) {
 	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {})
-	req, _ := http.NewRequest(http.MethodGet, server.URL+"/relay/models", nil)
-	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("models: %v", err)
-	}
+	req := authedRequest(t, http.MethodGet, server.URL+"/relay/models", token, "", nil)
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	var payload map[string]interface{}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
+	testutil.DecodeJSON(t, resp, &payload)
 	models := payload["data"].([]interface{})
 	first := models[0].(map[string]interface{})
 	if first["displayName"] != "Rich Chat" || first["api_type"] != relay.APIFormatOpenAI || first["providerId"] != "1" {
@@ -370,16 +340,11 @@ func TestChatRejectsSpeechModel(t *testing.T) {
 		t.Fatal("upstream should not be called")
 	})
 	body := []byte(`{"model":"whisper-test","api_type":"openai","messages":[{"role":"user","content":"ping"}]}`)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/chat", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("chat: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
 	}
 }
@@ -401,16 +366,11 @@ func TestTranscribeForwardsSpeechModel(t *testing.T) {
 	})
 
 	body, contentType := multipartBody(t, map[string]string{"model": "whisper-test", "api_type": "openai", "response_format": "json"})
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/transcribe", body)
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", contentType)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("transcribe: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/transcribe", token, contentType, body)
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
 	}
 	if seenAuth != "Bearer upstream-secret" || seenModel != "whisper-test" || seenAPIType != "" {
@@ -431,16 +391,11 @@ func TestImageGenerationsForwardsImageModel(t *testing.T) {
 		_, _ = w.Write([]byte(`{"data":[{"url":"https://example.com/a.png"}]}`))
 	})
 	body := []byte(`{"model":"image-test","api_type":"openai","prompt":"cat"}`)
-	req, _ := http.NewRequest(http.MethodPost, server.URL+"/relay/images/generations", bytes.NewReader(body))
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("images: %v", err)
-	}
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/images/generations", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		raw, _ := io.ReadAll(resp.Body)
+		raw := testutil.ReadAll(t, resp.Body)
 		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
 	}
 	if _, ok := seenBody["api_type"]; ok {

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -284,7 +285,10 @@ func (h *Handler) RejectPlugin(c *gin.Context) {
 	reviewerIDStr := c.GetString("userID")
 	reviewerID, _ := strconv.ParseInt(reviewerIDStr, 10, 64)
 	var req rejectRequest
-	_ = c.ShouldBindJSON(&req)
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 
 	if err := h.svc.Reject(id, reviewerID, req.Reason); err != nil {
 		if err == ErrPluginNotFound {
