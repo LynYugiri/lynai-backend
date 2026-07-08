@@ -251,7 +251,7 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 	}
 	appID := relayModelAppID(resolved.Model)
 	if appID == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_lasr requires AppID in model User advanced parameter")
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_lasr requires AppID in model advanced parameters")
 		return
 	}
 	sessionID := strconv.FormatInt(time.Now().UnixNano(), 10)
@@ -525,7 +525,7 @@ func (h *Handler) Config(c *gin.Context) {
 func (h *Handler) forwardVivoOCR(c *gin.Context, resolved *ResolvedModel, image []byte) {
 	appID := relayModelAppID(resolved.Model)
 	if appID == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_ocr requires AppID in model User advanced parameter")
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_ocr requires AppID in model advanced parameters")
 		return
 	}
 	query := url.Values{}
@@ -629,6 +629,11 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 
 func relayModelAppID(model database.RelayModel) string {
 	params := DecodeAdvancedParams(model.AdvancedParams)
+	if params.AppID != nil {
+		if appID := strings.TrimSpace(*params.AppID); appID != "" {
+			return appID
+		}
+	}
 	if params.User == nil {
 		return ""
 	}
@@ -779,6 +784,11 @@ func (h *Handler) writeResolveError(c *gin.Context, err error) {
 }
 
 func modelPayload(provider database.RelayProvider, entry database.RelayModel) gin.H {
+	advancedParams := DecodeAdvancedParams(entry.AdvancedParams)
+	if isVivoAPIFormat(provider.APIFormat) && advancedParams.AppID == nil && advancedParams.User != nil {
+		advancedParams.AppID = advancedParams.User
+		advancedParams.User = nil
+	}
 	return gin.H{
 		"id":             entry.ModelID,
 		"object":         "model",
@@ -787,10 +797,19 @@ func modelPayload(provider database.RelayProvider, entry database.RelayModel) gi
 		"displayName":    entry.DisplayName,
 		"description":    entry.Description,
 		"capabilities":   DecodeCapabilities(entry.Capabilities),
-		"advancedParams": DecodeAdvancedParams(entry.AdvancedParams),
+		"advancedParams": advancedParams,
 		"enabled":        entry.Enabled && provider.Enabled,
 		"providerId":     fmt.Sprintf("%d", provider.ID),
 		"providerName":   provider.Name,
+	}
+}
+
+func isVivoAPIFormat(apiFormat string) bool {
+	switch normalizeAPIType(apiFormat) {
+	case APIFormatVivoOCR, APIFormatVivoLASR:
+		return true
+	default:
+		return false
 	}
 }
 

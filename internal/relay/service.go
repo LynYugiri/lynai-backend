@@ -74,6 +74,7 @@ type ModelAdvancedParams struct {
 	FrequencyPenalty *float64 `json:"frequencyPenalty,omitempty"`
 	Seed             *int     `json:"seed,omitempty"`
 	Stop             *string  `json:"stop,omitempty"`
+	AppID            *string  `json:"appId,omitempty"`
 	User             *string  `json:"user,omitempty"`
 	DebugSSE         bool     `json:"debugSse,omitempty"`
 }

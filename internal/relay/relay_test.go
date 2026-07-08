@@ -321,6 +321,50 @@ func TestConfigReturnsRelayConfig(t *testing.T) {
 	}
 }
 
+func TestConfigReturnsVivoAppID(t *testing.T) {
+	appID := "vivo-app-id"
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Updates(map[string]interface{}{
+		"models":     "",
+		"api_format": relay.APIFormatVivoOCR,
+	}).Error; err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+	entry := database.RelayModel{
+		ProviderID:     1,
+		ModelID:        "general_recognition",
+		DisplayName:    "VIVO OCR",
+		Category:       relay.CategoryOCR,
+		Capabilities:   relay.EncodeCapabilities(relay.ModelCapabilities{}),
+		AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{User: &appID}),
+		Enabled:        true,
+	}
+	if err := db.Create(&entry).Error; err != nil {
+		t.Fatalf("create relay model: %v", err)
+	}
+
+	req := authedRequest(t, http.MethodGet, server.URL+"/relay/config", token, "", nil)
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	var payload map[string]interface{}
+	testutil.DecodeJSON(t, resp, &payload)
+	providers := payload["data"].([]interface{})
+	provider := providers[0].(map[string]interface{})
+	models := provider["models"].([]interface{})
+	model := models[0].(map[string]interface{})
+	params := model["advancedParams"].(map[string]interface{})
+	if params["appId"] != appID {
+		t.Fatalf("advancedParams.appId = %v, want %s", params["appId"], appID)
+	}
+	if _, ok := params["user"]; ok {
+		t.Fatalf("advancedParams leaked user for AppID: %#v", params)
+	}
+}
+
 func TestModelsReturnsRichPayloadFromRelayModels(t *testing.T) {
 	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {})
 	req := authedRequest(t, http.MethodGet, server.URL+"/relay/models", token, "", nil)

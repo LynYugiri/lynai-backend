@@ -62,7 +62,8 @@
               <div><label>Presence Penalty</label><input type="number" name="presencePenalty" value="{{.PresencePenalty}}" step="0.01"></div>
               <div><label>Frequency Penalty</label><input type="number" name="frequencyPenalty" value="{{.FrequencyPenalty}}" step="0.01"></div>
               <div><label>Stop</label><input type="text" name="stop" value="{{.Stop}}"></div>
-              <div><label>User</label><input type="text" name="user" value="{{.User}}"></div>
+              <div><label>AppID <span class="muted">VIVO OCR/LASR</span></label><input type="text" name="appId" value="{{.AppID}}" placeholder="VIVO OCR/LASR 必填"></div>
+              <div><label>OpenAI User</label><input type="text" name="user" value="{{.User}}"></div>
             </div>
             <button type="button" class="btn btn-sm btn-danger remove-model-row" style="margin-top:10px;">删除此行</button>
           </div>

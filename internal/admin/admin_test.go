@@ -186,6 +186,61 @@ func TestAdminPanelRelayProviderModelRows(t *testing.T) {
 	}
 }
 
+func TestAdminPanelRelayVivoAppID(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+
+	client := adminClient(t)
+	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
+
+	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
+	csrf := extractCSRF(t, body)
+	resp := postForm(t, client, ts.URL+"/admin/relay/new", url.Values{
+		"_csrf":          {csrf},
+		"name":           {"Broken VIVO OCR"},
+		"endpoint":       {"https://api-ai.vivo.com.cn/ocr/general_recognition"},
+		"apiFormat":      {"vivo_ocr"},
+		"apiKey":         {"app-key"},
+		"modelId":        {"general_recognition"},
+		"category":       {"ocr"},
+		"modelEnabled_0": {"on"},
+		"enabled":        {"on"},
+	})
+	brokenBody := string(testutil.ReadAll(t, resp.Body))
+	resp.Body.Close()
+	if !strings.Contains(brokenBody, "AppID") {
+		t.Fatalf("missing AppID error not shown: %s", brokenBody)
+	}
+
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/new")
+	csrf = extractCSRF(t, body)
+	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
+		"_csrf":          {csrf},
+		"name":           {"VIVO OCR"},
+		"endpoint":       {"https://api-ai.vivo.com.cn/ocr/general_recognition"},
+		"apiFormat":      {"vivo_ocr"},
+		"apiKey":         {"app-key"},
+		"modelId":        {"general_recognition"},
+		"category":       {"ocr"},
+		"appId":          {"vivo-app-id"},
+		"modelEnabled_0": {"on"},
+		"enabled":        {"on"},
+	})
+
+	body = getAdminPage(t, client, ts.URL+"/admin/relay")
+	if !strings.Contains(body, "VIVO OCR") || !strings.Contains(body, "general_recognition (ocr)") {
+		t.Fatalf("created vivo relay provider is not visible: %s", body)
+	}
+	match := regexp.MustCompile(`/admin/relay/(\d+)/edit`).FindStringSubmatch(body)
+	if len(match) != 2 {
+		t.Fatal("edit link not found")
+	}
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/"+match[1]+"/edit")
+	if !strings.Contains(body, `value="vivo-app-id"`) || !strings.Contains(body, "AppID") {
+		t.Fatalf("edit form missing AppID: %s", body)
+	}
+}
+
 func adminClient(t *testing.T) *http.Client {
 	t.Helper()
 	jar, err := cookiejar.New(nil)

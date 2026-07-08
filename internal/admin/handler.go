@@ -346,6 +346,7 @@ type relayModelFormRow struct {
 	FrequencyPenalty string
 	Seed             string
 	Stop             string
+	AppID            string
 	User             string
 	DebugSSE         bool
 	Enabled          bool
@@ -380,16 +381,21 @@ func (h *Handler) NewRelayProviderForm(c *gin.Context) {
 }
 
 func (h *Handler) CreateRelayProvider(c *gin.Context) {
+	apiFormat := normalizeRelayAPIFormat(c.PostForm("apiFormat"))
 	models, err := parseRelayModelForm(c)
 	if err != nil {
 		h.redirectRelayNewWithError(c, "模型列表格式错误")
+		return
+	}
+	if err := validateRelayModelForm(apiFormat, models); err != nil {
+		h.redirectRelayNewWithError(c, err.Error())
 		return
 	}
 	provider := database.RelayProvider{
 		Name:      strings.TrimSpace(c.PostForm("name")),
 		Endpoint:  strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/"),
 		APIKey:    strings.TrimSpace(c.PostForm("apiKey")),
-		APIFormat: normalizeRelayAPIFormat(c.PostForm("apiFormat")),
+		APIFormat: apiFormat,
 		Enabled:   c.PostForm("enabled") == "on",
 	}
 	if provider.Name == "" || provider.Endpoint == "" || provider.APIKey == "" {
@@ -432,14 +438,19 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 	if !ok {
 		return
 	}
+	apiFormat := normalizeRelayAPIFormat(c.PostForm("apiFormat"))
 	models, err := parseRelayModelForm(c)
 	if err != nil {
 		h.redirectRelayEditWithError(c, "模型列表格式错误")
 		return
 	}
+	if err := validateRelayModelForm(apiFormat, models); err != nil {
+		h.redirectRelayEditWithError(c, err.Error())
+		return
+	}
 	provider.Name = strings.TrimSpace(c.PostForm("name"))
 	provider.Endpoint = strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/")
-	provider.APIFormat = normalizeRelayAPIFormat(c.PostForm("apiFormat"))
+	provider.APIFormat = apiFormat
 	provider.Enabled = c.PostForm("enabled") == "on"
 	if key := strings.TrimSpace(c.PostForm("apiKey")); key != "" {
 		provider.APIKey = key
@@ -531,6 +542,10 @@ func relayModelRowsFromProvider(provider database.RelayProvider) ([]relayModelFo
 		for i, entry := range provider.Entries {
 			cap := relay.DecodeCapabilities(entry.Capabilities)
 			params := relay.DecodeAdvancedParams(entry.AdvancedParams)
+			appID := stringPtrString(params.AppID)
+			if appID == "" && isVivoAppIDAPI(provider.APIFormat) {
+				appID = stringPtrString(params.User)
+			}
 			rows = append(rows, relayModelFormRow{
 				Index:            i,
 				ModelID:          entry.ModelID,
@@ -547,6 +562,7 @@ func relayModelRowsFromProvider(provider database.RelayProvider) ([]relayModelFo
 				FrequencyPenalty: floatPtrString(params.FrequencyPenalty),
 				Seed:             intPtrString(params.Seed),
 				Stop:             stringPtrString(params.Stop),
+				AppID:            appID,
 				User:             stringPtrString(params.User),
 				DebugSSE:         params.DebugSSE,
 				Enabled:          entry.Enabled,
@@ -683,11 +699,39 @@ func parseAdvancedParams(c *gin.Context, i int) (relay.ModelAdvancedParams, erro
 	if v := strings.TrimSpace(indexedPostForm(c, "stop", i)); v != "" {
 		params.Stop = &v
 	}
+	if v := strings.TrimSpace(indexedPostForm(c, "appId", i)); v != "" {
+		params.AppID = &v
+	}
 	if v := strings.TrimSpace(indexedPostForm(c, "user", i)); v != "" {
 		params.User = &v
 	}
 	params.DebugSSE = c.PostForm("debugSse_"+strconv.Itoa(i)) == "on"
 	return params, nil
+}
+
+func validateRelayModelForm(apiFormat string, models []database.RelayModel) error {
+	if !isVivoAppIDAPI(apiFormat) {
+		return nil
+	}
+	for _, model := range models {
+		if !model.Enabled {
+			continue
+		}
+		params := relay.DecodeAdvancedParams(model.AdvancedParams)
+		if params.AppID == nil || strings.TrimSpace(*params.AppID) == "" {
+			return errors.New("VIVO OCR/LASR 启用模型必须填写 AppID")
+		}
+	}
+	return nil
+}
+
+func isVivoAppIDAPI(apiFormat string) bool {
+	switch normalizeRelayAPIFormat(apiFormat) {
+	case relay.APIFormatVivoOCR, relay.APIFormatVivoLASR:
+		return true
+	default:
+		return false
+	}
 }
 
 func indexedPostForm(c *gin.Context, key string, i int) string {
