@@ -459,12 +459,14 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 		h.redirectRelayEditWithError(c, "名称、Endpoint、API Key 必填")
 		return
 	}
-	if err := h.db.Save(&provider).Error; err != nil {
+	if err := h.db.Transaction(func(tx *gorm.DB) error {
+		provider.Models = ""
+		if err := tx.Save(&provider).Error; err != nil {
+			return err
+		}
+		return replaceRelayModelsTx(tx, provider.ID, models)
+	}); err != nil {
 		h.redirectRelayEditWithError(c, "保存中转上游失败")
-		return
-	}
-	if err := h.replaceRelayModels(provider.ID, models); err != nil {
-		h.redirectRelayEditWithError(c, "保存模型配置失败")
 		return
 	}
 	c.Redirect(http.StatusFound, "/admin/relay")
@@ -641,13 +643,10 @@ func mustRelayModelsJSON(text string) string {
 	return raw
 }
 
-func (h *Handler) replaceRelayModels(providerID int64, models []database.RelayModel) error {
-	return h.db.Transaction(func(tx *gorm.DB) error {
-		return replaceRelayModelsTx(tx, providerID, models)
-	})
-}
-
 func replaceRelayModelsTx(tx *gorm.DB, providerID int64, models []database.RelayModel) error {
+	if err := tx.Model(&database.RelayProvider{}).Where("id = ?", providerID).Update("models", "").Error; err != nil {
+		return err
+	}
 	if err := tx.Where("provider_id = ?", providerID).Delete(&database.RelayModel{}).Error; err != nil {
 		return err
 	}

@@ -3,6 +3,7 @@ package relay_test
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -64,6 +65,7 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServ
 	g := r.Group("/relay")
 	g.Use(auth.AuthMiddleware(jwtMgr))
 	g.POST("/chat", handler.Chat)
+	g.POST("/v2/chat", handler.ChatV2)
 	g.POST("/messages", handler.Messages)
 	g.POST("/api/chat", handler.OllamaChat)
 	g.POST("/transcribe", handler.Transcribe)
@@ -71,6 +73,7 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServ
 	g.POST("/images/generations", handler.ImageGenerations)
 	g.GET("/models", handler.Models)
 	g.GET("/config", handler.Config)
+	g.GET("/v2/config", handler.ConfigV2)
 	server := testutil.NewTestServer(r)
 	t.Cleanup(server.Close)
 
@@ -188,6 +191,93 @@ func TestChatStripsAPITypeAndForwards(t *testing.T) {
 	}
 	if seenAuth != "Bearer upstream-secret" {
 		t.Fatalf("upstream auth = %q", seenAuth)
+	}
+	if _, ok := seenBody["api_type"]; ok {
+		t.Fatal("api_type was forwarded upstream")
+	}
+}
+
+func TestChatRequiresProviderIDForAmbiguousModel(t *testing.T) {
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be called without provider_id")
+	})
+	provider := database.RelayProvider{
+		Name:      "second upstream",
+		Endpoint:  "https://second.invalid",
+		APIKey:    "second-secret",
+		APIFormat: relay.APIFormatOpenAI,
+		Enabled:   true,
+	}
+	if err := db.Create(&provider).Error; err != nil {
+		t.Fatalf("create second provider: %v", err)
+	}
+	entry := database.RelayModel{
+		ProviderID:     provider.ID,
+		ModelID:        "gpt-rich",
+		Category:       relay.CategoryChat,
+		Capabilities:   relay.EncodeCapabilities(relay.ModelCapabilities{}),
+		AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}),
+		Enabled:        true,
+	}
+	if err := db.Create(&entry).Error; err != nil {
+		t.Fatalf("create duplicate model: %v", err)
+	}
+
+	body := []byte(`{"model":"gpt-rich","api_type":"openai","messages":[{"role":"user","content":"ping"}]}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusConflict {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status = %d, want 409: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestChatRoutesByProviderIDAndStripsIt(t *testing.T) {
+	var seenBody map[string]interface{}
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("first upstream should not be selected")
+	})
+	secondUpstream := testutil.NewTestServerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	})
+	t.Cleanup(secondUpstream.Close)
+	provider := database.RelayProvider{
+		Name:      "selected upstream",
+		Endpoint:  secondUpstream.URL,
+		APIKey:    "selected-secret",
+		APIFormat: relay.APIFormatOpenAI,
+		Enabled:   true,
+	}
+	if err := db.Create(&provider).Error; err != nil {
+		t.Fatalf("create selected provider: %v", err)
+	}
+	entry := database.RelayModel{
+		ProviderID:     provider.ID,
+		ModelID:        "gpt-rich",
+		Category:       relay.CategoryChat,
+		Capabilities:   relay.EncodeCapabilities(relay.ModelCapabilities{}),
+		AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}),
+		Enabled:        true,
+	}
+	if err := db.Create(&entry).Error; err != nil {
+		t.Fatalf("create selected model: %v", err)
+	}
+
+	body := []byte(fmt.Sprintf(`{"model":"gpt-rich","api_type":"openai","provider_id":"%d","messages":[{"role":"user","content":"ping"}]}`, provider.ID))
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	if _, ok := seenBody["provider_id"]; ok {
+		t.Fatal("provider_id was forwarded upstream")
 	}
 	if _, ok := seenBody["api_type"]; ok {
 		t.Fatal("api_type was forwarded upstream")
@@ -318,6 +408,80 @@ func TestConfigReturnsRelayConfig(t *testing.T) {
 	params := first["advancedParams"].(map[string]interface{})
 	if params["maxTokens"] != float64(2048) || params["temperature"] != 0.3 {
 		t.Fatalf("advancedParams = %#v", params)
+	}
+}
+
+func TestConfigV2SplitsProviderByCategory(t *testing.T) {
+	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {})
+	req := authedRequest(t, http.MethodGet, server.URL+"/relay/v2/config", token, "", nil)
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	var payload map[string]interface{}
+	testutil.DecodeJSON(t, resp, &payload)
+	if payload["schemaVersion"] != float64(2) {
+		t.Fatalf("schemaVersion = %v, want 2", payload["schemaVersion"])
+	}
+	providers := payload["data"].([]interface{})
+	if len(providers) != 3 {
+		t.Fatalf("provider count = %d, want 3 category-scoped providers", len(providers))
+	}
+	categories := map[string]bool{}
+	for _, raw := range providers {
+		provider := raw.(map[string]interface{})
+		category := provider["category"].(string)
+		categories[category] = true
+		models := provider["models"].([]interface{})
+		if len(models) != 1 {
+			t.Fatalf("category %s model count = %d, want 1", category, len(models))
+		}
+		model := models[0].(map[string]interface{})
+		if model["category"] != category || model["providerId"] != "1" {
+			t.Fatalf("unexpected model payload for %s: %#v", category, model)
+		}
+	}
+	for _, category := range []string{relay.CategoryChat, relay.CategorySpeech, relay.CategoryImageGeneration} {
+		if !categories[category] {
+			t.Fatalf("missing category %s", category)
+		}
+	}
+}
+
+func TestChatV2RoutesAnthropicAndStripsRelayFields(t *testing.T) {
+	var seenBody map[string]interface{}
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/messages" {
+			t.Fatalf("upstream path = %s, want /messages", r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&seenBody); err != nil {
+			t.Fatalf("decode upstream body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"content":[{"type":"text","text":"pong"}]}`))
+	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("api_format", relay.APIFormatAnthropic).Error; err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+
+	body := []byte(`{"model":"gpt-test","api_type":"anthropic","provider_id":"1","max_tokens":1024,"messages":[{"role":"user","content":"ping"}]}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/v2/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status = %d, want 200: %s", resp.StatusCode, raw)
+	}
+	if _, ok := seenBody["api_type"]; ok {
+		t.Fatal("api_type was forwarded upstream")
+	}
+	if _, ok := seenBody["provider_id"]; ok {
+		t.Fatal("provider_id was forwarded upstream")
+	}
+	if seenBody["model"] != "gpt-test" {
+		t.Fatalf("upstream model = %v", seenBody["model"])
 	}
 }
 

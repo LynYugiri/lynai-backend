@@ -121,6 +121,33 @@ curl -X POST http://localhost:8080/auth/refresh \
 
 ### LynAI 中转
 
+新版客户端优先使用 `/relay/v2/*`。旧版 `/relay/*` 端点继续保留；客户端连接不支持 v2 的旧后端时会自动回退。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| GET | `/relay/v2/config` | Bearer | 返回 schemaVersion 2 的分类 Provider 配置。一个响应 Provider 只包含同一分类的模型。 |
+| POST | `/relay/v2/chat` | Bearer | 统一托管 Chat 入口，根据 `provider_id`、`api_type` 和 `model` 转发到 OpenAI、Anthropic 或 Ollama 上游。 |
+| POST | `/relay/v2/ocr` | Bearer | v2 OCR 入口。 |
+| POST | `/relay/v2/transcribe` | Bearer | v2 语音转文字入口。 |
+| POST | `/relay/v2/speech/*` | Bearer | v2 长语音会话入口。 |
+| POST | `/relay/v2/images/generations` | Bearer | v2 图片生成入口。 |
+
+v2 Chat 请求示例：
+
+```json
+{
+  "provider_id": "1",
+  "api_type": "anthropic",
+  "model": "claude-sonnet",
+  "messages": [
+    {"role": "user", "content": "hi"}
+  ],
+  "stream": true
+}
+```
+
+`provider_id` 和 `api_type` 仅用于 LynAI 后端路由，转发上游前会被移除。v2 统一的是 LynAI 入口路径；请求和响应正文仍采用对应上游协议格式。
+
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
 | POST | `/relay/chat` | Bearer | 登录用户调用 LynAI 中转；请求体为 OpenAI Chat Completions 兼容 JSON，并包含 `api_type`（如 `openai`）。服务端按 `api_type` 和 `model` 路由到管理员配置的上游，转发前会剥离 `api_type`。支持流式 SSE 透传。 |

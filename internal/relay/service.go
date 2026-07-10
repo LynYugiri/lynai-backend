@@ -36,9 +36,10 @@ const (
 )
 
 var (
-	ErrProviderNotFound = errors.New("relay provider not found")
-	ErrUnsupportedType  = errors.New("unsupported relay api type")
-	ErrInvalidModels    = errors.New("invalid relay provider models")
+	ErrProviderNotFound  = errors.New("relay provider not found")
+	ErrAmbiguousProvider = errors.New("multiple relay providers match the requested model")
+	ErrUnsupportedType   = errors.New("unsupported relay api type")
+	ErrInvalidModels     = errors.New("invalid relay provider models")
 )
 
 var supportedAPIFormats = map[string]struct{}{
@@ -128,8 +129,10 @@ func (s *Service) ListConfig() ([]database.RelayProvider, error) {
 	return s.ListEnabled()
 }
 
-// Resolve finds an enabled provider matching apiType and model.
-func (s *Service) Resolve(apiType, model string) (*ResolvedModel, error) {
+// Resolve finds an enabled provider matching apiType and model. providerID is
+// optional for legacy clients, but required when multiple providers expose the
+// same apiType/model pair.
+func (s *Service) Resolve(apiType, model string, providerIDs ...string) (*ResolvedModel, error) {
 	apiType = normalizeAPIType(apiType)
 	if !IsSupportedAPIFormat(apiType) {
 		return nil, ErrUnsupportedType
@@ -138,36 +141,65 @@ func (s *Service) Resolve(apiType, model string) (*ResolvedModel, error) {
 	if model == "" {
 		return nil, ErrProviderNotFound
 	}
+	providerID := ""
+	if len(providerIDs) > 0 {
+		providerID = strings.TrimSpace(providerIDs[0])
+	}
 
-	var entry database.RelayModel
-	if err := s.db.Joins("JOIN relay_providers ON relay_providers.id = relay_models.provider_id").
+	query := s.db.Joins("JOIN relay_providers ON relay_providers.id = relay_models.provider_id").
 		Where("relay_models.enabled = ? AND relay_models.model_id = ? AND relay_providers.enabled = ? AND relay_providers.api_format = ?", true, model, true, apiType).
-		Order("relay_providers.created_at ASC, relay_models.created_at ASC").
-		First(&entry).Error; err == nil {
+		Order("relay_providers.created_at ASC, relay_models.created_at ASC")
+	if providerID != "" {
+		query = query.Where("relay_providers.id = ?", providerID)
+	}
+	var entries []database.RelayModel
+	if err := query.Limit(2).Find(&entries).Error; err != nil {
+		return nil, err
+	}
+	if len(entries) > 1 && providerID == "" {
+		return nil, ErrAmbiguousProvider
+	}
+	var resolved *ResolvedModel
+	if len(entries) == 1 {
+		entry := entries[0]
 		var provider database.RelayProvider
 		if err := s.db.First(&provider, "id = ?", entry.ProviderID).Error; err != nil {
 			return nil, err
 		}
-		return &ResolvedModel{Provider: provider, Model: entry}, nil
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
+		resolved = &ResolvedModel{Provider: provider, Model: entry}
+		if providerID != "" {
+			return resolved, nil
+		}
 	}
 
 	// Legacy fallback for providers that have not been expanded into RelayModel rows yet.
 	var providers []database.RelayProvider
-	if err := s.db.Where("enabled = ? AND api_format = ?", true, apiType).Order("created_at ASC").Find(&providers).Error; err != nil {
+	legacyQuery := s.db.Preload("Entries").Where("enabled = ? AND api_format = ?", true, apiType).Order("created_at ASC")
+	if providerID != "" {
+		legacyQuery = legacyQuery.Where("id = ?", providerID)
+	}
+	if err := legacyQuery.Find(&providers).Error; err != nil {
 		return nil, err
 	}
 	for i := range providers {
+		if len(providers[i].Entries) > 0 {
+			continue
+		}
 		models, err := DecodeModels(providers[i].Models)
 		if err != nil {
 			return nil, err
 		}
 		for _, candidate := range models {
 			if candidate == model {
-				return &ResolvedModel{Provider: providers[i], Model: database.RelayModel{ProviderID: providers[i].ID, ModelID: model, Category: CategoryChat, Enabled: true}}, nil
+				if resolved != nil && resolved.Provider.ID != providers[i].ID && providerID == "" {
+					return nil, ErrAmbiguousProvider
+				}
+				resolved = &ResolvedModel{Provider: providers[i], Model: database.RelayModel{ProviderID: providers[i].ID, ModelID: model, Category: CategoryChat, Enabled: true}}
 			}
 		}
+	}
+	if resolved != nil {
+		return resolved, nil
 	}
 	return nil, ErrProviderNotFound
 }

@@ -34,12 +34,12 @@ func (h *Handler) Messages(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
 		return
 	}
-	model, stream, err := modelAndStreamFromJSON(body)
+	forwardBody, model, providerID, stream, err := prepareRoutedBody(body)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	resolved, err := h.svc.Resolve(APIFormatAnthropic, model)
+	resolved, err := h.svc.Resolve(APIFormatAnthropic, model, providerID)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
@@ -48,7 +48,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
 	}
-	resp, err := h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, body)
+	resp, err := h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, forwardBody)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
@@ -64,12 +64,12 @@ func (h *Handler) OllamaChat(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
 		return
 	}
-	model, stream, err := modelAndStreamFromJSON(body)
+	forwardBody, model, providerID, stream, err := prepareRoutedBody(body)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	resolved, err := h.svc.Resolve(APIFormatOllama, model)
+	resolved, err := h.svc.Resolve(APIFormatOllama, model, providerID)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
@@ -78,7 +78,7 @@ func (h *Handler) OllamaChat(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
 	}
-	resp, err := h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, body)
+	resp, err := h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, forwardBody)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
@@ -109,23 +109,15 @@ func (h *Handler) Chat(c *gin.Context) {
 		return
 	}
 
-	forwardBody, apiType, model, stream, err := prepareForwardBody(body)
+	forwardBody, apiType, model, providerID, stream, err := prepareForwardBody(body)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
 
-	resolved, err := h.svc.Resolve(apiType, model)
+	resolved, err := h.svc.Resolve(apiType, model, providerID)
 	if err != nil {
-		if errors.Is(err, ErrUnsupportedType) {
-			writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "unsupported api_type")
-			return
-		}
-		if errors.Is(err, ErrProviderNotFound) {
-			writeOpenAIError(c, http.StatusNotFound, "not_found_error", "no relay provider is configured for the requested api_type and model")
-			return
-		}
-		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to resolve relay provider")
+		h.writeResolveError(c, err)
 		return
 	}
 
@@ -158,6 +150,50 @@ func (h *Handler) Chat(c *gin.Context) {
 	_, _ = io.Copy(c.Writer, resp.Body)
 }
 
+// ChatV2 exposes one managed chat endpoint regardless of the upstream API
+// format. The request and response payload remain native to the configured
+// provider so existing protocol adapters can be reused by the client.
+func (h *Handler) ChatV2(c *gin.Context) {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxRelayBodyBytes))
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
+		return
+	}
+	forwardBody, apiType, model, providerID, stream, err := prepareForwardBody(body)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return
+	}
+	resolved, err := h.svc.Resolve(apiType, model, providerID)
+	if err != nil {
+		h.writeResolveError(c, err)
+		return
+	}
+	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
+		return
+	}
+
+	var resp *http.Response
+	switch normalizeAPIType(resolved.Provider.APIFormat) {
+	case APIFormatOpenAI:
+		resp, err = h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, forwardBody)
+	case APIFormatAnthropic:
+		resp, err = h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, forwardBody)
+	case APIFormatOllama:
+		resp, err = h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, forwardBody)
+	default:
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested provider does not support chat")
+		return
+	}
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		return
+	}
+	defer resp.Body.Close()
+	writeUpstreamResponse(c, resp, stream)
+}
+
 // Transcribe forwards an OpenAI-compatible audio transcription request.
 func (h *Handler) Transcribe(c *gin.Context) {
 	if err := c.Request.ParseMultipartForm(maxRelayBodyBytes); err != nil {
@@ -166,11 +202,12 @@ func (h *Handler) Transcribe(c *gin.Context) {
 	}
 	model := strings.TrimSpace(c.Request.FormValue("model"))
 	apiType := normalizeAPIType(c.Request.FormValue("api_type"))
+	providerID := relayProviderIDFromForm(c.Request)
 	if model == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
-	resolved, err := h.svc.Resolve(apiType, model)
+	resolved, err := h.svc.Resolve(apiType, model, providerID)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
@@ -180,6 +217,8 @@ func (h *Handler) Transcribe(c *gin.Context) {
 		return
 	}
 	delete(c.Request.MultipartForm.Value, "api_type")
+	delete(c.Request.MultipartForm.Value, "provider_id")
+	delete(c.Request.MultipartForm.Value, "providerId")
 	body, contentType, err := CloneMultipartForm(c.Request.MultipartForm)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to prepare multipart request")
@@ -204,11 +243,12 @@ func (h *Handler) OCR(c *gin.Context) {
 	}
 	model := strings.TrimSpace(c.Request.FormValue("model"))
 	apiType := normalizeAPIType(c.Request.FormValue("api_type"))
+	providerID := relayProviderIDFromForm(c.Request)
 	if model == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
-	resolved, err := h.svc.Resolve(apiType, model)
+	resolved, err := h.svc.Resolve(apiType, model, providerID)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
@@ -240,7 +280,8 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 	}
 	model := strings.TrimSpace(fmt.Sprint(body["model"]))
 	apiType := normalizeAPIType(fmt.Sprint(body["api_type"]))
-	resolved, err := h.svc.Resolve(apiType, model)
+	providerID := relayProviderID(body)
+	resolved, err := h.svc.Resolve(apiType, model, providerID)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
@@ -355,12 +396,12 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
 		return
 	}
-	forwardBody, apiType, model, _, err := prepareForwardBody(body)
+	forwardBody, apiType, model, providerID, _, err := prepareForwardBody(body)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	resolved, err := h.svc.Resolve(apiType, model)
+	resolved, err := h.svc.Resolve(apiType, model, providerID)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
@@ -460,20 +501,6 @@ func (h *Handler) writeVivoImageResponse(c *gin.Context, resp *http.Response) {
 	c.JSON(http.StatusOK, gin.H{"created": 0, "data": data})
 }
 
-func modelAndStreamFromJSON(raw []byte) (string, bool, error) {
-	var body map[string]interface{}
-	if err := json.Unmarshal(raw, &body); err != nil {
-		return "", false, fmt.Errorf("invalid JSON body")
-	}
-	model, _ := body["model"].(string)
-	model = strings.TrimSpace(model)
-	if model == "" {
-		return "", false, fmt.Errorf("model is required")
-	}
-	stream, _ := body["stream"].(bool)
-	return model, stream, nil
-}
-
 func writeUpstreamResponse(c *gin.Context, resp *http.Response, stream bool) {
 	copyResponseHeaders(c, resp.Header)
 	c.Status(resp.StatusCode)
@@ -520,6 +547,57 @@ func (h *Handler) Config(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"object": "relay_config", "data": data})
+}
+
+// ConfigV2 returns providers split by model category. It coexists with the v1
+// config while clients migrate to category-scoped managed providers.
+func (h *Handler) ConfigV2(c *gin.Context) {
+	providers, err := h.svc.ListConfig()
+	if err != nil {
+		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to list relay config")
+		return
+	}
+	data := make([]gin.H, 0)
+	for _, provider := range providers {
+		entries := provider.Entries
+		if len(entries) == 0 {
+			entries, err = legacyEntries(provider)
+			if err != nil {
+				writeOpenAIError(c, http.StatusInternalServerError, "server_error", "invalid relay provider model list")
+				return
+			}
+		}
+		byCategory := map[string][]database.RelayModel{}
+		categoryOrder := make([]string, 0, 4)
+		for _, entry := range entries {
+			category := NormalizeCategory(entry.Category)
+			if _, exists := byCategory[category]; !exists {
+				categoryOrder = append(categoryOrder, category)
+			}
+			byCategory[category] = append(byCategory[category], entry)
+		}
+		for _, category := range categoryOrder {
+			models := make([]gin.H, 0, len(byCategory[category]))
+			for _, entry := range byCategory[category] {
+				models = append(models, modelPayload(provider, entry))
+			}
+			data = append(data, gin.H{
+				"id":        fmt.Sprintf("%d", provider.ID),
+				"name":      provider.Name,
+				"category":  category,
+				"apiType":   normalizeAPIType(provider.APIFormat),
+				"enabled":   provider.Enabled,
+				"defaults":  gin.H{},
+				"models":    models,
+				"updatedAt": provider.UpdatedAt,
+			})
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"object":        "relay_config",
+		"schemaVersion": 2,
+		"data":          data,
+	})
 }
 
 func (h *Handler) forwardVivoOCR(c *gin.Context, resolved *ResolvedModel, image []byte) {
@@ -746,25 +824,59 @@ func extractVivoSpeechText(payload map[string]interface{}) string {
 	return strings.Join(parts, "")
 }
 
-func prepareForwardBody(raw []byte) ([]byte, string, string, bool, error) {
+func prepareForwardBody(raw []byte) ([]byte, string, string, string, bool, error) {
+	forwardBody, model, providerID, stream, apiType, err := prepareRoutedBodyWithAPIType(raw)
+	return forwardBody, apiType, model, providerID, stream, err
+}
+
+func prepareRoutedBody(raw []byte) ([]byte, string, string, bool, error) {
+	forwardBody, model, providerID, stream, _, err := prepareRoutedBodyWithAPIType(raw)
+	if err != nil {
+		return nil, "", "", false, err
+	}
+	return forwardBody, model, providerID, stream, nil
+}
+
+func prepareRoutedBodyWithAPIType(raw []byte) ([]byte, string, string, bool, string, error) {
 	var body map[string]interface{}
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, "", "", false, fmt.Errorf("invalid JSON body")
+		return nil, "", "", false, "", fmt.Errorf("invalid JSON body")
 	}
 	model, _ := body["model"].(string)
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return nil, "", "", false, fmt.Errorf("model is required")
+		return nil, "", "", false, "", fmt.Errorf("model is required")
 	}
 	apiType, _ := body["api_type"].(string)
 	apiType = normalizeAPIType(apiType)
+	providerID := relayProviderID(body)
 	stream, _ := body["stream"].(bool)
 	delete(body, "api_type")
+	delete(body, "provider_id")
+	delete(body, "providerId")
 	forwardBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, "", "", false, fmt.Errorf("failed to encode request body")
+		return nil, "", "", false, "", fmt.Errorf("failed to encode request body")
 	}
-	return forwardBody, apiType, model, stream, nil
+	return forwardBody, model, providerID, stream, apiType, nil
+}
+
+func relayProviderID(body map[string]interface{}) string {
+	if value := strings.TrimSpace(fmt.Sprint(body["provider_id"])); value != "" && value != "<nil>" {
+		return value
+	}
+	value := strings.TrimSpace(fmt.Sprint(body["providerId"]))
+	if value == "<nil>" {
+		return ""
+	}
+	return value
+}
+
+func relayProviderIDFromForm(request *http.Request) string {
+	if value := strings.TrimSpace(request.FormValue("provider_id")); value != "" {
+		return value
+	}
+	return strings.TrimSpace(request.FormValue("providerId"))
 }
 
 func writeOpenAIError(c *gin.Context, status int, typ, message string) {
@@ -778,6 +890,10 @@ func (h *Handler) writeResolveError(c *gin.Context, err error) {
 	}
 	if errors.Is(err, ErrProviderNotFound) {
 		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "no relay provider is configured for the requested api_type and model")
+		return
+	}
+	if errors.Is(err, ErrAmbiguousProvider) {
+		writeOpenAIError(c, http.StatusConflict, "ambiguous_route", "multiple relay providers expose the requested model; provider_id is required")
 		return
 	}
 	writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to resolve relay provider")
