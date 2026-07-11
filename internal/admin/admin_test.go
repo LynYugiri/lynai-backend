@@ -150,10 +150,10 @@ func TestAdminPanelRelayProviderModelRows(t *testing.T) {
 		"endpoint":         {"https://api.example.com/v1"},
 		"apiFormat":        {"openai"},
 		"apiKey":           {"secret-key"},
-		"modelId":          {"gpt-admin", "whisper-admin"},
-		"displayName":      {"GPT Admin", "Whisper Admin"},
-		"description":      {"chat entry", "speech entry"},
-		"category":         {"chat", "speech"},
+		"modelId":          {"gpt-admin", "ocr-admin"},
+		"displayName":      {"GPT Admin", "OCR Admin"},
+		"description":      {"chat entry", "ocr entry"},
+		"category":         {"chat", "ocr"},
 		"maxTokens":        {"4096", ""},
 		"temperature":      {"0.2", ""},
 		"topP":             {"0.9", ""},
@@ -171,7 +171,7 @@ func TestAdminPanelRelayProviderModelRows(t *testing.T) {
 	})
 
 	body = getAdminPage(t, client, ts.URL+"/admin/relay")
-	if !strings.Contains(body, "Rich OpenAI") || !strings.Contains(body, "gpt-admin (chat)") || !strings.Contains(body, "whisper-admin (speech)") {
+	if !strings.Contains(body, "Rich OpenAI") || !strings.Contains(body, "gpt-admin (chat)") || !strings.Contains(body, "ocr-admin (ocr)") {
 		t.Fatalf("created relay model rows are not visible: %s", body)
 	}
 	match := regexp.MustCompile(`/admin/relay/(\d+)/edit`).FindStringSubmatch(body)
@@ -179,7 +179,7 @@ func TestAdminPanelRelayProviderModelRows(t *testing.T) {
 		t.Fatal("edit link not found")
 	}
 	body = getAdminPage(t, client, ts.URL+"/admin/relay/"+match[1]+"/edit")
-	for _, want := range []string{"GPT Admin", "Whisper Admin", "value=\"4096\"", "value=\"0.2\"", "value=\"0.9\"", "value=\"42\"", "value=\"END\"", "value=\"local-user\""} {
+	for _, want := range []string{"GPT Admin", "OCR Admin", "value=\"4096\"", "value=\"0.2\"", "value=\"0.9\"", "value=\"42\"", ">END</textarea>", "value=\"local-user\""} {
 		if !strings.Contains(body, want) {
 			t.Fatalf("edit form missing %q", want)
 		}
@@ -238,6 +238,41 @@ func TestAdminPanelRelayVivoAppID(t *testing.T) {
 	body = getAdminPage(t, client, ts.URL+"/admin/relay/"+match[1]+"/edit")
 	if !strings.Contains(body, `value="vivo-app-id"`) || !strings.Contains(body, "AppID") {
 		t.Fatalf("edit form missing AppID: %s", body)
+	}
+}
+
+func TestAdminPanelRelayRejectsInvalidTypeAndCategory(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+	client := adminClient(t)
+	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
+	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
+	csrf := extractCSRF(t, body)
+	resp := postForm(t, client, ts.URL+"/admin/relay/new", url.Values{
+		"_csrf": {csrf}, "name": {"Bad"}, "endpoint": {"https://example.com"}, "apiFormat": {"vivo_image"},
+		"apiKey": {"key"}, "modelId": {"image"}, "category": {"chat"}, "modelEnabled_0": {"on"},
+	})
+	raw := string(testutil.ReadAll(t, resp.Body))
+	resp.Body.Close()
+	if !strings.Contains(raw, "API Type") || !strings.Contains(raw, "模型分类") {
+		t.Fatalf("missing category validation: %s", raw)
+	}
+}
+
+func TestAdminPanelRelayAllowsOllamaWithoutAPIKey(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+	client := adminClient(t)
+	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
+	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
+	csrf := extractCSRF(t, body)
+	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
+		"_csrf": {csrf}, "name": {"Local Ollama"}, "endpoint": {"http://localhost:11434"}, "apiFormat": {"ollama"},
+		"modelId": {"qwen"}, "category": {"chat"}, "modelEnabled_0": {"on"}, "enabled": {"on"},
+	})
+	body = getAdminPage(t, client, ts.URL+"/admin/relay")
+	if !strings.Contains(body, "Local Ollama") {
+		t.Fatalf("ollama provider was not created: %s", body)
 	}
 }
 

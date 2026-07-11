@@ -324,7 +324,7 @@ func TestChatRejectsUnsupportedAPIType(t *testing.T) {
 
 func TestMessagesForwardsAnthropic(t *testing.T) {
 	var seenKey, seenVersion string
-	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/messages" {
 			t.Fatalf("upstream path = %s, want /messages", r.URL.Path)
 		}
@@ -337,7 +337,7 @@ func TestMessagesForwardsAnthropic(t *testing.T) {
 		t.Fatalf("update provider: %v", err)
 	}
 
-	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"ping"}]}`)
+	body := []byte(`{"model":"gpt-rich","messages":[{"role":"user","content":"ping"}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/messages", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -352,7 +352,7 @@ func TestMessagesForwardsAnthropic(t *testing.T) {
 
 func TestOllamaChatForwards(t *testing.T) {
 	var seenAuth string
-	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/chat" {
 			t.Fatalf("upstream path = %s, want /api/chat", r.URL.Path)
 		}
@@ -364,7 +364,7 @@ func TestOllamaChatForwards(t *testing.T) {
 		t.Fatalf("update provider: %v", err)
 	}
 
-	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":"ping"}],"stream":false}`)
+	body := []byte(`{"model":"gpt-rich","messages":[{"role":"user","content":"ping"}],"stream":false}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/api/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -452,7 +452,7 @@ func TestConfigV2SplitsProviderByCategory(t *testing.T) {
 
 func TestChatV2RoutesAnthropicAndStripsRelayFields(t *testing.T) {
 	var seenBody map[string]interface{}
-	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/messages" {
 			t.Fatalf("upstream path = %s, want /messages", r.URL.Path)
 		}
@@ -466,7 +466,7 @@ func TestChatV2RoutesAnthropicAndStripsRelayFields(t *testing.T) {
 		t.Fatalf("update provider: %v", err)
 	}
 
-	body := []byte(`{"model":"gpt-test","api_type":"anthropic","provider_id":"1","max_tokens":1024,"messages":[{"role":"user","content":"ping"}]}`)
+	body := []byte(`{"model":"gpt-rich","api_type":"anthropic","provider_id":"1","messages":[{"role":"user","content":"ping"}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/v2/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -480,8 +480,11 @@ func TestChatV2RoutesAnthropicAndStripsRelayFields(t *testing.T) {
 	if _, ok := seenBody["provider_id"]; ok {
 		t.Fatal("provider_id was forwarded upstream")
 	}
-	if seenBody["model"] != "gpt-test" {
+	if seenBody["model"] != "gpt-rich" {
 		t.Fatalf("upstream model = %v", seenBody["model"])
+	}
+	if seenBody["max_tokens"] != float64(2048) || seenBody["temperature"] != 0.3 {
+		t.Fatalf("model defaults were not forwarded: %#v", seenBody)
 	}
 }
 
@@ -529,6 +532,50 @@ func TestConfigReturnsVivoAppID(t *testing.T) {
 	}
 }
 
+func TestApplyModelDefaultsPreservesClientValues(t *testing.T) {
+	maxTokens := 2048
+	temperature := 0.3
+	topP := 0.8
+	model := database.RelayModel{AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{
+		MaxTokens: &maxTokens, Temperature: &temperature, TopP: &topP, Stop: []string{"END", "STOP"},
+	})}
+	raw, err := relay.ApplyModelDefaults(relay.APIFormatOpenAI, []byte(`{"model":"gpt-test","temperature":0.9}`), model)
+	if err != nil {
+		t.Fatalf("apply defaults: %v", err)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode defaults: %v", err)
+	}
+	if body["temperature"] != 0.9 || body["max_tokens"] != float64(2048) || body["top_p"] != 0.8 {
+		t.Fatalf("defaults = %#v", body)
+	}
+	stop := body["stop"].([]interface{})
+	if len(stop) != 2 || stop[0] != "END" {
+		t.Fatalf("stop = %#v", stop)
+	}
+}
+
+func TestApplyOllamaDefaultsAndLegacyStop(t *testing.T) {
+	params := relay.DecodeAdvancedParams(`{"maxTokens":512,"temperature":0.4,"stop":"END"}`)
+	if len(params.Stop) != 1 || params.Stop[0] != "END" {
+		t.Fatalf("legacy stop = %#v", params.Stop)
+	}
+	model := database.RelayModel{AdvancedParams: relay.EncodeAdvancedParams(params)}
+	raw, err := relay.ApplyModelDefaults(relay.APIFormatOllama, []byte(`{"model":"qwen","options":{"temperature":0.7}}`), model)
+	if err != nil {
+		t.Fatalf("apply defaults: %v", err)
+	}
+	var body map[string]interface{}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("decode defaults: %v", err)
+	}
+	options := body["options"].(map[string]interface{})
+	if options["temperature"] != 0.7 || options["num_predict"] != float64(512) {
+		t.Fatalf("options = %#v", options)
+	}
+}
+
 func TestModelsReturnsRichPayloadFromRelayModels(t *testing.T) {
 	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {})
 	req := authedRequest(t, http.MethodGet, server.URL+"/relay/models", token, "", nil)
@@ -559,7 +606,7 @@ func TestChatRejectsSpeechModel(t *testing.T) {
 
 func TestTranscribeForwardsSpeechModel(t *testing.T) {
 	var seenAuth, seenModel, seenAPIType string
-	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/audio/transcriptions" {
 			t.Fatalf("upstream path = %s, want /audio/transcriptions", r.URL.Path)
 		}
@@ -572,8 +619,11 @@ func TestTranscribeForwardsSpeechModel(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"text":"hello"}`))
 	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("api_format", relay.APIFormatOpenAISpeech).Error; err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
 
-	body, contentType := multipartBody(t, map[string]string{"model": "whisper-test", "api_type": "openai", "response_format": "json"})
+	body, contentType := multipartBody(t, map[string]string{"model": "whisper-test", "api_type": "openai_speech", "response_format": "json"})
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/transcribe", token, contentType, body)
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()

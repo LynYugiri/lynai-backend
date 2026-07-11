@@ -101,6 +101,7 @@ type RelayProvider struct {
 	Endpoint  string `gorm:"not null" json:"endpoint"`
 	APIKey    string `gorm:"not null" json:"-"`
 	APIFormat string `gorm:"not null;index" json:"apiFormat"`
+	Config    string `gorm:"type:text" json:"-"`
 	// Models is kept only for migrating legacy newline/JSON model lists into RelayModel rows.
 	Models    string       `gorm:"type:text" json:"-"`
 	Enabled   bool         `gorm:"default:true;index" json:"enabled"`

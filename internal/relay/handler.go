@@ -48,6 +48,11 @@ func (h *Handler) Messages(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
 	}
+	forwardBody, err = ApplyModelDefaults(APIFormatAnthropic, forwardBody, resolved.Model)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+		return
+	}
 	resp, err := h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, forwardBody)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
@@ -76,6 +81,11 @@ func (h *Handler) OllamaChat(c *gin.Context) {
 	}
 	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
+		return
+	}
+	forwardBody, err = ApplyModelDefaults(APIFormatOllama, forwardBody, resolved.Model)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
 		return
 	}
 	resp, err := h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, forwardBody)
@@ -123,6 +133,11 @@ func (h *Handler) Chat(c *gin.Context) {
 
 	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
+		return
+	}
+	forwardBody, err = ApplyModelDefaults(resolved.Provider.APIFormat, forwardBody, resolved.Model)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
 		return
 	}
 	if normalizeAPIType(resolved.Provider.APIFormat) != APIFormatOpenAI {
@@ -173,6 +188,11 @@ func (h *Handler) ChatV2(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
 	}
+	forwardBody, err = ApplyModelDefaults(resolved.Provider.APIFormat, forwardBody, resolved.Model)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+		return
+	}
 
 	var resp *http.Response
 	switch normalizeAPIType(resolved.Provider.APIFormat) {
@@ -214,6 +234,10 @@ func (h *Handler) Transcribe(c *gin.Context) {
 	}
 	if resolved.Model.Category != CategorySpeech {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a speech-to-text model")
+		return
+	}
+	if normalizeAPIType(resolved.Provider.APIFormat) != APIFormatOpenAISpeech {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested provider does not support OpenAI transcription")
 		return
 	}
 	delete(c.Request.MultipartForm.Value, "api_type")
@@ -290,13 +314,13 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "speech session is only supported for vivo_lasr")
 		return
 	}
-	appID := relayModelAppID(resolved.Model)
+	appID := relayProviderAppID(resolved.Provider, resolved.Model)
 	if appID == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_lasr requires AppID in model advanced parameters")
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_lasr requires provider AppID")
 		return
 	}
 	sessionID := strconv.FormatInt(time.Now().UnixNano(), 10)
-	query := vivoSpeechQuery(appID, resolved.Model.ModelID)
+	query := vivoSpeechQuery(resolved.Provider, appID, resolved.Model.ModelID)
 	upstreamBody := map[string]interface{}{
 		"audio_type":  fmt.Sprint(body["audio_type"]),
 		"x-sessionId": sessionID,
@@ -342,7 +366,7 @@ func (h *Handler) SpeechUpload(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to prepare multipart request")
 		return
 	}
-	query := vivoSpeechQuery(session.AppID, session.Model.ModelID)
+	query := vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID)
 	query.Set("audio_id", session.UpstreamAudioID)
 	query.Set("x-sessionId", c.Param("audioId"))
 	query.Set("slice_index", c.DefaultQuery("slice_index", c.Request.FormValue("slice_index")))
@@ -364,7 +388,7 @@ func (h *Handler) SpeechRun(c *gin.Context) {
 	if !ok {
 		return
 	}
-	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, "/lasr/run", vivoSpeechQuery(session.AppID, session.Model.ModelID), raw)
+	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, "/lasr/run", vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID), raw)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
@@ -408,6 +432,11 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 	}
 	if resolved.Model.Category != CategoryImageGeneration {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not an image generation model")
+		return
+	}
+	forwardBody, err = ApplyModelDefaults(resolved.Provider.APIFormat, forwardBody, resolved.Model)
+	if err != nil {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
 		return
 	}
 	var resp *http.Response
@@ -601,17 +630,18 @@ func (h *Handler) ConfigV2(c *gin.Context) {
 }
 
 func (h *Handler) forwardVivoOCR(c *gin.Context, resolved *ResolvedModel, image []byte) {
-	appID := relayModelAppID(resolved.Model)
+	appID := relayProviderAppID(resolved.Provider, resolved.Model)
 	if appID == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_ocr requires AppID in model advanced parameters")
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_ocr requires provider AppID")
 		return
 	}
 	query := url.Values{}
 	query.Set("requestId", strconv.FormatInt(time.Now().UnixNano(), 10))
 	form := url.Values{}
 	form.Set("image", base64.StdEncoding.EncodeToString(image))
-	form.Set("pos", "2")
-	form.Set("businessid", "aigc"+appID)
+	config := DecodeProviderConfig(resolved.Provider.Config)
+	form.Set("pos", defaultProviderValue(config.OCRPos, "2"))
+	form.Set("businessid", defaultProviderValue(config.BusinessIDPrefix, "aigc")+appID)
 	resp, err := h.svc.ForwardVivoForm(c.Request.Context(), &resolved.Provider, "", query, form)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
@@ -691,7 +721,7 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 	if !ok {
 		return
 	}
-	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, path, vivoSpeechQuery(session.AppID, session.Model.ModelID), raw)
+	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, path, vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID), raw)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
@@ -705,7 +735,10 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 	c.JSON(resp.StatusCode, gin.H{"text": extractVivoSpeechText(payload), "raw": payload})
 }
 
-func relayModelAppID(model database.RelayModel) string {
+func relayProviderAppID(provider database.RelayProvider, model database.RelayModel) string {
+	if appID := strings.TrimSpace(DecodeProviderConfig(provider.Config).AppID); appID != "" {
+		return appID
+	}
 	params := DecodeAdvancedParams(model.AdvancedParams)
 	if params.AppID != nil {
 		if appID := strings.TrimSpace(*params.AppID); appID != "" {
@@ -718,15 +751,23 @@ func relayModelAppID(model database.RelayModel) string {
 	return strings.TrimSpace(*params.User)
 }
 
-func vivoSpeechQuery(appID, engineID string) url.Values {
+func vivoSpeechQuery(provider database.RelayProvider, appID, engineID string) url.Values {
+	config := DecodeProviderConfig(provider.Config)
 	query := url.Values{}
-	query.Set("client_version", "1.0.0")
-	query.Set("package", "lynai")
+	query.Set("client_version", defaultProviderValue(config.ClientVersion, "1.0.0"))
+	query.Set("package", defaultProviderValue(config.Package, "lynai"))
 	query.Set("user_id", strings.ToLower((appID + strings.Repeat("0", 32))[:32]))
 	query.Set("system_time", strconv.FormatInt(time.Now().UnixMilli(), 10))
 	query.Set("engineid", engineID)
 	query.Set("requestId", strconv.FormatInt(time.Now().UnixNano(), 10))
 	return query
+}
+
+func defaultProviderValue(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func decodeJSONResponse(resp *http.Response) (map[string]interface{}, []byte, error) {
@@ -901,9 +942,14 @@ func (h *Handler) writeResolveError(c *gin.Context, err error) {
 
 func modelPayload(provider database.RelayProvider, entry database.RelayModel) gin.H {
 	advancedParams := DecodeAdvancedParams(entry.AdvancedParams)
-	if isVivoAPIFormat(provider.APIFormat) && advancedParams.AppID == nil && advancedParams.User != nil {
-		advancedParams.AppID = advancedParams.User
-		advancedParams.User = nil
+	if isVivoAPIFormat(provider.APIFormat) {
+		appID := relayProviderAppID(provider, entry)
+		if appID != "" {
+			advancedParams.AppID = &appID
+		}
+		if advancedParams.User != nil && advancedParams.AppID != nil && *advancedParams.User == *advancedParams.AppID {
+			advancedParams.User = nil
+		}
 	}
 	return gin.H{
 		"id":             entry.ModelID,

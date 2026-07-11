@@ -17,7 +17,7 @@
       <div class="form-group"><label>名称</label><input type="text" name="name" value="{{.Name}}" required></div>
       <div class="form-group"><label>Endpoint</label><input type="url" name="endpoint" value="{{.Endpoint}}" placeholder="https://api.openai.com/v1" required></div>
       <div class="form-group"><label>API Type</label>
-        <select name="apiFormat">
+        <select id="apiFormat" name="apiFormat">
           <option value="openai" {{if eq .APIFormat "openai"}}selected{{end}}>openai</option>
           <option value="anthropic" {{if eq .APIFormat "anthropic"}}selected{{end}}>anthropic</option>
           <option value="ollama" {{if eq .APIFormat "ollama"}}selected{{end}}>ollama</option>
@@ -28,7 +28,15 @@
           <option value="vivo_ocr" {{if eq .APIFormat "vivo_ocr"}}selected{{end}}>vivo_ocr</option>
         </select>
       </div>
-      <div class="form-group"><label>API Key {{if .Provider}}<span class="muted">（留空表示不修改）</span>{{end}}</label><input type="password" name="apiKey" {{if not .Provider}}required{{end}} autocomplete="off"></div>
+      <div class="form-group"><label id="apiKeyLabel">API Key {{if .Provider}}<span class="muted">（留空表示不修改）</span>{{end}}</label><input id="apiKey" type="password" name="apiKey" {{if not .Provider}}required{{end}} autocomplete="off"></div>
+      <div id="vivoAccountFields" style="display:none;grid-template-columns:repeat(2,minmax(180px,1fr));gap:10px;">
+        <div class="form-group"><label>AppID</label><input type="text" name="appId" value="{{.AppID}}"></div>
+        <div class="form-group vivo-lasr"><label>Client Version</label><input type="text" name="clientVersion" value="{{.ClientVersion}}"></div>
+        <div class="form-group vivo-lasr"><label>Package</label><input type="text" name="package" value="{{.Package}}"></div>
+        <div class="form-group vivo-ocr"><label>OCR Pos</label><input type="text" name="ocrPos" value="{{.OCRPos}}"></div>
+        <div class="form-group vivo-ocr"><label>Business ID 前缀</label><input type="text" name="businessIdPrefix" value="{{.BusinessIDPrefix}}"></div>
+      </div>
+      <div id="vivoImageFields" class="form-group" style="display:none;"><label>Image Module</label><input type="text" name="imageModule" value="{{.ImageModule}}"></div>
       <div class="form-group">
         <label>模型配置 <span class="muted">（留空的模型 ID 行会被忽略；云端启用后会同步到用户端并默认启用）</span></label>
         <div id="modelRows" style="display:flex;flex-direction:column;gap:16px;">
@@ -48,21 +56,20 @@
               <label style="white-space:nowrap;"><input type="checkbox" name="modelEnabled_{{.Index}}" {{if .Enabled}}checked{{end}} style="width:auto;"> 启用</label>
             </div>
             <div style="margin-top:10px;"><label>描述</label><input type="text" name="description" value="{{.Description}}" placeholder="可选"></div>
-            <div style="display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;">
+            <div class="chat-capabilities" style="display:flex;gap:18px;flex-wrap:wrap;margin-top:10px;">
               <label><input type="checkbox" name="supportsVision_{{.Index}}" {{if .SupportsVision}}checked{{end}} style="width:auto;"> 视觉</label>
               <label><input type="checkbox" name="supportsThinking_{{.Index}}" {{if .SupportsThinking}}checked{{end}} style="width:auto;"> 思考</label>
               <label><input type="checkbox" name="supportsTools_{{.Index}}" {{if .SupportsTools}}checked{{end}} style="width:auto;"> 工具使用</label>
               <label><input type="checkbox" name="debugSse_{{.Index}}" {{if .DebugSSE}}checked{{end}} style="width:auto;"> SSE 调试日志</label>
             </div>
-            <div style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:10px;">
+            <div class="chat-params" style="display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:10px;">
               <div><label>Max Tokens</label><input type="number" name="maxTokens" value="{{.MaxTokens}}" min="1"></div>
               <div><label>Temperature</label><input type="number" name="temperature" value="{{.Temperature}}" step="0.01"></div>
               <div><label>Top P</label><input type="number" name="topP" value="{{.TopP}}" step="0.01"></div>
               <div><label>Seed</label><input type="number" name="seed" value="{{.Seed}}"></div>
               <div><label>Presence Penalty</label><input type="number" name="presencePenalty" value="{{.PresencePenalty}}" step="0.01"></div>
               <div><label>Frequency Penalty</label><input type="number" name="frequencyPenalty" value="{{.FrequencyPenalty}}" step="0.01"></div>
-              <div><label>Stop</label><input type="text" name="stop" value="{{.Stop}}"></div>
-              <div><label>AppID <span class="muted">VIVO OCR/LASR</span></label><input type="text" name="appId" value="{{.AppID}}" placeholder="VIVO OCR/LASR 必填"></div>
+              <div><label>Stop <span class="muted">每行一个</span></label><textarea name="stop" rows="2">{{.Stop}}</textarea></div>
               <div><label>OpenAI User</label><input type="text" name="user" value="{{.User}}"></div>
             </div>
             <button type="button" class="btn btn-sm btn-danger remove-model-row" style="margin-top:10px;">删除此行</button>
@@ -82,6 +89,7 @@
   const rows = document.getElementById('modelRows');
   const addButton = document.getElementById('addModelRow');
   const form = document.getElementById('relayForm');
+  const apiFormat = document.getElementById('apiFormat');
 
   function reindexRows() {
     Array.from(rows.querySelectorAll('.model-row')).forEach((row, index) => {
@@ -93,7 +101,7 @@
   }
 
   function clearRow(row) {
-    row.querySelectorAll('input').forEach((input) => {
+	row.querySelectorAll('input, textarea').forEach((input) => {
       if (input.type === 'checkbox') {
         input.checked = input.name.startsWith('modelEnabled_');
       } else {
@@ -117,6 +125,31 @@
     };
   }
 
+  const categories = {
+    openai: ['chat', 'ocr'], anthropic: ['chat', 'ocr'], ollama: ['chat', 'ocr'],
+    openai_image: ['image_generation'], vivo_image: ['image_generation'],
+    openai_speech: ['speech'], vivo_lasr: ['speech'], vivo_ocr: ['ocr']
+  };
+
+  function updateAPIFields() {
+    const type = apiFormat.value;
+    const vivoAccount = type === 'vivo_ocr' || type === 'vivo_lasr';
+    document.getElementById('vivoAccountFields').style.display = vivoAccount ? 'grid' : 'none';
+    document.getElementById('vivoImageFields').style.display = type === 'vivo_image' ? 'block' : 'none';
+    document.querySelectorAll('.vivo-lasr').forEach((el) => el.style.display = type === 'vivo_lasr' ? 'block' : 'none');
+    document.querySelectorAll('.vivo-ocr').forEach((el) => el.style.display = type === 'vivo_ocr' ? 'block' : 'none');
+    document.getElementById('apiKey').required = type !== 'ollama' && !{{if .Provider}}true{{else}}false{{end}};
+    const allowed = categories[type] || ['chat'];
+    rows.querySelectorAll('.model-row').forEach((row) => {
+      const select = row.querySelector('select[name="category"]');
+      Array.from(select.options).forEach((option) => option.hidden = !allowed.includes(option.value));
+      if (!allowed.includes(select.value)) select.value = allowed[0];
+      const chatLike = type === 'openai' || type === 'anthropic' || type === 'ollama';
+      row.querySelector('.chat-capabilities').style.display = chatLike ? 'flex' : 'none';
+      row.querySelector('.chat-params').style.display = chatLike ? 'grid' : 'none';
+    });
+  }
+
   Array.from(rows.querySelectorAll('.model-row')).forEach(bindRemove);
   addButton.onclick = function () {
     const source = rows.querySelector('.model-row');
@@ -126,7 +159,10 @@
     rows.appendChild(clone);
     bindRemove(clone);
     reindexRows();
+    updateAPIFields();
   };
+  apiFormat.onchange = updateAPIFields;
+  updateAPIFields();
   form.onsubmit = reindexRows;
 })();
 </script>

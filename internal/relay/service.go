@@ -59,6 +59,23 @@ func IsSupportedAPIFormat(apiType string) bool {
 	return ok
 }
 
+// SupportsCategory reports whether an API format can expose the given model category.
+func SupportsCategory(apiType, category string) bool {
+	category = NormalizeCategory(category)
+	switch normalizeAPIType(apiType) {
+	case APIFormatOpenAI, APIFormatAnthropic, APIFormatOllama:
+		return category == CategoryChat || category == CategoryOCR
+	case APIFormatOpenAIImage, APIFormatVivoImage:
+		return category == CategoryImageGeneration
+	case APIFormatOpenAISpeech, APIFormatVivoLASR:
+		return category == CategorySpeech
+	case APIFormatVivoOCR:
+		return category == CategoryOCR
+	default:
+		return false
+	}
+}
+
 // ModelCapabilities describes optional behavior exposed by a relay model.
 type ModelCapabilities struct {
 	Vision   bool `json:"vision"`
@@ -74,10 +91,34 @@ type ModelAdvancedParams struct {
 	PresencePenalty  *float64 `json:"presencePenalty,omitempty"`
 	FrequencyPenalty *float64 `json:"frequencyPenalty,omitempty"`
 	Seed             *int     `json:"seed,omitempty"`
-	Stop             *string  `json:"stop,omitempty"`
+	Stop             []string `json:"stop,omitempty"`
 	AppID            *string  `json:"appId,omitempty"`
 	User             *string  `json:"user,omitempty"`
 	DebugSSE         bool     `json:"debugSse,omitempty"`
+}
+
+// ProviderConfig contains non-secret, API-specific provider settings.
+type ProviderConfig struct {
+	AppID            string `json:"appId,omitempty"`
+	ClientVersion    string `json:"clientVersion,omitempty"`
+	Package          string `json:"package,omitempty"`
+	OCRPos           string `json:"ocrPos,omitempty"`
+	BusinessIDPrefix string `json:"businessIdPrefix,omitempty"`
+	ImageModule      string `json:"imageModule,omitempty"`
+}
+
+func EncodeProviderConfig(config ProviderConfig) string {
+	raw, err := json.Marshal(config)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+func DecodeProviderConfig(raw string) ProviderConfig {
+	var config ProviderConfig
+	_ = json.Unmarshal([]byte(raw), &config)
+	return config
 }
 
 // ResolvedModel is the upstream provider plus the concrete model metadata.
@@ -248,7 +289,12 @@ func (s *Service) ForwardVivoImage(ctx context.Context, provider *database.Relay
 		return nil, err
 	}
 	query := u.Query()
-	query.Set("module", "aigc")
+	config := DecodeProviderConfig(provider.Config)
+	module := strings.TrimSpace(config.ImageModule)
+	if module == "" {
+		module = "aigc"
+	}
+	query.Set("module", module)
 	now := time.Now()
 	query.Set("request_id", strconv.FormatInt(now.UnixNano(), 10))
 	query.Set("system_time", strconv.FormatInt(now.Unix(), 10))
@@ -371,8 +417,75 @@ func EncodeAdvancedParams(params ModelAdvancedParams) string {
 
 func DecodeAdvancedParams(raw string) ModelAdvancedParams {
 	var params ModelAdvancedParams
-	_ = json.Unmarshal([]byte(raw), &params)
+	if err := json.Unmarshal([]byte(raw), &params); err == nil {
+		return params
+	}
+	var legacy map[string]interface{}
+	if json.Unmarshal([]byte(raw), &legacy) == nil {
+		delete(legacy, "stop")
+		clean, _ := json.Marshal(legacy)
+		_ = json.Unmarshal(clean, &params)
+		var original map[string]json.RawMessage
+		if json.Unmarshal([]byte(raw), &original) == nil {
+			var stop string
+			if json.Unmarshal(original["stop"], &stop) == nil && strings.TrimSpace(stop) != "" {
+				params.Stop = []string{strings.TrimSpace(stop)}
+			}
+		}
+	}
 	return params
+}
+
+// ApplyModelDefaults adds administrator defaults without replacing client values.
+func ApplyModelDefaults(apiType string, body []byte, model database.RelayModel) ([]byte, error) {
+	var payload map[string]interface{}
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	params := DecodeAdvancedParams(model.AdvancedParams)
+	set := func(key string, value interface{}) {
+		if _, exists := payload[key]; !exists && value != nil {
+			payload[key] = value
+		}
+	}
+	switch normalizeAPIType(apiType) {
+	case APIFormatOpenAI:
+		set("max_tokens", params.MaxTokens)
+		set("temperature", params.Temperature)
+		set("top_p", params.TopP)
+		set("presence_penalty", params.PresencePenalty)
+		set("frequency_penalty", params.FrequencyPenalty)
+		set("seed", params.Seed)
+		if len(params.Stop) > 0 {
+			set("stop", params.Stop)
+		}
+		set("user", params.User)
+	case APIFormatAnthropic:
+		set("max_tokens", params.MaxTokens)
+		set("temperature", params.Temperature)
+		set("top_p", params.TopP)
+		if len(params.Stop) > 0 {
+			set("stop_sequences", params.Stop)
+		}
+	case APIFormatOllama:
+		options, _ := payload["options"].(map[string]interface{})
+		if options == nil {
+			options = map[string]interface{}{}
+		}
+		if _, ok := options["num_predict"]; !ok && params.MaxTokens != nil {
+			options["num_predict"] = *params.MaxTokens
+		}
+		if _, ok := options["temperature"]; !ok && params.Temperature != nil {
+			options["temperature"] = *params.Temperature
+		}
+		if _, ok := options["top_p"]; !ok && params.TopP != nil {
+			options["top_p"] = *params.TopP
+		}
+		if len(options) > 0 {
+			payload["options"] = options
+		}
+	}
+	return json.Marshal(payload)
 }
 
 func NormalizeCategory(category string) string {
