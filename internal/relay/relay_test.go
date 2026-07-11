@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/auth"
@@ -63,7 +64,7 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServ
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	g := r.Group("/relay")
-	g.Use(auth.AuthMiddleware(jwtMgr))
+	g.Use(auth.AuthMiddleware(jwtMgr), handler.LoggingMiddleware())
 	g.POST("/chat", handler.Chat)
 	g.POST("/v2/chat", handler.ChatV2)
 	g.POST("/messages", handler.Messages)
@@ -573,6 +574,79 @@ func TestApplyOllamaDefaultsAndLegacyStop(t *testing.T) {
 	options := body["options"].(map[string]interface{})
 	if options["temperature"] != 0.7 || options["num_predict"] != float64(512) {
 		t.Fatalf("options = %#v", options)
+	}
+}
+
+func TestRelayLoggingRecordsUserAndSkipsConfig(t *testing.T) {
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"content":"pong"}}]}`))
+	})
+	body := []byte(`{"model":"gpt-test","api_type":"openai","messages":[{"role":"user","content":"private prompt"}]}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
+	resp.Body.Close()
+
+	configReq := authedRequest(t, http.MethodGet, server.URL+"/relay/config", token, "", nil)
+	configResp := testutil.Do(t, configReq)
+	configResp.Body.Close()
+
+	var logs []database.RelayRequestLog
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		logs = nil
+		if err := db.Find(&logs).Error; err != nil {
+			t.Fatalf("list logs: %v", err)
+		}
+		if len(logs) == 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("log count = %d, want 1", len(logs))
+	}
+	entry := logs[0]
+	if entry.Username != "tester" || entry.UserID == 0 || entry.ProviderName != "test upstream" || entry.ModelID != "gpt-test" {
+		t.Fatalf("unexpected log identity: %#v", entry)
+	}
+	if entry.Operation != "chat" || entry.Protocol != "v1" || entry.HTTPStatus != http.StatusOK || entry.UpstreamStatus != http.StatusOK {
+		t.Fatalf("unexpected call metadata: %#v", entry)
+	}
+	if entry.RequestBytes != int64(len(body)) {
+		t.Fatalf("request bytes = %d, want %d", entry.RequestBytes, len(body))
+	}
+}
+
+func TestRelayLogDashboardAndRetention(t *testing.T) {
+	_, _, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {})
+	logs := relay.NewLogService(db)
+	now := time.Now()
+	entries := []database.RelayRequestLog{
+		{UserID: 1, Username: "alice", Operation: "chat", Route: "/relay/v2/chat", Protocol: "v2", HTTPStatus: 200, DurationMS: 100, RequestBytes: 10, ResponseBytes: 20, CreatedAt: now.Add(-time.Hour)},
+		{UserID: 1, Username: "alice", Operation: "chat", Route: "/relay/v2/chat", Protocol: "v2", HTTPStatus: 500, DurationMS: 300, RequestBytes: 30, ResponseBytes: 40, CreatedAt: now.Add(-2 * time.Hour)},
+		{UserID: 2, Username: "bob", Operation: "ocr", Route: "/relay/v2/ocr", Protocol: "v2", HTTPStatus: 200, DurationMS: 50, CreatedAt: now.Add(-8 * 24 * time.Hour)},
+	}
+	if err := db.Create(&entries).Error; err != nil {
+		t.Fatalf("create logs: %v", err)
+	}
+	dashboard, err := logs.Dashboard("7d", now)
+	if err != nil {
+		t.Fatalf("dashboard: %v", err)
+	}
+	if dashboard.Summary.Total != 2 || dashboard.Summary.Success != 1 || dashboard.Summary.Failed != 1 || len(dashboard.Users) != 1 || dashboard.Users[0].Username != "alice" {
+		t.Fatalf("unexpected dashboard: %#v", dashboard)
+	}
+	if len(dashboard.Trend) == 0 {
+		t.Fatal("dashboard trend is empty")
+	}
+	if err := logs.DeleteExpired(now); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	var count int64
+	db.Model(&database.RelayRequestLog{}).Count(&count)
+	if count != 2 {
+		t.Fatalf("retained logs = %d, want 2", count)
 	}
 }
 

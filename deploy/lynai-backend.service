@@ -20,7 +20,6 @@ Environment="PORT=8080"
 Environment="STORAGE_DIR=/opt/lynai-backend/storage"
 Environment="ADMIN_PHONE=0000000000"
 Environment="ADMIN_DISPLAY_NAME=管理员"
-Environment="ADMIN_TEMPLATES=/opt/lynai-backend/templates"
 
 # Basic hardening. The service only needs write access to STORAGE_DIR.
 NoNewPrivileges=true

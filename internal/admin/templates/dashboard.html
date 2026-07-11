@@ -10,16 +10,23 @@
 {{template "admin-sidebar" .}}
 <div class="main">
   <h1 style="margin-bottom: 24px;">概览</h1>
+  {{if .RelayError}}<div class="error-msg">{{.RelayError}}</div>{{end}}
   <div class="stat-grid">
     <div class="stat-card"><div class="num">{{.PendingCount}}</div><div class="label">待审核插件</div></div>
     <div class="stat-card"><div class="num">{{.ApprovedCount}}</div><div class="label">已上架插件</div></div>
     <div class="stat-card"><div class="num">{{.UserCount}}</div><div class="label">注册用户</div></div>
+  </div>
+  <div class="stat-grid" style="margin-top:20px;">
+    <div class="stat-card"><div class="num">{{.RelayToday.Total}}</div><div class="label">今日中转调用</div></div>
+    <div class="stat-card"><div class="num">{{.RelayToday.Failed}}</div><div class="label">今日失败调用</div></div>
+    <div class="stat-card"><div class="num">{{.RelayToday.ActiveUsers}}</div><div class="label">今日活跃用户</div></div>
   </div>
   <div class="card" style="margin-top: 20px;">
     <h3 style="margin-bottom: 12px;">快捷操作</h3>
     <p><a href="/admin/pending">查看待审核插件 ({{.PendingCount}})</a></p>
     <p><a href="/admin/plugins">管理全部插件</a></p>
     <p><a href="/admin/users">管理用户与管理员</a></p>
+    <p><a href="/admin/relay/dashboard">查看调用概览（近 7 天 {{.RelaySevenDays.Total}} 次）</a></p>
   </div>
 </div>
 </body>

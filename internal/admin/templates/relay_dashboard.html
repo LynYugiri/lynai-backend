@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 调用概览</title>{{template "layout-css"}}</head><body>
+{{template "admin-sidebar" .}}
+<div class="main">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;"><h1>调用概览</h1><a class="btn btn-secondary" href="/admin/relay/logs?range={{.Dashboard.Range}}">查看明细</a></div>
+  {{if .Error}}<div class="error-msg">{{.Error}}</div>{{end}}
+  <div style="display:flex;gap:8px;margin-bottom:20px;">
+    <a class="btn {{if eq .Dashboard.Range "today"}}btn-primary{{else}}btn-secondary{{end}}" href="?range=today">今日</a>
+    <a class="btn {{if eq .Dashboard.Range "24h"}}btn-primary{{else}}btn-secondary{{end}}" href="?range=24h">最近 24 小时</a>
+    <a class="btn {{if eq .Dashboard.Range "7d"}}btn-primary{{else}}btn-secondary{{end}}" href="?range=7d">最近 7 天</a>
+  </div>
+  <div class="stat-grid">
+    <div class="stat-card"><div class="num">{{.Dashboard.Summary.Total}}</div><div class="label">总调用</div></div>
+    <div class="stat-card"><div class="num">{{.Dashboard.Summary.Success}}</div><div class="label">成功</div></div>
+    <div class="stat-card"><div class="num">{{.Dashboard.Summary.Failed}}</div><div class="label">失败</div></div>
+    <div class="stat-card"><div class="num">{{.Dashboard.Summary.ActiveUsers}}</div><div class="label">活跃用户</div></div>
+    <div class="stat-card"><div class="num">{{printf "%.0f" .Dashboard.Summary.AverageMS}}</div><div class="label">平均耗时 ms</div></div>
+    <div class="stat-card"><div class="num">{{.Dashboard.Summary.RequestBytes}}</div><div class="label">请求字节</div></div>
+  </div>
+  <div class="card" style="margin-top:20px;overflow-x:auto;"><h3 style="margin-bottom:14px;">用户调用排行</h3><table>
+    <thead><tr><th>用户</th><th>调用</th><th>成功</th><th>失败</th><th>成功率</th><th>平均耗时</th><th>请求/响应字节</th><th>最后调用</th></tr></thead><tbody>
+    {{range .Dashboard.Users}}<tr><td><a href="/admin/relay/logs?range={{$.Dashboard.Range}}&userId={{.UserID}}">{{.Username}}<br><span class="muted">{{.UserID}}</span></a></td><td>{{.Total}}</td><td>{{.Success}}</td><td>{{.Failed}}</td><td>{{if .Total}}{{printf "%.1f%%" (divPercent .Success .Total)}}{{else}}-{{end}}</td><td>{{printf "%.0f ms" .AverageMS}}</td><td>{{.RequestBytes}} / {{.ResponseBytes}}</td><td>{{.LastCalledAt}}</td></tr>
+    {{else}}<tr><td colspan="8" class="empty">暂无调用数据</td></tr>{{end}}</tbody></table></div>
+  <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:20px;">
+    <div class="card"><h3>Provider</h3>{{range .Dashboard.Providers}}<p style="margin-top:10px;">{{.Name}}：{{.Total}} 次，失败 {{.Failed}}</p>{{else}}<p class="empty">暂无</p>{{end}}</div>
+    <div class="card"><h3>模型</h3>{{range .Dashboard.Models}}<p style="margin-top:10px;">{{.Name}}：{{.Total}} 次，{{printf "%.0f ms" .AverageMS}}</p>{{else}}<p class="empty">暂无</p>{{end}}</div>
+    <div class="card"><h3>API 类型</h3>{{range .Dashboard.APITypes}}<p style="margin-top:10px;">{{.Name}}：{{.Total}} 次，失败 {{.Failed}}</p>{{else}}<p class="empty">暂无</p>{{end}}</div>
+  </div>
+  <div class="card"><h3 style="margin-bottom:14px;">调用趋势</h3><table><thead><tr><th>时间</th><th>调用</th><th>成功</th><th>失败</th><th>平均耗时</th></tr></thead><tbody>{{range .Dashboard.Trend}}<tr><td>{{.Bucket}}</td><td>{{.Total}}</td><td>{{.Success}}</td><td>{{.Failed}}</td><td>{{printf "%.0f ms" .AverageMS}}</td></tr>{{else}}<tr><td colspan="5" class="empty">暂无趋势数据</td></tr>{{end}}</tbody></table></div>
+</div></body></html>

@@ -2,8 +2,6 @@ package testutil
 
 import (
 	"os"
-	"path/filepath"
-	"runtime"
 
 	"github.com/lynai/backend/internal/admin"
 	"github.com/lynai/backend/internal/auth"
@@ -85,7 +83,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 
 	var adminHandler *admin.Handler
 	if withAdminPanel {
-		adminHandler, err = admin.NewHandler(db, authSvc, marketSvc, jwtMgr, adminTemplateDir())
+		adminHandler, err = admin.NewHandler(db, authSvc, marketSvc, jwtMgr)
 		if err != nil {
 			panic("admin templates: " + err.Error())
 		}
@@ -100,12 +98,4 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 	}
 
 	return adminPhone, adminPassword, ts, cleanup
-}
-
-func adminTemplateDir() string {
-	_, file, _, ok := runtime.Caller(0)
-	if !ok {
-		return filepath.Join("..", "admin", "templates")
-	}
-	return filepath.Join(filepath.Dir(file), "..", "admin", "templates")
 }

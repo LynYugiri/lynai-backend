@@ -276,6 +276,22 @@ func TestAdminPanelRelayAllowsOllamaWithoutAPIKey(t *testing.T) {
 	}
 }
 
+func TestAdminPanelRelayLogPages(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+	client := adminClient(t)
+	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
+
+	dashboard := getAdminPage(t, client, ts.URL+"/admin/relay/dashboard?range=7d")
+	if !strings.Contains(dashboard, "调用概览") || !strings.Contains(dashboard, "用户调用排行") {
+		t.Fatalf("relay dashboard did not render: %s", dashboard)
+	}
+	logs := getAdminPage(t, client, ts.URL+"/admin/relay/logs?range=7d")
+	if !strings.Contains(logs, "调用日志") || !strings.Contains(logs, "用户 ID") {
+		t.Fatalf("relay logs did not render: %s", logs)
+	}
+}
+
 func adminClient(t *testing.T) *http.Client {
 	t.Helper()
 	jar, err := cookiejar.New(nil)

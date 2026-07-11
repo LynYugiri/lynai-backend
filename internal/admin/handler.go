@@ -8,7 +8,6 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -32,21 +31,22 @@ var csrfTokenMaxAge = int(auth.RefreshTokenExpiry.Seconds())
 // Handler serves the HTML admin panel.
 type Handler struct {
 	db        *gorm.DB
+	relayLogs *relay.LogService
 	authSvc   *auth.Service
 	marketSvc *market.Service
 	jwtMgr    *auth.JWTManager
 	templates *template.Template
 }
 
-// NewHandler creates an admin handler. Templates are parsed from the given
-// directory at startup.
-func NewHandler(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, jwtMgr *auth.JWTManager, templateDir string) (*Handler, error) {
-	tmpl, err := template.ParseGlob(filepath.Join(templateDir, "*.html"))
+// NewHandler creates an admin handler using templates embedded in the binary.
+func NewHandler(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, jwtMgr *auth.JWTManager) (*Handler, error) {
+	tmpl, err := parseAdminTemplates()
 	if err != nil {
 		return nil, err
 	}
 	return &Handler{
 		db:        db,
+		relayLogs: relay.NewLogService(db),
 		authSvc:   authSvc,
 		marketSvc: marketSvc,
 		jwtMgr:    jwtMgr,
@@ -83,6 +83,8 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, jwtMgr *auth.JWTManager) {
 		protected.POST("/plugins/:id/unpublish", h.UnpublishPlugin)
 		protected.POST("/plugins/:id/delete", h.DeletePlugin)
 		protected.GET("/relay", h.RelayProviders)
+		protected.GET("/relay/dashboard", h.RelayDashboard)
+		protected.GET("/relay/logs", h.RelayLogs)
 		protected.GET("/relay/new", h.NewRelayProviderForm)
 		protected.POST("/relay/new", h.CreateRelayProvider)
 		protected.GET("/relay/:id/edit", h.EditRelayProviderForm)
@@ -193,11 +195,44 @@ func (h *Handler) Dashboard(c *gin.Context) {
 	h.db.Model(&database.Plugin{}).Where("status = ?", database.PluginStatusApproved).Count(&approvedCount)
 	h.db.Model(&database.User{}).Count(&userCount)
 
+	relayToday, todayErr := h.relayLogs.Summary("today", time.Now())
+	relaySevenDays, sevenDayErr := h.relayLogs.Summary("7d", time.Now())
+	relayError := ""
+	if todayErr != nil || sevenDayErr != nil {
+		relayError = "中转调用统计暂不可用"
+	}
 	h.render(c, "dashboard.html", h.pageData(c, "dashboard", map[string]interface{}{
-		"PendingCount":  pendingCount,
-		"ApprovedCount": approvedCount,
-		"UserCount":     userCount,
+		"PendingCount":   pendingCount,
+		"ApprovedCount":  approvedCount,
+		"UserCount":      userCount,
+		"RelayToday":     relayToday,
+		"RelaySevenDays": relaySevenDays,
+		"RelayError":     relayError,
 	}))
+}
+
+func (h *Handler) RelayDashboard(c *gin.Context) {
+	dashboard, err := h.relayLogs.Dashboard(c.DefaultQuery("range", "7d"), time.Now())
+	data := map[string]interface{}{"Dashboard": dashboard}
+	if err != nil {
+		data["Error"] = "调用统计加载失败"
+	}
+	h.render(c, "relay_dashboard.html", h.pageData(c, "relay_dashboard", data))
+}
+
+func (h *Handler) RelayLogs(c *gin.Context) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	filter := relay.LogFilter{
+		Range: c.DefaultQuery("range", "7d"), UserID: c.Query("userId"), Username: c.Query("username"),
+		Provider: c.Query("provider"), APIType: c.Query("apiType"), ModelID: c.Query("model"),
+		Operation: c.Query("operation"), Protocol: c.Query("protocol"), Result: c.Query("result"), Page: page,
+	}
+	logs, err := h.relayLogs.List(filter, time.Now())
+	data := map[string]interface{}{"LogPage": logs, "Filter": filter}
+	if err != nil {
+		data["Error"] = "调用日志加载失败"
+	}
+	h.render(c, "relay_logs.html", h.pageData(c, "relay_logs", data))
 }
 
 // --- Pending ---

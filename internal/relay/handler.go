@@ -23,8 +23,20 @@ const maxRelayBodyBytes = 8 << 20
 // Handler serves authenticated relay endpoints.
 type Handler struct {
 	svc      *Service
+	logs     *LogService
 	speechMu sync.Mutex
 	speech   map[string]*speechSession
+}
+
+type countingReadCloser struct {
+	io.ReadCloser
+	bytes int64
+}
+
+func (r *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	r.bytes += int64(n)
+	return n, err
 }
 
 // Messages forwards an Anthropic-compatible messages request.
@@ -44,6 +56,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
@@ -58,6 +71,7 @@ func (h *Handler) Messages(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	writeUpstreamResponse(c, resp, stream)
 }
@@ -79,6 +93,7 @@ func (h *Handler) OllamaChat(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
@@ -93,13 +108,109 @@ func (h *Handler) OllamaChat(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	writeUpstreamResponse(c, resp, stream)
 }
 
 // NewHandler creates a relay handler.
 func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc, speech: map[string]*speechSession{}}
+	return &Handler{svc: svc, logs: NewLogService(svc.db), speech: map[string]*speechSession{}}
+}
+
+// LoggingMiddleware records privacy-safe metadata for relay operations.
+func (h *Handler) LoggingMiddleware() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		operation := relayOperation(c.FullPath())
+		if operation == "" {
+			c.Next()
+			return
+		}
+		started := time.Now()
+		requestBody := &countingReadCloser{ReadCloser: c.Request.Body}
+		c.Request.Body = requestBody
+		c.Next()
+		userID, _ := strconv.ParseInt(c.GetString("userID"), 10, 64)
+		errorType := c.GetString("relayErrorType")
+		upstreamStatus := contextInt(c, "relayUpstreamStatus")
+		if errorType == "" && c.Writer.Status() >= http.StatusBadRequest {
+			if upstreamStatus != 0 {
+				errorType = "upstream_error"
+			} else {
+				errorType = "request_error"
+			}
+		}
+		entry := database.RelayRequestLog{
+			UserID: userID, Username: c.GetString("username"), Operation: operation,
+			Route: c.FullPath(), Protocol: relayProtocol(c.FullPath()), HTTPStatus: c.Writer.Status(),
+			DurationMS: time.Since(started).Milliseconds(), RequestBytes: requestBody.bytes,
+			ResponseBytes: maxInt64(int64(c.Writer.Size()), 0), ProviderID: contextInt64(c, "relayProviderID"),
+			ProviderName: c.GetString("relayProviderName"), APIType: c.GetString("relayAPIType"),
+			ModelID: c.GetString("relayModelID"), Category: c.GetString("relayCategory"),
+			UpstreamStatus: upstreamStatus, ErrorType: errorType,
+			CreatedAt: time.Now(),
+		}
+		h.logs.Enqueue(entry)
+	}
+}
+
+func relayOperation(path string) string {
+	switch path {
+	case "/relay/chat", "/relay/messages", "/relay/api/chat", "/relay/v2/chat":
+		return "chat"
+	case "/relay/ocr", "/relay/v2/ocr":
+		return "ocr"
+	case "/relay/transcribe", "/relay/v2/transcribe":
+		return "transcribe"
+	case "/relay/speech/create", "/relay/v2/speech/create":
+		return "speech_create"
+	case "/relay/speech/:audioId/upload", "/relay/v2/speech/:audioId/upload":
+		return "speech_upload"
+	case "/relay/speech/:audioId/run", "/relay/v2/speech/:audioId/run":
+		return "speech_run"
+	case "/relay/speech/:audioId/progress", "/relay/v2/speech/:audioId/progress":
+		return "speech_progress"
+	case "/relay/speech/:audioId/result", "/relay/v2/speech/:audioId/result":
+		return "speech_result"
+	case "/relay/images/generations", "/relay/v2/images/generations":
+		return "image_generation"
+	default:
+		return ""
+	}
+}
+
+func relayProtocol(path string) string {
+	if strings.HasPrefix(path, "/relay/v2/") {
+		return "v2"
+	}
+	return "v1"
+}
+
+func (h *Handler) setLogModel(c *gin.Context, resolved *ResolvedModel) {
+	c.Set("relayProviderID", resolved.Provider.ID)
+	c.Set("relayProviderName", resolved.Provider.Name)
+	c.Set("relayAPIType", normalizeAPIType(resolved.Provider.APIFormat))
+	c.Set("relayModelID", resolved.Model.ModelID)
+	c.Set("relayCategory", NormalizeCategory(resolved.Model.Category))
+}
+
+func setUpstreamStatus(c *gin.Context, status int) { c.Set("relayUpstreamStatus", status) }
+
+func contextInt64(c *gin.Context, key string) int64 {
+	value, _ := c.Get(key)
+	result, _ := value.(int64)
+	return result
+}
+func contextInt(c *gin.Context, key string) int {
+	value, _ := c.Get(key)
+	result, _ := value.(int)
+	return result
+}
+func maxInt64(value, minimum int64) int64 {
+	if value < minimum {
+		return minimum
+	}
+	return value
 }
 
 type speechSession struct {
@@ -130,6 +241,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 
 	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
@@ -150,6 +262,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 
 	copyResponseHeaders(c, resp.Header)
@@ -184,6 +297,7 @@ func (h *Handler) ChatV2(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
@@ -210,6 +324,7 @@ func (h *Handler) ChatV2(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	writeUpstreamResponse(c, resp, stream)
 }
@@ -232,6 +347,7 @@ func (h *Handler) Transcribe(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 	if resolved.Model.Category != CategorySpeech {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a speech-to-text model")
 		return
@@ -253,6 +369,7 @@ func (h *Handler) Transcribe(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	copyResponseHeaders(c, resp.Header)
 	c.Status(resp.StatusCode)
@@ -277,6 +394,7 @@ func (h *Handler) OCR(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 	file, _, err := c.Request.FormFile("file")
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "file is required")
@@ -310,6 +428,7 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 	if normalizeAPIType(resolved.Provider.APIFormat) != APIFormatVivoLASR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "speech session is only supported for vivo_lasr")
 		return
@@ -335,6 +454,7 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	upstream, rawResp, err := decodeJSONResponse(resp)
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -375,6 +495,7 @@ func (h *Handler) SpeechUpload(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	writeUpstreamResponse(c, resp, false)
 }
@@ -393,6 +514,7 @@ func (h *Handler) SpeechRun(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, rawResp, err := decodeJSONResponse(resp)
 	if err == nil {
@@ -430,6 +552,7 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 		h.writeResolveError(c, err)
 		return
 	}
+	h.setLogModel(c, resolved)
 	if resolved.Model.Category != CategoryImageGeneration {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not an image generation model")
 		return
@@ -449,6 +572,7 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	if normalizeAPIType(resolved.Provider.APIFormat) == APIFormatVivoImage {
 		h.writeVivoImageResponse(c, resp)
@@ -647,6 +771,7 @@ func (h *Handler) forwardVivoOCR(c *gin.Context, resolved *ResolvedModel, image 
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, raw, err := decodeJSONResponse(resp)
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -689,6 +814,7 @@ func (h *Handler) forwardVisionOCR(c *gin.Context, resolved *ResolvedModel, imag
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, raw, err := decodeJSONResponse(resp)
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -704,7 +830,9 @@ func (h *Handler) loadSpeechSession(c *gin.Context) *speechSession {
 	session := h.speech[c.Param("audioId")]
 	if session == nil {
 		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "speech session not found")
+		return nil
 	}
+	h.setLogModel(c, &ResolvedModel{Provider: session.Provider, Model: session.Model})
 	return session
 }
 
@@ -726,6 +854,7 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 		return
 	}
+	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, rawResp, err := decodeJSONResponse(resp)
 	if err != nil || !normalize {
@@ -921,6 +1050,7 @@ func relayProviderIDFromForm(request *http.Request) string {
 }
 
 func writeOpenAIError(c *gin.Context, status int, typ, message string) {
+	c.Set("relayErrorType", typ)
 	c.JSON(status, gin.H{"error": gin.H{"message": message, "type": typ}})
 }
 

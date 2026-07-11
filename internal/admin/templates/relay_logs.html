@@ -1,0 +1,19 @@
+<!DOCTYPE html>
+<html lang="zh"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LynAI Admin · 调用日志</title>{{template "layout-css"}}</head><body>{{template "admin-sidebar" .}}
+<div class="main"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:24px;"><h1>调用日志</h1><a class="btn btn-secondary" href="/admin/relay/dashboard?range={{.Filter.Range}}">调用概览</a></div>
+{{if .Error}}<div class="error-msg">{{.Error}}</div>{{end}}
+<div class="card"><form method="GET" style="display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:10px;">
+  <select name="range"><option value="today" {{if eq .Filter.Range "today"}}selected{{end}}>今日</option><option value="24h" {{if eq .Filter.Range "24h"}}selected{{end}}>最近24小时</option><option value="7d" {{if eq .Filter.Range "7d"}}selected{{end}}>最近7天</option></select>
+  <input name="userId" value="{{.Filter.UserID}}" placeholder="用户 ID"><input name="username" value="{{.Filter.Username}}" placeholder="用户昵称"><input name="provider" value="{{.Filter.Provider}}" placeholder="Provider">
+  <input name="apiType" value="{{.Filter.APIType}}" placeholder="API 类型"><input name="model" value="{{.Filter.ModelID}}" placeholder="模型"><input name="operation" value="{{.Filter.Operation}}" placeholder="操作">
+  <select name="protocol"><option value="">全部版本</option><option value="v1" {{if eq .Filter.Protocol "v1"}}selected{{end}}>v1</option><option value="v2" {{if eq .Filter.Protocol "v2"}}selected{{end}}>v2</option></select>
+  <select name="result"><option value="">全部结果</option><option value="success" {{if eq .Filter.Result "success"}}selected{{end}}>成功</option><option value="failed" {{if eq .Filter.Result "failed"}}selected{{end}}>失败</option></select>
+  <div><button class="btn btn-primary" type="submit">筛选</button> <a class="btn btn-secondary" href="/admin/relay/logs">清除</a></div>
+</form></div>
+<div class="card" style="overflow-x:auto;"><p style="margin-bottom:12px;">共 {{.LogPage.Total}} 条</p><table><thead><tr><th>时间</th><th>用户</th><th>版本/操作</th><th>Provider</th><th>API/模型</th><th>状态</th><th>耗时</th><th>流量</th><th>错误</th></tr></thead><tbody>
+{{range .LogPage.Logs}}<tr><td>{{.CreatedAt.Format "2006-01-02 15:04:05"}}</td><td>{{.Username}}<br><span class="muted">{{.UserID}}</span></td><td>{{.Protocol}} / {{.Operation}}</td><td>{{.ProviderName}}</td><td>{{.APIType}}<br>{{.ModelID}}</td><td>{{.HTTPStatus}}{{if .UpstreamStatus}} / {{.UpstreamStatus}}{{end}}</td><td>{{.DurationMS}} ms</td><td>{{.RequestBytes}} / {{.ResponseBytes}}</td><td>{{.ErrorType}}</td></tr>{{else}}<tr><td colspan="9" class="empty">暂无调用日志</td></tr>{{end}}</tbody></table>
+<div style="margin-top:14px;display:flex;gap:10px;align-items:center;">第 {{.LogPage.Page}} / {{.LogPage.Pages}} 页
+{{if gt .LogPage.Page 1}}<a href="?range={{.Filter.Range}}&userId={{.Filter.UserID}}&username={{.Filter.Username}}&provider={{.Filter.Provider}}&apiType={{.Filter.APIType}}&model={{.Filter.ModelID}}&operation={{.Filter.Operation}}&protocol={{.Filter.Protocol}}&result={{.Filter.Result}}&page={{sub .LogPage.Page 1}}">上一页</a>{{end}}
+{{if lt .LogPage.Page .LogPage.Pages}}<a href="?range={{.Filter.Range}}&userId={{.Filter.UserID}}&username={{.Filter.Username}}&provider={{.Filter.Provider}}&apiType={{.Filter.APIType}}&model={{.Filter.ModelID}}&operation={{.Filter.Operation}}&protocol={{.Filter.Protocol}}&result={{.Filter.Result}}&page={{add .LogPage.Page 1}}">下一页</a>{{end}}
+</div></div></div></body></html>

@@ -92,7 +92,7 @@ func Setup(
 	// --- Relay API (authenticated) ---
 	if relayHandler != nil {
 		relayAuth := r.Group("/relay")
-		relayAuth.Use(auth.AuthMiddleware(jwtMgr))
+		relayAuth.Use(auth.AuthMiddleware(jwtMgr), relayHandler.LoggingMiddleware())
 		{
 			relayAuth.GET("/v2/config", relayHandler.ConfigV2)
 			relayAuth.POST("/v2/chat", relayHandler.ChatV2)

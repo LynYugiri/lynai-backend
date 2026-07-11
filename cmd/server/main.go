@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
+	"time"
 
 	"github.com/lynai/backend/internal/admin"
 	"github.com/lynai/backend/internal/auth"
@@ -62,6 +62,9 @@ func main() {
 	}
 	syncSvc := sync.NewService(db, blobStorage)
 	relaySvc := relay.NewService(db)
+	if err := relay.NewLogService(db).DeleteExpired(time.Now()); err != nil {
+		log.Printf("relay log cleanup: %v", err)
+	}
 
 	// Handlers
 	authHandler := auth.NewHandler(authSvc)
@@ -70,8 +73,7 @@ func main() {
 	relayHandler := relay.NewHandler(relaySvc)
 
 	// Admin panel
-	templateDir := envOr("ADMIN_TEMPLATES", defaultTemplateDir())
-	adminHandler, err := admin.NewHandler(db, authSvc, marketSvc, jwtMgr, templateDir)
+	adminHandler, err := admin.NewHandler(db, authSvc, marketSvc, jwtMgr)
 	if err != nil {
 		log.Fatalf("admin templates: %v", err)
 	}
@@ -84,17 +86,6 @@ func main() {
 	if err := r.Run(addr); err != nil {
 		log.Fatalf("server: %v", err)
 	}
-}
-
-func defaultTemplateDir() string {
-	exe, err := os.Executable()
-	if err == nil {
-		candidate := filepath.Join(filepath.Dir(exe), "templates")
-		if _, err := os.Stat(candidate); err == nil {
-			return candidate
-		}
-	}
-	return "internal/admin/templates"
 }
 
 func envOr(key, fallback string) string {

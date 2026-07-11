@@ -40,7 +40,6 @@ make build
 | `STORAGE_DIR` | 否 | `./storage` | 插件 ZIP 存储目录 |
 | `ADMIN_PHONE` | 否 | `0000000000` | 管理员手机号 |
 | `ADMIN_DISPLAY_NAME` | 否 | `管理员` | 管理员显示名 |
-| `ADMIN_TEMPLATES` | 否 | 可执行文件同目录 `templates/`，回退到 `internal/admin/templates` | Admin Web 面板模板目录 |
 
 ### 4. 启动
 
@@ -306,7 +305,8 @@ service 文件内包含所有必需环境变量：
 - `STORAGE_DIR` — 插件 ZIP 和同步 blob 存储目录
 - `ADMIN_PHONE` — 初始管理员手机号，默认 `0000000000`
 - `ADMIN_DISPLAY_NAME` — 初始管理员显示名，默认 `管理员`
-- `ADMIN_TEMPLATES` — Admin Web 模板目录
+
+Admin Web 模板已编译进二进制，不需要部署单独的模板目录。
 
 完整部署示例：
 
@@ -315,9 +315,7 @@ make build
 
 sudo useradd -r -s /usr/sbin/nologin lynai || true
 sudo mkdir -p /opt/lynai-backend/bin /opt/lynai-backend/storage
-sudo cp bin/lynai-backend /opt/lynai-backend/bin/lynai-backend
-sudo rm -rf /opt/lynai-backend/templates
-sudo cp -r internal/admin/templates /opt/lynai-backend/templates
+sudo install -o lynai -g lynai -m 755 bin/lynai-backend /opt/lynai-backend/bin/lynai-backend
 sudo chown -R lynai:lynai /opt/lynai-backend
 sudo cp deploy/lynai-backend.service /etc/systemd/system/lynai-backend.service
 sudo nano /etc/systemd/system/lynai-backend.service
@@ -328,6 +326,33 @@ sudo systemctl start lynai-backend
 ```
 
 首次启动会用 `ADMIN_PHONE` / `ADMIN_DISPLAY_NAME` / `ADMIN_PASSWORD` 创建第一个管理员。之后访问 `http://<host>:8080/admin/login`，用该手机号和密码登录面板。
+
+### 更新与回滚
+
+管理员页面已内置在二进制中，更新时只需构建、替换二进制并重启：
+
+```bash
+git pull origin master
+go test ./...
+make build
+
+sudo cp /opt/lynai-backend/bin/lynai-backend /opt/lynai-backend/bin/lynai-backend.previous
+sudo install -o lynai -g lynai -m 755 bin/lynai-backend /opt/lynai-backend/bin/lynai-backend
+sudo systemctl restart lynai-backend
+curl --fail http://127.0.0.1:8080/health
+```
+
+更新失败时恢复旧二进制：
+
+```bash
+sudo systemctl stop lynai-backend
+sudo cp /opt/lynai-backend/bin/lynai-backend.previous /opt/lynai-backend/bin/lynai-backend
+sudo chown lynai:lynai /opt/lynai-backend/bin/lynai-backend
+sudo chmod 755 /opt/lynai-backend/bin/lynai-backend
+sudo systemctl start lynai-backend
+```
+
+旧版本部署留下的 `/opt/lynai-backend/templates` 不再使用，确认新版本正常后可以删除。
 
 ### Nginx 反向代理（可选）
 

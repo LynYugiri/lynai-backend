@@ -125,6 +125,28 @@ type RelayModel struct {
 	UpdatedAt      time.Time `json:"updatedAt"`
 }
 
+// RelayRequestLog stores privacy-safe metadata for one authenticated relay call.
+type RelayRequestLog struct {
+	ID             int64     `gorm:"primaryKey;autoIncrement" json:"id,string"`
+	UserID         int64     `gorm:"not null;index" json:"userId,string"`
+	Username       string    `gorm:"not null" json:"username"`
+	ProviderID     int64     `gorm:"index" json:"providerId,string"`
+	ProviderName   string    `json:"providerName"`
+	APIType        string    `gorm:"index" json:"apiType"`
+	ModelID        string    `gorm:"index" json:"modelId"`
+	Category       string    `json:"category"`
+	Operation      string    `gorm:"not null;index" json:"operation"`
+	Route          string    `gorm:"not null" json:"route"`
+	Protocol       string    `gorm:"not null;index" json:"protocol"`
+	HTTPStatus     int       `gorm:"not null;index" json:"httpStatus"`
+	UpstreamStatus int       `json:"upstreamStatus"`
+	DurationMS     int64     `gorm:"not null" json:"durationMs"`
+	RequestBytes   int64     `gorm:"not null" json:"requestBytes"`
+	ResponseBytes  int64     `gorm:"not null" json:"responseBytes"`
+	ErrorType      string    `gorm:"index" json:"errorType"`
+	CreatedAt      time.Time `gorm:"not null;index" json:"createdAt"`
+}
+
 // AllModels returns every model that should be auto-migrated.
 func AllModels() []interface{} {
 	return []interface{}{
@@ -137,6 +159,7 @@ func AllModels() []interface{} {
 		&SyncBlob{},
 		&RelayProvider{},
 		&RelayModel{},
+		&RelayRequestLog{},
 	}
 }
 
