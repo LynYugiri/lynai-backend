@@ -1,11 +1,14 @@
 package testutil
 
 import (
+	"context"
 	"os"
+	"time"
 
 	"github.com/lynai/backend/internal/admin"
 	"github.com/lynai/backend/internal/auth"
 	"github.com/lynai/backend/internal/database"
+	"github.com/lynai/backend/internal/device"
 	"github.com/lynai/backend/internal/market"
 	"github.com/lynai/backend/internal/relay"
 	"github.com/lynai/backend/internal/server"
@@ -51,7 +54,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 	if err != nil {
 		panic("hash admin password: " + err.Error())
 	}
-	if err := database.EnsureAdminSeed(db, adminPhone, "测试管理员", adminPasswordHash, snowflake); err != nil {
+	if err := database.EnsureAdminSeed(context.Background(), db, adminPhone, "测试管理员", adminPasswordHash, snowflake); err != nil {
 		panic("seed admin: " + err.Error())
 	}
 
@@ -72,28 +75,38 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 
 	jwtMgr := auth.NewJWTManager("test-secret-key-for-testing")
 	authSvc := auth.NewService(db, jwtMgr, snowflake)
+	deviceSvc := device.NewService(db)
 	marketSvc := market.NewService(db, storage)
 	syncSvc := sync.NewService(db, blobStorage)
 	relaySvc := relay.NewService(db)
+	endpointPolicy, err := relay.NewEndpointPolicy([]string{"localhost:11434"})
+	if err != nil {
+		panic("relay endpoint policy: " + err.Error())
+	}
 
 	authHandler := auth.NewHandler(authSvc)
+	deviceHandler := device.NewHandler(deviceSvc)
 	marketHandler := market.NewHandler(marketSvc)
-	syncHandler := sync.NewHandler(syncSvc)
+	syncHandler := sync.NewHandlerWithClockSkew(syncSvc, 5*time.Minute)
 	relayHandler := relay.NewHandler(relaySvc)
 
 	var adminHandler *admin.Handler
 	if withAdminPanel {
-		adminHandler, err = admin.NewHandler(db, authSvc, marketSvc, jwtMgr)
+		adminHandler, err = admin.NewHandlerWithEndpointPolicy(db, authSvc, marketSvc, jwtMgr, endpointPolicy)
 		if err != nil {
 			panic("admin templates: " + err.Error())
 		}
 	}
 
-	r := server.Setup(authHandler, jwtMgr, marketHandler, syncHandler, relayHandler, adminHandler)
+	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, syncHandler, relayHandler, adminHandler)
 	ts = NewTestServer(r)
 
 	cleanup = func() {
 		ts.Close()
+		relayHandler.Close()
+		if adminHandler != nil {
+			adminHandler.Close()
+		}
 		_ = os.RemoveAll(tmpDir)
 	}
 

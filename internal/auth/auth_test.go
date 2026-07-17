@@ -1,9 +1,15 @@
 package auth_test
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
+	"net/http/httptest"
+	"sync"
 	"testing"
 
+	"github.com/gin-gonic/gin"
+	"github.com/lynai/backend/internal/auth"
 	"github.com/lynai/backend/internal/testutil"
 )
 
@@ -138,6 +144,26 @@ func TestMeRequiresAuth(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestAdminMiddlewareRejectsMissingOrInvalidRole(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	for _, value := range []interface{}{nil, "true"} {
+		router := gin.New()
+		router.Use(func(c *gin.Context) {
+			if value != nil {
+				c.Set("isAdmin", value)
+			}
+			c.Next()
+		}, auth.AdminMiddleware())
+		router.GET("/admin", func(c *gin.Context) { c.Status(http.StatusNoContent) })
+
+		recorder := httptest.NewRecorder()
+		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/admin", nil))
+		if recorder.Code != http.StatusForbidden {
+			t.Fatalf("isAdmin=%v status = %d, want 403", value, recorder.Code)
+		}
+	}
+}
+
 func TestMeWithToken(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
@@ -205,6 +231,266 @@ func TestRefresh(t *testing.T) {
 	testutil.SetBearer(req, newToken["accessToken"].(string))
 	resp = testutil.Do(t, req)
 	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+}
+
+func TestLogoutRevokesSession(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	res := doAuthRequest(t, ts.URL, "/auth/register", map[string]string{
+		"phone": "13500005556", "password": testPassword,
+	})
+	accessToken := res.Token["accessToken"].(string)
+	refreshToken := res.Token["refreshToken"].(string)
+
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/auth/logout", nil)
+	testutil.SetBearer(req, accessToken)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+
+	req = testutil.NewRequest(t, http.MethodGet, ts.URL+"/auth/me", nil)
+	testutil.SetBearer(req, accessToken)
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+
+	resp = testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{"refreshToken": refreshToken})
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+}
+
+func TestRefreshTokenRevokeIsIdempotent(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	res := doAuthRequest(t, ts.URL, "/auth/register", map[string]string{
+		"phone": "13500005559", "password": testPassword,
+	})
+	refreshToken := res.Token["refreshToken"].(string)
+	for range 2 {
+		resp := testutil.PostJSON(t, ts.URL+"/auth/revoke", map[string]string{"refreshToken": refreshToken})
+		testutil.RequireStatus(t, resp, http.StatusNoContent)
+		resp.Body.Close()
+	}
+	resp := testutil.PostJSON(t, ts.URL+"/auth/revoke", map[string]string{"refreshToken": "invalid"})
+	testutil.RequireStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+
+	resp = testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{"refreshToken": refreshToken})
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+}
+
+func TestRotatedRefreshTokenRevokesSessionFamily(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	res := doAuthRequest(t, ts.URL, "/auth/register", map[string]string{
+		"phone": "13500005560", "password": testPassword,
+	})
+	oldRefresh := res.Token["refreshToken"].(string)
+	rotated := doAuthRequest(t, ts.URL, "/auth/refresh", map[string]string{"refreshToken": oldRefresh})
+	resp := testutil.PostJSON(t, ts.URL+"/auth/revoke", map[string]string{"refreshToken": oldRefresh})
+	testutil.RequireStatus(t, resp, http.StatusNoContent)
+	resp.Body.Close()
+
+	resp = testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{
+		"refreshToken": rotated.Token["refreshToken"].(string),
+	})
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/auth/me", nil)
+	testutil.SetBearer(req, rotated.Token["accessToken"].(string))
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+}
+
+func TestConcurrentRefreshAndFamilyRevokeLeavesSessionRevoked(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	res := doAuthRequest(t, ts.URL, "/auth/register", map[string]string{
+		"phone": "13500005561", "password": testPassword,
+	})
+	refreshToken := res.Token["refreshToken"].(string)
+	body, err := json.Marshal(map[string]string{"refreshToken": refreshToken})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	var rotatedRefresh string
+	var rotatedMu sync.Mutex
+	var wg sync.WaitGroup
+	for _, path := range []string{"/auth/refresh", "/auth/revoke"} {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, err := http.Post(ts.URL+path, "application/json", bytes.NewReader(body))
+			if err != nil {
+				t.Errorf("POST %s: %v", path, err)
+				return
+			}
+			defer resp.Body.Close()
+			statuses <- resp.StatusCode
+			if path == "/auth/refresh" && resp.StatusCode == http.StatusOK {
+				var payload map[string]interface{}
+				if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+					t.Errorf("decode refresh response: %v", err)
+					return
+				}
+				token, _ := payload["token"].(map[string]interface{})
+				rotatedMu.Lock()
+				rotatedRefresh, _ = token["refreshToken"].(string)
+				rotatedMu.Unlock()
+			}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+
+	seenNoContent := false
+	for status := range statuses {
+		if status == http.StatusNoContent {
+			seenNoContent = true
+			continue
+		}
+		if status != http.StatusOK && status != http.StatusUnauthorized {
+			t.Fatalf("unexpected concurrent status %d", status)
+		}
+	}
+	if !seenNoContent {
+		t.Fatal("revoke did not succeed")
+	}
+
+	rotatedMu.Lock()
+	currentRefresh := rotatedRefresh
+	rotatedMu.Unlock()
+	if currentRefresh == "" {
+		currentRefresh = refreshToken
+	}
+	resp := testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{"refreshToken": currentRefresh})
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+}
+
+func TestRefreshRotationRejectsOldTokenWithoutRevokingSession(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	res := doAuthRequest(t, ts.URL, "/auth/register", map[string]string{
+		"phone": "13500005557", "password": testPassword,
+	})
+	oldRefresh := res.Token["refreshToken"].(string)
+	rotated := doAuthRequest(t, ts.URL, "/auth/refresh", map[string]string{"refreshToken": oldRefresh})
+
+	resp := testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{"refreshToken": oldRefresh})
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	resp.Body.Close()
+
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/auth/me", nil)
+	testutil.SetBearer(req, rotated.Token["accessToken"].(string))
+	resp = testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp = testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{
+		"refreshToken": rotated.Token["refreshToken"].(string),
+	})
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+}
+
+func TestConcurrentRefreshConsumesTokenOnce(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	res := doAuthRequest(t, ts.URL, "/auth/register", map[string]string{
+		"phone": "13500005558", "password": testPassword,
+	})
+	body, err := json.Marshal(map[string]string{"refreshToken": res.Token["refreshToken"].(string)})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	start := make(chan struct{})
+	type refreshResult struct {
+		status int
+		token  map[string]interface{}
+	}
+	results := make(chan refreshResult, 2)
+	errs := make(chan error, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			resp, err := http.Post(ts.URL+"/auth/refresh", "application/json", bytes.NewReader(body))
+			if err != nil {
+				errs <- err
+				return
+			}
+			result := refreshResult{status: resp.StatusCode}
+			if resp.StatusCode == http.StatusOK {
+				var payload map[string]interface{}
+				if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
+					resp.Body.Close()
+					errs <- err
+					return
+				}
+				result.token, _ = payload["token"].(map[string]interface{})
+			}
+			resp.Body.Close()
+			results <- result
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+	for err := range errs {
+		t.Fatalf("concurrent refresh: %v", err)
+	}
+
+	counts := map[int]int{}
+	var rotated map[string]interface{}
+	for result := range results {
+		counts[result.status]++
+		if result.status == http.StatusOK {
+			rotated = result.token
+		}
+	}
+	if counts[http.StatusOK] != 1 || counts[http.StatusUnauthorized] != 1 {
+		t.Fatalf("refresh statuses = %v, want one 200 and one 401", counts)
+	}
+	if rotated == nil {
+		t.Fatal("successful concurrent refresh response is missing token")
+	}
+
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/auth/me", nil)
+	testutil.SetBearer(req, rotated["accessToken"].(string))
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp = testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{
+		"refreshToken": rotated["refreshToken"].(string),
+	})
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	resp = testutil.PostJSON(t, ts.URL+"/auth/refresh", map[string]string{
+		"refreshToken": res.Token["refreshToken"].(string),
+	})
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
 	resp.Body.Close()
 }
 

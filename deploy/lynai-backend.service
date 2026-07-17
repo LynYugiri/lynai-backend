@@ -10,16 +10,26 @@ ExecStart=/opt/lynai-backend/bin/lynai-backend
 Restart=always
 RestartSec=5
 
-# Required environment variables. Replace CHANGE-ME values on the server before starting.
-Environment="DB_DSN=host=/var/run/postgresql port=5432 user=lynai dbname=lynai sslmode=disable"
-Environment="JWT_SECRET=CHANGE-ME-to-a-random-long-string"
-Environment="ADMIN_PASSWORD=CHANGE-ME-to-a-strong-password"
+# Required environment variables. Create this root-owned file before starting;
+# startup fails clearly when required values, including MACHINE_ID, are absent.
+EnvironmentFile=/etc/lynai-backend/environment
 
 # Optional environment variables.
 Environment="PORT=8080"
 Environment="STORAGE_DIR=/opt/lynai-backend/storage"
 Environment="ADMIN_PHONE=0000000000"
 Environment="ADMIN_DISPLAY_NAME=管理员"
+Environment="SNOWFLAKE_ROLLBACK_TIMEOUT=5s"
+Environment="SYNC_CLOCK_SKEW=5m"
+Environment="SYNC_REPLAY_RETENTION=24h"
+Environment="ADMIN_SESSION_TTL=720h"
+Environment="SESSION_CLEANUP_INTERVAL=1h"
+Environment="RELAY_SPEECH_SESSION_TTL=2h"
+Environment="RELAY_SPEECH_PER_USER_CAPACITY=5"
+Environment="RELAY_SPEECH_GLOBAL_CAPACITY=500"
+Environment="RELAY_NON_STREAM_TIMEOUT=2m"
+Environment="RELAY_STREAM_IDLE_TIMEOUT=45s"
+Environment="RELAY_STREAM_MAX_DURATION=30m"
 
 # Basic hardening. The service only needs write access to STORAGE_DIR.
 NoNewPrivileges=true

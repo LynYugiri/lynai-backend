@@ -3,18 +3,25 @@ package market
 import (
 	"errors"
 	"fmt"
+	"os"
+	"sync"
 
 	"github.com/lynai/backend/internal/database"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // ErrPluginNotFound is returned when a plugin ID does not exist.
 var ErrPluginNotFound = errors.New("plugin not found")
 
+// ErrPluginNotOwned is returned when another user owns a submitted plugin ID.
+var ErrPluginNotOwned = errors.New("plugin belongs to another submitter")
+
 // Service handles marketplace queries, submissions, and review operations.
 type Service struct {
-	db      *gorm.DB
-	storage *Storage
+	db        *gorm.DB
+	storage   *Storage
+	storageMu sync.Mutex
 }
 
 // NewService creates a market service with the given database and storage.
@@ -28,9 +35,7 @@ func (s *Service) ListPlugins(category, query string, page, pageSize int) ([]dat
 	if page < 1 {
 		page = 1
 	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 20
-	}
+	pageSize = normalizePageSize(pageSize)
 
 	tx := s.db.Model(&database.Plugin{}).Where("status = ?", database.PluginStatusApproved)
 	if category != "" {
@@ -50,7 +55,7 @@ func (s *Service) ListPlugins(category, query string, page, pageSize int) ([]dat
 	err := tx.
 		Preload("Screenshots").
 		Preload("Permissions").
-		Order("updated_at DESC").
+		Order("updated_at DESC, id DESC").
 		Offset((page - 1) * pageSize).
 		Limit(pageSize).
 		Find(&plugins).Error
@@ -58,6 +63,13 @@ func (s *Service) ListPlugins(category, query string, page, pageSize int) ([]dat
 		return nil, 0, err
 	}
 	return plugins, total, nil
+}
+
+func normalizePageSize(pageSize int) int {
+	if pageSize < 1 || pageSize > 100 {
+		return 20
+	}
+	return pageSize
 }
 
 // GetPlugin returns a single approved plugin by ID.
@@ -199,14 +211,27 @@ func (s *Service) Unpublish(pluginID string) error {
 
 // DeletePlugin deletes a plugin record and its stored ZIP file.
 func (s *Service) DeletePlugin(pluginID string) error {
-	plugin, err := s.GetPluginAnyStatus(pluginID)
-	if err != nil {
-		return err
-	}
-	if err := s.storage.DeletePluginZip(plugin.ZipPath); err != nil {
-		return err
-	}
-	return s.db.Transaction(func(tx *gorm.DB) error {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
+
+	var backupPath string
+	var fullPath string
+	var moved bool
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		var plugin database.Plugin
+		if err := tx.Where("id = ?", pluginID).First(&plugin).Error; err != nil {
+			if errors.Is(err, gorm.ErrRecordNotFound) {
+				return ErrPluginNotFound
+			}
+			return err
+		}
+
+		var err error
+		fullPath = s.storage.FullPath(plugin.ZipPath)
+		backupPath, moved, err = moveAside(fullPath)
+		if err != nil {
+			return fmt.Errorf("isolate plugin zip: %w", err)
+		}
 		if err := tx.Where("plugin_id = ?", pluginID).Delete(&database.PluginPermission{}).Error; err != nil {
 			return err
 		}
@@ -222,68 +247,101 @@ func (s *Service) DeletePlugin(pluginID string) error {
 		}
 		return nil
 	})
+	if err != nil {
+		if moved {
+			_ = os.Rename(backupPath, fullPath)
+		}
+		return err
+	}
+	if moved {
+		_ = os.Remove(backupPath)
+	}
+	return nil
 }
 
 // UpsertSubmission creates or updates a plugin record from a submitted manifest.
 // If a plugin with the same ID exists, it resets status to pending and updates
 // all metadata fields. Screenshots and permissions are fully replaced.
-func (s *Service) UpsertSubmission(m *manifestJSON, zipPath string, sha *string, submitterID int64) (*database.Plugin, error) {
-	var existing database.Plugin
-	err := s.db.Where("id = ?", m.ID).First(&existing).Error
+func (s *Service) UpsertSubmission(m *manifestJSON, tempPath string, sha *string, submitterID int64) (*database.Plugin, error) {
+	s.storageMu.Lock()
+	defer s.storageMu.Unlock()
 
-	if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, fmt.Errorf("query existing plugin: %w", err)
-	}
-
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		plugin := database.Plugin{
-			ID:          m.ID,
-			Name:        m.Name,
-			Author:      m.Author,
-			Description: m.Description,
-			Version:     m.Version,
-			Category:    "",
-			ZipPath:     zipPath,
-			SHA256:      sha,
-			Status:      database.PluginStatusPending,
-			SubmittedBy: submitterID,
-		}
-		if m.Icon != "" {
-			plugin.IconURL = &m.Icon
-		}
-		if err := s.db.Create(&plugin).Error; err != nil {
-			return nil, fmt.Errorf("create plugin: %w", err)
-		}
-		if err := s.replacePermissions(&plugin, m.Permissions); err != nil {
-			return nil, err
-		}
-		return s.reloadPlugin(plugin.ID)
-	}
-
-	// Update existing plugin, reset to pending for re-review.
-	updates := map[string]interface{}{
-		"name":        m.Name,
-		"author":      m.Author,
-		"description": m.Description,
-		"version":     m.Version,
-		"zip_path":    zipPath,
-		"sha256":      sha,
-		"status":      database.PluginStatusPending,
-		"reviewed_by": nil,
-		"review_note": nil,
-	}
-	if m.Icon != "" {
-		updates["icon_url"] = m.Icon
-	}
-	if err := s.db.Model(&existing).Updates(updates).Error; err != nil {
-		return nil, fmt.Errorf("update plugin: %w", err)
-	}
-
-	// Reload with relations.
-	if err := s.replacePermissions(&existing, m.Permissions); err != nil {
+	zipPath, fullPath, err := s.storage.PluginZipPath(m.ID, m.Version)
+	if err != nil {
 		return nil, err
 	}
-	return s.reloadPlugin(existing.ID)
+	if err := s.storage.PublishPluginZip(tempPath, fullPath); err != nil {
+		return nil, fmt.Errorf("publish plugin zip: %w", err)
+	}
+	if err := os.Chmod(fullPath, 0o644); err != nil {
+		_ = os.Remove(fullPath)
+		return nil, fmt.Errorf("set plugin zip permissions: %w", err)
+	}
+
+	var oldZipPath string
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		var existing database.Plugin
+		queryErr := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", m.ID).First(&existing).Error
+		if queryErr != nil && !errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			return fmt.Errorf("query existing plugin: %w", queryErr)
+		}
+		if queryErr == nil && existing.SubmittedBy != submitterID {
+			return ErrPluginNotOwned
+		}
+		if queryErr == nil {
+			oldZipPath = existing.ZipPath
+		}
+
+		if errors.Is(queryErr, gorm.ErrRecordNotFound) {
+			plugin := database.Plugin{
+				ID:          m.ID,
+				Name:        m.Name,
+				Author:      m.Author,
+				Description: m.Description,
+				Version:     m.Version,
+				ZipPath:     zipPath,
+				SHA256:      sha,
+				Status:      database.PluginStatusPending,
+				SubmittedBy: submitterID,
+			}
+			if m.Icon != "" {
+				plugin.IconURL = &m.Icon
+			}
+			if err := tx.Create(&plugin).Error; err != nil {
+				return fmt.Errorf("create plugin: %w", err)
+			}
+		} else {
+			updates := map[string]interface{}{
+				"name":        m.Name,
+				"author":      m.Author,
+				"description": m.Description,
+				"version":     m.Version,
+				"zip_path":    zipPath,
+				"sha256":      sha,
+				"status":      database.PluginStatusPending,
+				"reviewed_by": nil,
+				"review_note": nil,
+			}
+			if m.Icon != "" {
+				updates["icon_url"] = m.Icon
+			}
+			if err := tx.Model(&existing).Updates(updates).Error; err != nil {
+				return fmt.Errorf("update plugin: %w", err)
+			}
+		}
+		return replacePermissions(tx, m.ID, m.Permissions)
+	})
+	if err != nil {
+		_ = os.Remove(fullPath)
+		return nil, err
+	}
+	if oldZipPath != "" && oldZipPath != zipPath {
+		var references int64
+		if err := s.db.Model(&database.Plugin{}).Where("zip_path = ?", oldZipPath).Count(&references).Error; err == nil && references == 0 {
+			_ = s.storage.DeletePluginZip(oldZipPath)
+		}
+	}
+	return s.reloadPlugin(m.ID)
 }
 
 // reloadPlugin loads a plugin with all relations preloaded.
@@ -301,13 +359,13 @@ func (s *Service) reloadPlugin(id string) (*database.Plugin, error) {
 
 // replacePermissions deletes all existing permissions for a plugin and inserts
 // the new set.
-func (s *Service) replacePermissions(plugin *database.Plugin, perms []string) error {
-	if err := s.db.Where("plugin_id = ?", plugin.ID).Delete(&database.PluginPermission{}).Error; err != nil {
+func replacePermissions(tx *gorm.DB, pluginID string, perms []string) error {
+	if err := tx.Where("plugin_id = ?", pluginID).Delete(&database.PluginPermission{}).Error; err != nil {
 		return fmt.Errorf("clear permissions: %w", err)
 	}
 	for _, p := range perms {
-		if err := s.db.Create(&database.PluginPermission{
-			PluginID:   plugin.ID,
+		if err := tx.Create(&database.PluginPermission{
+			PluginID:   pluginID,
 			Permission: p,
 		}).Error; err != nil {
 			return fmt.Errorf("create permission: %w", err)

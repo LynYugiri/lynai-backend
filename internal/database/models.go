@@ -1,6 +1,7 @@
 package database
 
 import (
+	"context"
 	"errors"
 	"time"
 
@@ -20,6 +21,58 @@ type User struct {
 	IsAdmin       bool      `gorm:"default:false" json:"isAdmin"`
 	CreatedAt     time.Time `json:"createdAt"`
 	UpdatedAt     time.Time `json:"updatedAt"`
+}
+
+// UserSession is a revocable login session. RefreshJTI is replaced on every
+// successful refresh so a refresh token can be consumed only once.
+type UserSession struct {
+	ID         string     `gorm:"primaryKey;size:64" json:"id"`
+	UserID     int64      `gorm:"not null;index" json:"userId,string"`
+	RefreshJTI string     `gorm:"not null;size:64" json:"-"`
+	ExpiresAt  time.Time  `gorm:"not null;index" json:"expiresAt"`
+	RevokedAt  *time.Time `gorm:"index" json:"revokedAt"`
+	CreatedAt  time.Time  `json:"createdAt"`
+	UpdatedAt  time.Time  `json:"updatedAt"`
+}
+
+// AdminSession is an opaque browser session. Only the SHA-256 token digest is
+// stored so a database disclosure does not expose usable administrator cookies.
+type AdminSession struct {
+	TokenHash []byte    `gorm:"primaryKey;size:32" json:"-"`
+	UserID    int64     `gorm:"not null;index" json:"userId,string"`
+	ExpiresAt time.Time `gorm:"not null;index" json:"expiresAt"`
+	CreatedAt time.Time `gorm:"not null" json:"createdAt"`
+	UpdatedAt time.Time `gorm:"not null" json:"updatedAt"`
+}
+
+// UserDevice is one user's binding to a deterministic Ed25519 device identity.
+type UserDevice struct {
+	UserID    int64      `gorm:"primaryKey;autoIncrement:false;uniqueIndex:idx_user_devices_user_public_key,priority:1;index:idx_user_devices_user_session,priority:1;index:idx_user_devices_user_revoked,priority:1" json:"userId,string"`
+	DeviceID  string     `gorm:"primaryKey;size:52" json:"id"`
+	SessionID string     `gorm:"not null;size:64;index:idx_user_devices_user_session,priority:2" json:"-"`
+	Name      string     `gorm:"not null;size:64" json:"name"`
+	Platform  string     `gorm:"not null;size:32" json:"platform"`
+	Protocol  uint16     `gorm:"not null" json:"protocolVersion"`
+	PublicKey []byte     `gorm:"not null;size:32;uniqueIndex:idx_user_devices_user_public_key,priority:2" json:"-"`
+	RevokedAt *time.Time `gorm:"index:idx_user_devices_user_revoked,priority:2" json:"revokedAt"`
+	CreatedAt time.Time  `json:"createdAt"`
+	UpdatedAt time.Time  `json:"updatedAt"`
+}
+
+// DeviceChallenge binds a short-lived challenge to proposed enrollment data.
+type DeviceChallenge struct {
+	ID            string     `gorm:"primaryKey;size:32" json:"id"`
+	UserID        int64      `gorm:"not null;index" json:"userId,string"`
+	SessionID     string     `gorm:"not null;size:64;index" json:"-"`
+	DeviceID      string     `gorm:"not null;size:52" json:"deviceId"`
+	PublicKey     []byte     `gorm:"not null;size:32" json:"-"`
+	Name          string     `gorm:"not null;size:64" json:"name"`
+	Platform      string     `gorm:"not null;size:32" json:"platform"`
+	Protocol      uint16     `gorm:"not null" json:"protocolVersion"`
+	ChallengeHash []byte     `gorm:"not null;size:32" json:"-"`
+	ExpiresAt     time.Time  `gorm:"not null;index" json:"expiresAt"`
+	ConsumedAt    *time.Time `gorm:"index" json:"consumedAt"`
+	CreatedAt     time.Time  `gorm:"not null" json:"createdAt"`
 }
 
 // PluginStatus enumerates the review lifecycle of a submitted plugin.
@@ -75,14 +128,31 @@ type SyncMetadata struct {
 
 // SyncChange is a single change record in the incremental sync log.
 type SyncChange struct {
-	ID        int64     `gorm:"primaryKey;autoIncrement" json:"-"`
-	UserID    int64     `gorm:"not null;index:idx_user_seq,unique" json:"userId,string"`
-	Seq       int64     `gorm:"not null;index:idx_user_seq,unique" json:"seq"`
-	TableName string    `gorm:"not null" json:"table"`
-	Op        string    `gorm:"not null" json:"op"`
-	RecordID  string    `gorm:"not null" json:"recordId"`
-	Data      *string   `gorm:"type:text" json:"data"`
-	CreatedAt time.Time `gorm:"not null" json:"createdAt"`
+	ID              int64     `gorm:"primaryKey;autoIncrement" json:"-"`
+	UserID          int64     `gorm:"not null;index:idx_user_seq,unique;uniqueIndex:idx_sync_changes_user_change" json:"userId,string"`
+	Seq             int64     `gorm:"not null;index:idx_user_seq,unique" json:"seq"`
+	ChangeID        string    `gorm:"not null;size:128;uniqueIndex:idx_sync_changes_user_change" json:"changeId"`
+	DeviceID        *string   `gorm:"size:52;index" json:"deviceId,omitempty"`
+	TableName       string    `gorm:"not null" json:"table"`
+	Op              string    `gorm:"not null" json:"op"`
+	RecordID        string    `gorm:"not null" json:"recordId"`
+	Data            *string   `gorm:"type:text" json:"data"`
+	ClientCreatedAt time.Time `gorm:"not null" json:"clientCreatedAt"`
+	CreatedAt       time.Time `gorm:"not null" json:"createdAt"`
+}
+
+// SyncRequestReplay stores the exact committed response for a sync request ID.
+type SyncRequestReplay struct {
+	ID                  int64     `gorm:"primaryKey;autoIncrement" json:"-"`
+	UserID              int64     `gorm:"not null;uniqueIndex:idx_sync_request_replays_user_request" json:"userId,string"`
+	RequestID           string    `gorm:"not null;size:32;uniqueIndex:idx_sync_request_replays_user_request" json:"requestId"`
+	Operation           string    `gorm:"not null;size:128" json:"operation"`
+	BodyHash            []byte    `gorm:"not null;size:32" json:"-"`
+	ResponseStatus      int       `gorm:"not null" json:"responseStatus"`
+	ResponseContentType string    `gorm:"not null;size:128" json:"responseContentType"`
+	ResponseBody        []byte    `gorm:"not null" json:"-"`
+	CreatedAt           time.Time `gorm:"not null" json:"createdAt"`
+	ExpiresAt           time.Time `gorm:"not null;index" json:"expiresAt"`
 }
 
 // SyncBlob tracks which binary blobs a user has uploaded.
@@ -90,7 +160,7 @@ type SyncBlob struct {
 	ID        uint      `gorm:"primaryKey" json:"-"`
 	UserID    int64     `gorm:"not null;uniqueIndex:idx_user_blob" json:"userId,string"`
 	SHA256    string    `gorm:"not null;uniqueIndex:idx_user_blob" json:"sha256"`
-	Size      int       `gorm:"not null" json:"size"`
+	Size      int64     `gorm:"not null" json:"size"`
 	CreatedAt time.Time `gorm:"not null" json:"createdAt"`
 }
 
@@ -147,25 +217,46 @@ type RelayRequestLog struct {
 	CreatedAt      time.Time `gorm:"not null;index" json:"createdAt"`
 }
 
+// RelaySpeechSession is the shared state for one long-running speech relay.
+// A row with an empty UpstreamAudioID is a capacity reservation in progress.
+type RelaySpeechSession struct {
+	ID              string    `gorm:"primaryKey;size:32" json:"id"`
+	UserID          int64     `gorm:"not null;index:idx_relay_speech_user_expires,priority:1" json:"userId,string"`
+	ProviderID      int64     `gorm:"not null" json:"providerId,string"`
+	ModelID         string    `gorm:"not null" json:"modelId"`
+	AppID           string    `gorm:"not null" json:"-"`
+	UpstreamAudioID string    `gorm:"not null" json:"-"`
+	TaskID          string    `gorm:"not null" json:"-"`
+	ExpiresAt       time.Time `gorm:"not null;index;index:idx_relay_speech_user_expires,priority:2" json:"expiresAt"`
+	CreatedAt       time.Time `gorm:"not null" json:"createdAt"`
+	UpdatedAt       time.Time `gorm:"not null" json:"updatedAt"`
+}
+
 // AllModels returns every model that should be auto-migrated.
 func AllModels() []interface{} {
 	return []interface{}{
 		&User{},
+		&UserSession{},
+		&AdminSession{},
+		&UserDevice{},
+		&DeviceChallenge{},
 		&Plugin{},
 		&PluginScreenshot{},
 		&PluginPermission{},
 		&SyncMetadata{},
 		&SyncChange{},
+		&SyncRequestReplay{},
 		&SyncBlob{},
 		&RelayProvider{},
 		&RelayModel{},
 		&RelayRequestLog{},
+		&RelaySpeechSession{},
 	}
 }
 
 // EnsureAdminSeed creates the initial admin account if it does not exist.
 // Uses the snowflake generator for the user ID.
-func EnsureAdminSeed(db *gorm.DB, phone, displayName, passwordHash string, snowflake *SnowflakeGenerator) error {
+func EnsureAdminSeed(ctx context.Context, db *gorm.DB, phone, displayName, passwordHash string, snowflake *SnowflakeGenerator) error {
 	var existing User
 	if err := db.Where("phone = ?", phone).First(&existing).Error; err == nil {
 		updates := map[string]interface{}{}
@@ -182,8 +273,12 @@ func EnsureAdminSeed(db *gorm.DB, phone, displayName, passwordHash string, snowf
 	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
 		return err
 	}
+	id, err := snowflake.NextID(ctx)
+	if err != nil {
+		return err
+	}
 	admin := User{
-		ID:           snowflake.NextID(),
+		ID:           id,
 		Phone:        phone,
 		PasswordHash: passwordHash,
 		DisplayName:  displayName,

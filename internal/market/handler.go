@@ -2,7 +2,6 @@ package market
 
 import (
 	"archive/zip"
-	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,11 +9,17 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/database"
+)
+
+const (
+	pluginUploadMaxBytes   int64 = 16 << 20
+	pluginManifestMaxBytes int64 = 1 << 20
 )
 
 // Handler exposes the /market/* API endpoints.
@@ -76,7 +81,7 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 	category := c.Query("category")
 	query := c.Query("q")
 	page := parsePositiveInt(c.Query("page"), 1)
-	pageSize := parsePositiveInt(c.Query("page_size"), 20)
+	pageSize := normalizePageSize(parsePositiveInt(c.Query("page_size"), 20))
 
 	plugins, total, err := h.svc.ListPlugins(category, query, page, pageSize)
 	if err != nil {
@@ -169,6 +174,21 @@ func (h *Handler) SubmitPlugin(c *gin.Context) {
 	userIDStr := c.GetString("userID")
 	userID, _ := strconv.ParseInt(userIDStr, 10, 64)
 
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, pluginUploadMaxBytes)
+	err := c.Request.ParseMultipartForm(1 << 20)
+	if c.Request.MultipartForm != nil {
+		defer c.Request.MultipartForm.RemoveAll()
+	}
+	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "plugin upload exceeds 16 MiB limit"})
+			return
+		}
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid multipart upload"})
+		return
+	}
+
 	file, err := c.FormFile("zip")
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "zip file is required"})
@@ -180,7 +200,6 @@ func (h *Handler) SubmitPlugin(c *gin.Context) {
 		return
 	}
 
-	// Read the uploaded file into memory. Plugin ZIPs are small (<10 MB typical).
 	src, err := file.Open()
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot read uploaded file"})
@@ -188,14 +207,14 @@ func (h *Handler) SubmitPlugin(c *gin.Context) {
 	}
 	defer src.Close()
 
-	var buf bytes.Buffer
-	if _, err := io.Copy(&buf, src); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "cannot read uploaded file"})
+	tempPath, err := h.svc.storage.StagePluginZip(src)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to stage plugin file"})
 		return
 	}
-	zipBytes := buf.Bytes()
+	defer h.svc.storage.DeleteTemp(tempPath)
 
-	manifest, err := extractManifest(zipBytes)
+	manifest, sha, err := extractManifest(tempPath)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("cannot read plugin.json from ZIP: %v", err)})
 		return
@@ -213,15 +232,12 @@ func (h *Handler) SubmitPlugin(c *gin.Context) {
 		return
 	}
 
-	sha := sha256Hex(zipBytes)
-	relPath, err := h.svc.storage.SavePluginZip(manifest.ID, manifest.Version, zipBytes)
+	plugin, err := h.svc.UpsertSubmission(manifest, tempPath, &sha, userID)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to store plugin file"})
-		return
-	}
-
-	plugin, err := h.svc.UpsertSubmission(manifest, relPath, &sha, userID)
-	if err != nil {
+		if errors.Is(err, ErrPluginNotOwned) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "plugin id belongs to another submitter"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -301,38 +317,52 @@ func (h *Handler) RejectPlugin(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "rejected", "reason": req.Reason})
 }
 
-// extractManifest reads plugin.json from within a ZIP archive.
-func extractManifest(zipBytes []byte) (*manifestJSON, error) {
-	reader, err := zip.NewReader(bytes.NewReader(zipBytes), int64(len(zipBytes)))
+// extractManifest reads plugin.json and hashes a staged ZIP archive.
+func extractManifest(path string) (*manifestJSON, string, error) {
+	zipFile, err := os.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("open zip: %w", err)
+		return nil, "", fmt.Errorf("open zip: %w", err)
 	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, zipFile); err != nil {
+		zipFile.Close()
+		return nil, "", fmt.Errorf("hash zip: %w", err)
+	}
+	if err := zipFile.Close(); err != nil {
+		return nil, "", fmt.Errorf("close zip: %w", err)
+	}
+
+	reader, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, "", fmt.Errorf("open zip: %w", err)
+	}
+	defer reader.Close()
 
 	for _, f := range reader.File {
 		if f.Name == "plugin.json" || strings.HasSuffix(f.Name, "/plugin.json") {
+			if f.UncompressedSize64 > uint64(pluginManifestMaxBytes) {
+				return nil, "", fmt.Errorf("plugin.json exceeds 1 MiB limit")
+			}
 			rc, err := f.Open()
 			if err != nil {
-				return nil, fmt.Errorf("open plugin.json: %w", err)
+				return nil, "", fmt.Errorf("open plugin.json: %w", err)
 			}
 			defer rc.Close()
-			data, err := io.ReadAll(rc)
+			data, err := io.ReadAll(io.LimitReader(rc, pluginManifestMaxBytes+1))
 			if err != nil {
-				return nil, fmt.Errorf("read plugin.json: %w", err)
+				return nil, "", fmt.Errorf("read plugin.json: %w", err)
+			}
+			if int64(len(data)) > pluginManifestMaxBytes {
+				return nil, "", fmt.Errorf("plugin.json exceeds 1 MiB limit")
 			}
 			var m manifestJSON
 			if err := json.Unmarshal(data, &m); err != nil {
-				return nil, fmt.Errorf("parse plugin.json: %w", err)
+				return nil, "", fmt.Errorf("parse plugin.json: %w", err)
 			}
-			return &m, nil
+			return &m, hex.EncodeToString(hash.Sum(nil)), nil
 		}
 	}
-	return nil, fmt.Errorf("plugin.json not found in ZIP")
-}
-
-// sha256Hex returns the hex-encoded SHA-256 digest of the given bytes.
-func sha256Hex(data []byte) string {
-	sum := sha256.Sum256(data)
-	return hex.EncodeToString(sum[:])
+	return nil, "", fmt.Errorf("plugin.json not found in ZIP")
 }
 
 func parsePositiveInt(s string, fallback int) int {

@@ -1,6 +1,8 @@
 package auth
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"time"
 
@@ -27,6 +29,7 @@ type Claims struct {
 	Username  string `json:"usr"`
 	IsAdmin   bool   `json:"adm"`
 	TokenType string `json:"typ"`
+	SessionID string `json:"sid"`
 	jwt.RegisteredClaims
 }
 
@@ -42,22 +45,28 @@ func NewJWTManager(secret string) *JWTManager {
 
 // GenerateAccessToken produces a short-lived access JWT.
 func (m *JWTManager) GenerateAccessToken(userID, username string, isAdmin bool) (string, int64, error) {
-	return m.generate(userID, username, isAdmin, TokenTypeAccess, AccessTokenExpiry)
+	return m.generate(userID, username, isAdmin, "", TokenTypeAccess, AccessTokenExpiry)
 }
 
 // GenerateRefreshToken produces a long-lived refresh JWT.
 func (m *JWTManager) GenerateRefreshToken(userID, username string, isAdmin bool) (string, int64, error) {
-	return m.generate(userID, username, isAdmin, TokenTypeRefresh, RefreshTokenExpiry)
+	return m.generate(userID, username, isAdmin, "", TokenTypeRefresh, RefreshTokenExpiry)
 }
 
-func (m *JWTManager) generate(userID, username string, isAdmin bool, tokenType string, expiry time.Duration) (string, int64, error) {
+func (m *JWTManager) generate(userID, username string, isAdmin bool, sessionID, tokenType string, expiry time.Duration) (string, int64, error) {
+	tokenID, err := randomID()
+	if err != nil {
+		return "", 0, err
+	}
 	expiresAt := time.Now().Add(expiry)
 	claims := Claims{
 		UserID:    userID,
 		Username:  username,
 		IsAdmin:   isAdmin,
 		TokenType: tokenType,
+		SessionID: sessionID,
 		RegisteredClaims: jwt.RegisteredClaims{
+			ID:        tokenID,
 			ExpiresAt: jwt.NewNumericDate(expiresAt),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
 		},
@@ -70,12 +79,20 @@ func (m *JWTManager) generate(userID, username string, isAdmin bool, tokenType s
 	return signed, expiresAt.UnixMilli(), nil
 }
 
+func randomID() (string, error) {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(buf), nil
+}
+
 // Verify parses and validates a JWT string, returning its claims.
 // Works for both access and refresh tokens.
 func (m *JWTManager) Verify(tokenString string) (*Claims, error) {
 	claims := &Claims{}
 	token, err := jwt.ParseWithClaims(tokenString, claims, func(t *jwt.Token) (interface{}, error) {
-		if _, ok := t.Method.(*jwt.SigningMethodHMAC); !ok {
+		if t.Method != jwt.SigningMethodHS256 {
 			return nil, errors.New("unexpected signing method")
 		}
 		return m.secret, nil

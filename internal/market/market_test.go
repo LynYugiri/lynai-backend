@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"strings"
@@ -83,6 +84,26 @@ func submitPlugin(t *testing.T, ts *testutil.TestServer, token string, zipBytes 
 	return result
 }
 
+func submitPluginResponse(t *testing.T, ts *testutil.TestServer, token string, zipBytes []byte) *http.Response {
+	t.Helper()
+	body := &bytes.Buffer{}
+	mw := multipart.NewWriter(body)
+	part, err := mw.CreateFormFile("zip", "plugin.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := part.Write(zipBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := mw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/submit", body)
+	testutil.SetBearer(req, token)
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	return testutil.Do(t, req)
+}
+
 func TestSubmitPlugin(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
@@ -112,6 +133,128 @@ func TestSubmitPlugin(t *testing.T) {
 	perms, _ := result["permissions"].([]interface{})
 	if len(perms) != 2 {
 		t.Fatalf("permissions len = %d, want 2", len(perms))
+	}
+}
+
+func TestSubmitCannotTakeOverAnotherUsersPlugin(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	ownerToken := testutil.RegisterAndGetToken(t, ts.URL, "13800000011", testPassword)
+	attackerToken := testutil.RegisterAndGetToken(t, ts.URL, "13800000012", testPassword)
+	original := createPluginZip(t, "owned-plugin", "Original", "1.0.0")
+	submitPlugin(t, ts, ownerToken, original)
+
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/owned-plugin/approve", nil)
+	testutil.SetBearer(req, adminToken)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	replacement := createPluginZip(t, "owned-plugin", "Taken Over", "1.0.0")
+	resp = submitPluginResponse(t, ts, attackerToken, replacement)
+	testutil.RequireStatus(t, resp, http.StatusForbidden)
+	resp.Body.Close()
+
+	resp, err := http.Get(ts.URL + "/market/plugins/owned-plugin/download")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	downloaded := testutil.ReadAll(t, resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(downloaded, original) {
+		t.Fatal("failed takeover replaced the owner's ZIP")
+	}
+}
+
+func TestSubmitRejectsOversizedUpload(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000013", testPassword)
+	resp := submitPluginResponse(t, ts, token, bytes.Repeat([]byte("x"), 16<<20))
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusRequestEntityTooLarge)
+}
+
+func TestSubmitRejectsOversizedManifest(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	buf := &bytes.Buffer{}
+	zw := zip.NewWriter(buf)
+	f, err := zw.Create("plugin.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, `{"id":"large-manifest","name":"Large","version":"1.0.0","description":"`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(bytes.Repeat([]byte("a"), 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, `"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000014", testPassword)
+	resp := submitPluginResponse(t, ts, token, buf.Bytes())
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusBadRequest)
+}
+
+func TestFailedSubmissionDoesNotOverwriteExistingZip(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000015", testPassword)
+	original := createPluginZip(t, "preserve-plugin", "Preserve", "1.0.0")
+	submitPlugin(t, ts, token, original)
+
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/preserve-plugin/approve", nil)
+	testutil.SetBearer(req, adminToken)
+	resp := testutil.Do(t, req)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	buf := &bytes.Buffer{}
+	zw := zip.NewWriter(buf)
+	f, err := zw.Create("plugin.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, `{"id":"preserve-plugin","name":"Replacement","version":"1.0.0","description":"`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.Write(bytes.Repeat([]byte("a"), 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.WriteString(f, `"}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	resp = submitPluginResponse(t, ts, token, buf.Bytes())
+	testutil.RequireStatus(t, resp, http.StatusBadRequest)
+	resp.Body.Close()
+
+	resp, err = http.Get(ts.URL + "/market/plugins/preserve-plugin/download")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	downloaded := testutil.ReadAll(t, resp.Body)
+	resp.Body.Close()
+	if !bytes.Equal(downloaded, original) {
+		t.Fatal("failed submission replaced the existing ZIP")
 	}
 }
 

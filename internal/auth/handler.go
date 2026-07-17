@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -74,10 +75,14 @@ func (h *Handler) Register(c *gin.Context) {
 		return
 	}
 
-	user, pair, err := h.svc.Register(req.Phone, req.Password, req.DisplayName)
+	user, pair, err := h.svc.Register(c.Request.Context(), req.Phone, req.Password, req.DisplayName)
 	if err != nil {
 		if err == ErrPhoneTaken {
 			c.JSON(http.StatusConflict, gin.H{"error": "phone already registered"})
+			return
+		}
+		if errors.Is(err, database.ErrSnowflakeUnavailable) {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "service temporarily unavailable"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
@@ -201,9 +206,33 @@ func (h *Handler) Refresh(c *gin.Context) {
 	})
 }
 
+// Revoke handles POST /auth/revoke using a refresh token without requiring a
+// still-valid access token.
+func (h *Handler) Revoke(c *gin.Context) {
+	var req refreshRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := h.svc.RevokeRefreshToken(req.RefreshToken); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
 // Logout handles POST /auth/logout.
 func (h *Handler) Logout(c *gin.Context) {
+	if err := h.svc.RevokeSession(c.GetString("sessionID"), c.GetString("userID")); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return
+	}
 	c.Status(http.StatusNoContent)
+}
+
+// Service returns the auth service used by middleware mounted with this handler.
+func (h *Handler) Service() *Service {
+	return h.svc
 }
 
 // Me handles GET /auth/me. Requires authentication.

@@ -1,8 +1,11 @@
 package auth
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	"github.com/lynai/backend/internal/database"
 	"golang.org/x/crypto/bcrypt"
@@ -45,8 +48,8 @@ func NewService(db *gorm.DB, jwt *JWTManager, snowflake *database.SnowflakeGener
 // Register creates a new user with the given phone number and password, then returns a
 // session with both tokens. If the phone is already registered, returns
 // ErrPhoneTaken — the caller should use Login instead.
-func (s *Service) Register(phone, password, displayName string) (*database.User, TokenPair, error) {
-	user, err := s.createUser(phone, password, displayName, false)
+func (s *Service) Register(ctx context.Context, phone, password, displayName string) (*database.User, TokenPair, error) {
+	user, err := s.createUser(ctx, phone, password, displayName, false)
 	if err != nil {
 		return nil, TokenPair{}, err
 	}
@@ -59,11 +62,11 @@ func (s *Service) Register(phone, password, displayName string) (*database.User,
 }
 
 // CreateAdmin creates a new administrator account.
-func (s *Service) CreateAdmin(phone, password, displayName string) (*database.User, error) {
-	return s.createUser(phone, password, displayName, true)
+func (s *Service) CreateAdmin(ctx context.Context, phone, password, displayName string) (*database.User, error) {
+	return s.createUser(ctx, phone, password, displayName, true)
 }
 
-func (s *Service) createUser(phone, password, displayName string, isAdmin bool) (*database.User, error) {
+func (s *Service) createUser(ctx context.Context, phone, password, displayName string, isAdmin bool) (*database.User, error) {
 	var existing int64
 	s.db.Model(&database.User{}).Where("phone = ?", phone).Count(&existing)
 	if existing > 0 {
@@ -80,8 +83,12 @@ func (s *Service) createUser(phone, password, displayName string, isAdmin bool) 
 		name = defaultDisplayName(phone)
 	}
 
+	id, err := s.snowflake.NextID(ctx)
+	if err != nil {
+		return nil, err
+	}
 	user := database.User{
-		ID:           s.snowflake.NextID(),
+		ID:           id,
 		Phone:        phone,
 		PasswordHash: passwordHash,
 		DisplayName:  name,
@@ -127,22 +134,30 @@ func (s *Service) SetAdminRole(userID string, isAdmin bool) error {
 
 // Login verifies a phone/password pair and returns a session with both tokens.
 func (s *Service) Login(phone, password string) (*database.User, TokenPair, error) {
-	var user database.User
-	if err := s.db.Where("phone = ?", phone).First(&user).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, TokenPair{}, ErrInvalidCredentials
-		}
-		return nil, TokenPair{}, fmt.Errorf("find user: %w", err)
-	}
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		return nil, TokenPair{}, ErrInvalidCredentials
-	}
-
-	pair, err := s.generateTokenPair(&user)
+	user, err := s.AuthenticatePassword(phone, password)
 	if err != nil {
 		return nil, TokenPair{}, err
 	}
-	return &user, pair, nil
+	pair, err := s.generateTokenPair(user)
+	if err != nil {
+		return nil, TokenPair{}, err
+	}
+	return user, pair, nil
+}
+
+// AuthenticatePassword verifies credentials without creating an App session.
+func (s *Service) AuthenticatePassword(phone, password string) (*database.User, error) {
+	var user database.User
+	if err := s.db.Where("phone = ?", phone).First(&user).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrInvalidCredentials
+		}
+		return nil, fmt.Errorf("find user: %w", err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
+		return nil, ErrInvalidCredentials
+	}
+	return &user, nil
 }
 
 // Refresh validates a refresh token and issues a new token pair (rotation).
@@ -151,7 +166,7 @@ func (s *Service) Refresh(refreshToken string) (*database.User, TokenPair, error
 	if err != nil {
 		return nil, TokenPair{}, ErrInvalidRefreshToken
 	}
-	if claims.TokenType != TokenTypeRefresh {
+	if claims.TokenType != TokenTypeRefresh || claims.SessionID == "" || claims.ID == "" {
 		return nil, TokenPair{}, ErrInvalidRefreshToken
 	}
 
@@ -160,11 +175,101 @@ func (s *Service) Refresh(refreshToken string) (*database.User, TokenPair, error
 		return nil, TokenPair{}, ErrInvalidRefreshToken
 	}
 
-	pair, err := s.generateTokenPair(user)
+	pair, newRefreshJTI, err := s.generateTokenPairForSession(user, claims.SessionID)
 	if err != nil {
 		return nil, TokenPair{}, err
 	}
+
+	now := time.Now()
+	result := s.db.Model(&database.UserSession{}).
+		Where("id = ? AND user_id = ? AND refresh_jti = ? AND revoked_at IS NULL AND expires_at > ?", claims.SessionID, user.ID, claims.ID, now).
+		Updates(map[string]interface{}{"refresh_jti": newRefreshJTI, "expires_at": time.UnixMilli(pair.RefreshExpiresAt)})
+	if result.Error != nil {
+		return nil, TokenPair{}, fmt.Errorf("rotate refresh token: %w", result.Error)
+	}
+	if result.RowsAffected == 0 {
+		return nil, TokenPair{}, ErrInvalidRefreshToken
+	}
 	return user, pair, nil
+}
+
+// AuthenticateAccess validates an access token against its live session and
+// returns the current user record, including the current administrator role.
+func (s *Service) AuthenticateAccess(token string) (*database.User, *Claims, error) {
+	claims, err := s.jwt.Verify(token)
+	if err != nil || claims.TokenType != TokenTypeAccess || claims.SessionID == "" || claims.ID == "" {
+		return nil, nil, errors.New("invalid access token")
+	}
+	user, err := s.validateSession(claims, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	return user, claims, nil
+}
+
+// AuthenticateRefresh validates that a refresh token is the current token for
+// a live session and returns the user's current database role.
+func (s *Service) AuthenticateRefresh(token string) (*database.User, *Claims, error) {
+	claims, err := s.jwt.Verify(token)
+	if err != nil || claims.TokenType != TokenTypeRefresh || claims.SessionID == "" || claims.ID == "" {
+		return nil, nil, ErrInvalidRefreshToken
+	}
+	user, err := s.validateSession(claims, true)
+	if err != nil {
+		return nil, nil, ErrInvalidRefreshToken
+	}
+	return user, claims, nil
+}
+
+func (s *Service) validateSession(claims *Claims, checkRefreshJTI bool) (*database.User, error) {
+	userID, err := strconv.ParseInt(claims.UserID, 10, 64)
+	if err != nil {
+		return nil, err
+	}
+	query := s.db.Where("id = ? AND user_id = ? AND revoked_at IS NULL AND expires_at > ?", claims.SessionID, userID, time.Now())
+	if checkRefreshJTI {
+		query = query.Where("refresh_jti = ?", claims.ID)
+	}
+	var session database.UserSession
+	if err := query.First(&session).Error; err != nil {
+		return nil, err
+	}
+	return s.GetUserByID(claims.UserID)
+}
+
+// RevokeSession invalidates all access and refresh tokens in one login session.
+func (s *Service) RevokeSession(sessionID, userID string) error {
+	if sessionID == "" || userID == "" {
+		return nil
+	}
+	return s.db.Model(&database.UserSession{}).
+		Where("id = ? AND user_id = ? AND revoked_at IS NULL", sessionID, userID).
+		Update("revoked_at", time.Now()).Error
+}
+
+// RevokeToken invalidates the session identified by a signed session token.
+func (s *Service) RevokeToken(token string) error {
+	claims, err := s.jwt.Verify(token)
+	if err != nil || claims.SessionID == "" {
+		return nil
+	}
+	return s.RevokeSession(claims.SessionID, claims.UserID)
+}
+
+// RevokeRefreshToken idempotently revokes the session family named by a signed
+// refresh token. Rotation changes the current JTI, not the session identity.
+// Invalid, expired, and already-revoked tokens are successful no-ops.
+func (s *Service) RevokeRefreshToken(token string) error {
+	claims, err := s.jwt.Verify(token)
+	if err != nil || claims.TokenType != TokenTypeRefresh || claims.SessionID == "" || claims.UserID == "" || claims.ID == "" {
+		return nil
+	}
+	return s.RevokeSession(claims.SessionID, claims.UserID)
+}
+
+// DeleteExpiredSessions removes expired or previously revoked login sessions.
+func (s *Service) DeleteExpiredSessions(now time.Time) error {
+	return s.db.Where("expires_at <= ? OR revoked_at IS NOT NULL", now).Delete(&database.UserSession{}).Error
 }
 
 // GetUserByID fetches a user by primary key.
@@ -198,24 +303,46 @@ func HashPassword(password string) (string, error) {
 }
 
 func (s *Service) generateTokenPair(user *database.User) (TokenPair, error) {
-	access, accessExp, err := s.jwt.GenerateAccessToken(
-		fmt.Sprintf("%d", user.ID), user.DisplayName, user.IsAdmin,
-	)
+	sessionID, err := randomID()
 	if err != nil {
-		return TokenPair{}, fmt.Errorf("generate access token: %w", err)
+		return TokenPair{}, fmt.Errorf("generate session ID: %w", err)
 	}
-	refresh, refreshExp, err := s.jwt.GenerateRefreshToken(
-		fmt.Sprintf("%d", user.ID), user.DisplayName, user.IsAdmin,
-	)
+	pair, refreshJTI, err := s.generateTokenPairForSession(user, sessionID)
 	if err != nil {
-		return TokenPair{}, fmt.Errorf("generate refresh token: %w", err)
+		return TokenPair{}, err
+	}
+	session := database.UserSession{
+		ID:         sessionID,
+		UserID:     user.ID,
+		RefreshJTI: refreshJTI,
+		ExpiresAt:  time.UnixMilli(pair.RefreshExpiresAt),
+	}
+	if err := s.db.Create(&session).Error; err != nil {
+		return TokenPair{}, fmt.Errorf("create session: %w", err)
+	}
+	return pair, nil
+}
+
+func (s *Service) generateTokenPairForSession(user *database.User, sessionID string) (TokenPair, string, error) {
+	userID := strconv.FormatInt(user.ID, 10)
+	access, accessExp, err := s.jwt.generate(userID, user.DisplayName, user.IsAdmin, sessionID, TokenTypeAccess, AccessTokenExpiry)
+	if err != nil {
+		return TokenPair{}, "", fmt.Errorf("generate access token: %w", err)
+	}
+	refresh, refreshExp, err := s.jwt.generate(userID, user.DisplayName, user.IsAdmin, sessionID, TokenTypeRefresh, RefreshTokenExpiry)
+	if err != nil {
+		return TokenPair{}, "", fmt.Errorf("generate refresh token: %w", err)
+	}
+	claims, err := s.jwt.Verify(refresh)
+	if err != nil {
+		return TokenPair{}, "", fmt.Errorf("read refresh token: %w", err)
 	}
 	return TokenPair{
 		AccessToken:      access,
 		AccessExpiresAt:  accessExp,
 		RefreshToken:     refresh,
 		RefreshExpiresAt: refreshExp,
-	}, nil
+	}, claims.ID, nil
 }
 
 // defaultDisplayName generates a display name from the phone number.

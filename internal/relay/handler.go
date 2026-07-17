@@ -2,6 +2,8 @@ package relay
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,21 +13,24 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/database"
 )
 
-const maxRelayBodyBytes = 8 << 20
+const (
+	maxRelayBodyBytes             = 8 << 20
+	maxRelayUpstreamResponseBytes = 16 << 20
+)
+
+var errUpstreamResponseTooLarge = errors.New("upstream response is too large")
 
 // Handler serves authenticated relay endpoints.
 type Handler struct {
-	svc      *Service
-	logs     *LogService
-	speechMu sync.Mutex
-	speech   map[string]*speechSession
+	svc    *Service
+	logs   *LogService
+	speech *speechSessionStore
 }
 
 type countingReadCloser struct {
@@ -68,7 +73,7 @@ func (h *Handler) Messages(c *gin.Context) {
 	}
 	resp, err := h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, forwardBody)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
@@ -105,7 +110,7 @@ func (h *Handler) OllamaChat(c *gin.Context) {
 	}
 	resp, err := h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, forwardBody)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
@@ -115,7 +120,27 @@ func (h *Handler) OllamaChat(c *gin.Context) {
 
 // NewHandler creates a relay handler.
 func NewHandler(svc *Service) *Handler {
-	return &Handler{svc: svc, logs: NewLogService(svc.db), speech: map[string]*speechSession{}}
+	return NewHandlerWithConfig(svc, 2*time.Hour, 5, 500, 2*time.Minute, 45*time.Second, 30*time.Minute)
+}
+
+// NewHandlerWithConfig creates a relay handler with shared speech sessions and timeouts.
+func NewHandlerWithConfig(svc *Service, speechTTL time.Duration, perUserCapacity, globalCapacity int, nonStreamTimeout, streamIdleTimeout, streamMaxDuration time.Duration) *Handler {
+	svc.setTimeouts(nonStreamTimeout, streamIdleTimeout, streamMaxDuration)
+	return &Handler{
+		svc:    svc,
+		logs:   NewLogService(svc.db),
+		speech: newSpeechSessionStore(svc.db, speechTTL, perUserCapacity, globalCapacity),
+	}
+}
+
+// Close stops the handler's background speech-session cleanup.
+func (h *Handler) Close() {
+	h.logs.Close()
+}
+
+// DeleteExpiredSessions removes expired shared speech sessions.
+func (h *Handler) DeleteExpiredSessions(now time.Time) error {
+	return h.speech.deleteExpired(now)
 }
 
 // LoggingMiddleware records privacy-safe metadata for relay operations.
@@ -213,15 +238,6 @@ func maxInt64(value, minimum int64) int64 {
 	return value
 }
 
-type speechSession struct {
-	Provider        database.RelayProvider
-	Model           database.RelayModel
-	AppID           string
-	UpstreamAudioID string
-	TaskID          string
-	CreatedAt       time.Time
-}
-
 // Chat forwards an OpenAI-compatible chat request to an admin-managed upstream.
 func (h *Handler) Chat(c *gin.Context) {
 	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, maxRelayBodyBytes))
@@ -259,15 +275,15 @@ func (h *Handler) Chat(c *gin.Context) {
 
 	resp, err := h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, forwardBody)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 
-	copyResponseHeaders(c, resp.Header)
-	c.Status(resp.StatusCode)
 	if stream || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		copyResponseHeaders(c, resp.Header)
+		c.Status(resp.StatusCode)
 		c.Header("Content-Type", "text/event-stream")
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
@@ -275,7 +291,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		streamCopy(c, resp.Body)
 		return
 	}
-	_, _ = io.Copy(c.Writer, resp.Body)
+	writeBoundedUpstreamResponse(c, resp)
 }
 
 // ChatV2 exposes one managed chat endpoint regardless of the upstream API
@@ -321,7 +337,7 @@ func (h *Handler) ChatV2(c *gin.Context) {
 		return
 	}
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
@@ -331,7 +347,7 @@ func (h *Handler) ChatV2(c *gin.Context) {
 
 // Transcribe forwards an OpenAI-compatible audio transcription request.
 func (h *Handler) Transcribe(c *gin.Context) {
-	if err := c.Request.ParseMultipartForm(maxRelayBodyBytes); err != nil {
+	if err := parseRelayMultipart(c); err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
 		return
 	}
@@ -366,19 +382,17 @@ func (h *Handler) Transcribe(c *gin.Context) {
 	}
 	resp, err := h.svc.ForwardMultipart(c.Request.Context(), &resolved.Provider, "/audio/transcriptions", body, contentType)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
-	copyResponseHeaders(c, resp.Header)
-	c.Status(resp.StatusCode)
-	_, _ = io.Copy(c.Writer, resp.Body)
+	writeBoundedUpstreamResponse(c, resp)
 }
 
 // OCR forwards an image OCR request to a managed OCR or vision-chat upstream.
 func (h *Handler) OCR(c *gin.Context) {
-	if err := c.Request.ParseMultipartForm(maxRelayBodyBytes); err != nil {
+	if err := parseRelayMultipart(c); err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
 		return
 	}
@@ -438,7 +452,25 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_lasr requires provider AppID")
 		return
 	}
-	sessionID := strconv.FormatInt(time.Now().UnixNano(), 10)
+	sessionID, err := newSpeechSessionID()
+	if err != nil {
+		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to create speech session")
+		return
+	}
+	if err := h.speech.reserve(sessionID, c.GetString("userID"), resolved, appID); err != nil {
+		if errors.Is(err, errSpeechCapacity) {
+			writeOpenAIError(c, http.StatusTooManyRequests, "capacity_error", "speech session capacity reached")
+			return
+		}
+		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to reserve speech session")
+		return
+	}
+	reserved := true
+	defer func() {
+		if reserved {
+			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+		}
+	}()
 	query := vivoSpeechQuery(resolved.Provider, appID, resolved.Model.ModelID)
 	upstreamBody := map[string]interface{}{
 		"audio_type":  fmt.Sprint(body["audio_type"]),
@@ -451,12 +483,16 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 	}
 	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &resolved.Provider, "/lasr/create", query, raw)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	upstream, rawResp, err := decodeJSONResponse(resp)
+	if errors.Is(err, ErrUpstreamTimeout) {
+		writeForwardError(c, err)
+		return
+	}
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(rawResp))
 		return
@@ -466,18 +502,20 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "vivo_lasr create did not return audio_id")
 		return
 	}
-	h.speechMu.Lock()
-	h.speech[sessionID] = &speechSession{Provider: resolved.Provider, Model: resolved.Model, AppID: appID, UpstreamAudioID: upstreamAudioID, CreatedAt: time.Now()}
-	h.speechMu.Unlock()
+	if err := h.speech.completeReservation(sessionID, c.GetString("userID"), upstreamAudioID); err != nil {
+		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to save speech session")
+		return
+	}
+	reserved = false
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"audio_id": sessionID}})
 }
 
 func (h *Handler) SpeechUpload(c *gin.Context) {
-	session := h.loadSpeechSession(c)
-	if session == nil {
+	session, ok := h.loadSpeechSession(c)
+	if !ok {
 		return
 	}
-	if err := c.Request.ParseMultipartForm(maxRelayBodyBytes); err != nil {
+	if err := parseRelayMultipart(c); err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
 		return
 	}
@@ -492,7 +530,7 @@ func (h *Handler) SpeechUpload(c *gin.Context) {
 	query.Set("slice_index", c.DefaultQuery("slice_index", c.Request.FormValue("slice_index")))
 	resp, err := h.svc.ForwardVivoMultipart(c.Request.Context(), &session.Provider, "/lasr/upload", query, body, contentType)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
@@ -501,8 +539,8 @@ func (h *Handler) SpeechUpload(c *gin.Context) {
 }
 
 func (h *Handler) SpeechRun(c *gin.Context) {
-	session := h.loadSpeechSession(c)
-	if session == nil {
+	session, ok := h.loadSpeechSession(c)
+	if !ok {
 		return
 	}
 	raw, ok := marshalRelayJSON(c, gin.H{"audio_id": session.UpstreamAudioID, "x-sessionId": c.Param("audioId")})
@@ -511,17 +549,23 @@ func (h *Handler) SpeechRun(c *gin.Context) {
 	}
 	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, "/lasr/run", vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID), raw)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, rawResp, err := decodeJSONResponse(resp)
+	if errors.Is(err, ErrUpstreamTimeout) {
+		writeForwardError(c, err)
+		return
+	}
+	if errors.Is(err, errUpstreamResponseTooLarge) {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "upstream response is too large")
+		return
+	}
 	if err == nil {
 		if taskID, _ := nestedString(payload, "data", "task_id"); taskID != "" {
-			h.speechMu.Lock()
-			session.TaskID = taskID
-			h.speechMu.Unlock()
+			h.speech.setTaskID(c.Param("audioId"), c.GetString("userID"), taskID)
 		}
 	}
 	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), rawResp)
@@ -569,7 +613,7 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 		resp, err = h.svc.ForwardJSON(c.Request.Context(), &resolved.Provider, "/images/generations", forwardBody)
 	}
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
@@ -578,9 +622,7 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 		h.writeVivoImageResponse(c, resp)
 		return
 	}
-	copyResponseHeaders(c, resp.Header)
-	c.Status(resp.StatusCode)
-	_, _ = io.Copy(c.Writer, resp.Body)
+	writeBoundedUpstreamResponse(c, resp)
 }
 
 // Models returns enabled relay models in an OpenAI-compatible list with LynAI metadata.
@@ -616,9 +658,13 @@ func (h *Handler) Models(c *gin.Context) {
 }
 
 func (h *Handler) writeVivoImageResponse(c *gin.Context, resp *http.Response) {
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readBoundedUpstreamBody(resp.Body)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to read upstream response")
+		if errors.Is(err, ErrUpstreamTimeout) {
+			writeForwardError(c, err)
+			return
+		}
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "upstream response is too large or unreadable")
 		return
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
@@ -655,16 +701,16 @@ func (h *Handler) writeVivoImageResponse(c *gin.Context, resp *http.Response) {
 }
 
 func writeUpstreamResponse(c *gin.Context, resp *http.Response, stream bool) {
-	copyResponseHeaders(c, resp.Header)
-	c.Status(resp.StatusCode)
 	if stream || strings.Contains(resp.Header.Get("Content-Type"), "text/event-stream") {
+		copyResponseHeaders(c, resp.Header)
+		c.Status(resp.StatusCode)
 		c.Header("Cache-Control", "no-cache")
 		c.Header("Connection", "keep-alive")
 		c.Header("X-Accel-Buffering", "no")
 		streamCopy(c, resp.Body)
 		return
 	}
-	_, _ = io.Copy(c.Writer, resp.Body)
+	writeBoundedUpstreamResponse(c, resp)
 }
 
 // Config returns the full enabled relay configuration for managed frontend providers.
@@ -768,12 +814,16 @@ func (h *Handler) forwardVivoOCR(c *gin.Context, resolved *ResolvedModel, image 
 	form.Set("businessid", defaultProviderValue(config.BusinessIDPrefix, "aigc")+appID)
 	resp, err := h.svc.ForwardVivoForm(c.Request.Context(), &resolved.Provider, "", query, form)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, raw, err := decodeJSONResponse(resp)
+	if errors.Is(err, ErrUpstreamTimeout) {
+		writeForwardError(c, err)
+		return
+	}
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(raw))
 		return
@@ -811,12 +861,16 @@ func (h *Handler) forwardVisionOCR(c *gin.Context, resolved *ResolvedModel, imag
 		resp, err = h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, body)
 	}
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, raw, err := decodeJSONResponse(resp)
+	if errors.Is(err, ErrUpstreamTimeout) {
+		writeForwardError(c, err)
+		return
+	}
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(raw))
 		return
@@ -824,21 +878,19 @@ func (h *Handler) forwardVisionOCR(c *gin.Context, resolved *ResolvedModel, imag
 	c.JSON(http.StatusOK, gin.H{"text": extractChatText(apiType, payload), "raw": payload})
 }
 
-func (h *Handler) loadSpeechSession(c *gin.Context) *speechSession {
-	h.speechMu.Lock()
-	defer h.speechMu.Unlock()
-	session := h.speech[c.Param("audioId")]
-	if session == nil {
+func (h *Handler) loadSpeechSession(c *gin.Context) (speechSession, bool) {
+	session, ok := h.speech.get(c.Param("audioId"), c.GetString("userID"))
+	if !ok {
 		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "speech session not found")
-		return nil
+		return speechSession{}, false
 	}
 	h.setLogModel(c, &ResolvedModel{Provider: session.Provider, Model: session.Model})
-	return session
+	return session, true
 }
 
 func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize bool) {
-	session := h.loadSpeechSession(c)
-	if session == nil {
+	session, ok := h.loadSpeechSession(c)
+	if !ok {
 		return
 	}
 	if session.TaskID == "" {
@@ -851,15 +903,26 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 	}
 	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, path, vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID), raw)
 	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
+		writeForwardError(c, err)
 		return
 	}
 	setUpstreamStatus(c, resp.StatusCode)
 	defer resp.Body.Close()
 	payload, rawResp, err := decodeJSONResponse(resp)
+	if errors.Is(err, ErrUpstreamTimeout) {
+		writeForwardError(c, err)
+		return
+	}
+	if errors.Is(err, errUpstreamResponseTooLarge) {
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "upstream response is too large")
+		return
+	}
 	if err != nil || !normalize {
 		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), rawResp)
 		return
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && validVivoSpeechResult(payload) {
+		h.speech.delete(c.Param("audioId"), c.GetString("userID"))
 	}
 	c.JSON(resp.StatusCode, gin.H{"text": extractVivoSpeechText(payload), "raw": payload})
 }
@@ -900,13 +963,54 @@ func defaultProviderValue(value, fallback string) string {
 }
 
 func decodeJSONResponse(resp *http.Response) (map[string]interface{}, []byte, error) {
-	raw, err := io.ReadAll(resp.Body)
+	raw, err := readBoundedUpstreamBody(resp.Body)
 	if err != nil {
 		return nil, raw, err
 	}
 	var payload map[string]interface{}
 	err = json.Unmarshal(raw, &payload)
 	return payload, raw, err
+}
+
+func parseRelayMultipart(c *gin.Context) error {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxRelayBodyBytes)
+	return c.Request.ParseMultipartForm(maxRelayBodyBytes)
+}
+
+func readBoundedUpstreamBody(body io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(body, maxRelayUpstreamResponseBytes+1))
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) || isNetTimeout(err) {
+			return raw, ErrUpstreamTimeout
+		}
+		return raw, err
+	}
+	if len(raw) > maxRelayUpstreamResponseBytes {
+		return nil, errUpstreamResponseTooLarge
+	}
+	return raw, nil
+}
+
+func writeBoundedUpstreamResponse(c *gin.Context, resp *http.Response) {
+	raw, err := readBoundedUpstreamBody(resp.Body)
+	if err != nil {
+		if errors.Is(err, ErrUpstreamTimeout) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			writeOpenAIError(c, http.StatusGatewayTimeout, "upstream_timeout", "upstream provider timed out")
+			return
+		}
+		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "upstream response is too large or unreadable")
+		return
+	}
+	copyResponseHeaders(c, resp.Header)
+	c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), raw)
+}
+
+func newSpeechSessionID() (string, error) {
+	raw := make([]byte, 24)
+	if _, err := rand.Read(raw); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
 func nestedString(payload map[string]interface{}, path ...string) (string, bool) {
@@ -994,6 +1098,30 @@ func extractVivoSpeechText(payload map[string]interface{}) string {
 	return strings.Join(parts, "")
 }
 
+func validVivoSpeechResult(payload map[string]interface{}) bool {
+	if code, ok := payload["code"].(float64); ok && code != 0 {
+		return false
+	}
+	data, ok := payload["data"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	result, ok := data["result"].([]interface{})
+	if !ok {
+		return false
+	}
+	for _, raw := range result {
+		item, ok := raw.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if _, ok := item["onebest"].(string); !ok {
+			return false
+		}
+	}
+	return true
+}
+
 func prepareForwardBody(raw []byte) ([]byte, string, string, string, bool, error) {
 	forwardBody, model, providerID, stream, apiType, err := prepareRoutedBodyWithAPIType(raw)
 	return forwardBody, apiType, model, providerID, stream, err
@@ -1052,6 +1180,14 @@ func relayProviderIDFromForm(request *http.Request) string {
 func writeOpenAIError(c *gin.Context, status int, typ, message string) {
 	c.Set("relayErrorType", typ)
 	c.JSON(status, gin.H{"error": gin.H{"message": message, "type": typ}})
+}
+
+func writeForwardError(c *gin.Context, err error) {
+	if errors.Is(err, ErrUpstreamTimeout) {
+		writeOpenAIError(c, http.StatusGatewayTimeout, "upstream_timeout", "upstream provider timed out")
+		return
+	}
+	writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "failed to reach upstream provider")
 }
 
 func (h *Handler) writeResolveError(c *gin.Context, err error) {
@@ -1149,6 +1285,9 @@ func streamCopy(c *gin.Context, r io.Reader) {
 			}
 		}
 		if err != nil {
+			if errors.Is(err, ErrUpstreamTimeout) {
+				c.Set("relayErrorType", "upstream_timeout")
+			}
 			return
 		}
 	}

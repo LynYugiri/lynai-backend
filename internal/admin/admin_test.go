@@ -49,6 +49,55 @@ func TestAdminPanelLoginUsersAndCSRF(t *testing.T) {
 	}
 }
 
+func TestAdminRoleDemotionTakesEffectImmediately(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+
+	owner := adminClient(t)
+	loginAdmin(t, owner, ts.URL, adminPhone, adminPassword)
+	usersBody := getAdminPage(t, owner, ts.URL+"/admin/users")
+	csrf := extractCSRF(t, usersBody)
+	postFormFollow(t, owner, ts.URL+"/admin/users/create", url.Values{
+		"_csrf": {csrf}, "phone": {"13900000002"}, "password": {userPassword}, "displayName": {"Demoted Admin"},
+	})
+
+	login := doAdminAuthRequest(t, ts.URL, "13900000002", userPassword)
+	userID := login["user"].(map[string]interface{})["id"].(string)
+	accessToken := login["token"].(map[string]interface{})["accessToken"].(string)
+	demoted := adminClient(t)
+	loginAdmin(t, demoted, ts.URL, "13900000002", userPassword)
+	getAdminPage(t, demoted, ts.URL+"/admin/")
+
+	usersBody = getAdminPage(t, owner, ts.URL+"/admin/users")
+	csrf = extractCSRF(t, usersBody)
+	postFormFollow(t, owner, ts.URL+"/admin/users/"+userID+"/demote", url.Values{"_csrf": {csrf}})
+
+	resp, err := demoted.Get(ts.URL + "/admin/")
+	if err != nil {
+		t.Fatalf("get admin after demotion: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.Request.URL.Path != "/admin/login" {
+		t.Fatalf("demoted admin final path = %s, want /admin/login", resp.Request.URL.Path)
+	}
+
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/market/plugins/pending", nil)
+	testutil.SetBearer(req, accessToken)
+	apiResp := testutil.Do(t, req)
+	defer apiResp.Body.Close()
+	testutil.RequireStatus(t, apiResp, http.StatusForbidden)
+}
+
+func doAdminAuthRequest(t *testing.T, baseURL, phone, password string) map[string]interface{} {
+	t.Helper()
+	resp := testutil.PostJSON(t, baseURL+"/auth/login", map[string]string{"phone": phone, "password": password})
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	var result map[string]interface{}
+	testutil.DecodeJSON(t, resp, &result)
+	return result
+}
+
 func TestAdminPanelPluginManage(t *testing.T) {
 	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
 	defer cleanup()
@@ -273,6 +322,24 @@ func TestAdminPanelRelayAllowsOllamaWithoutAPIKey(t *testing.T) {
 	body = getAdminPage(t, client, ts.URL+"/admin/relay")
 	if !strings.Contains(body, "Local Ollama") {
 		t.Fatalf("ollama provider was not created: %s", body)
+	}
+}
+
+func TestAdminPanelRelayRejectsPublicHTTP(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+	client := adminClient(t)
+	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
+	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
+	csrf := extractCSRF(t, body)
+	resp := postForm(t, client, ts.URL+"/admin/relay/new", url.Values{
+		"_csrf": {csrf}, "name": {"Unsafe"}, "endpoint": {"http://api.example.com/v1"}, "apiFormat": {"openai"},
+		"apiKey": {"key"}, "modelId": {"gpt"}, "category": {"chat"}, "modelEnabled_0": {"on"},
+	})
+	raw := string(testutil.ReadAll(t, resp.Body))
+	resp.Body.Close()
+	if !strings.Contains(raw, "Endpoint 不安全") || !strings.Contains(raw, "HTTPS") {
+		t.Fatalf("missing endpoint policy error: %s", raw)
 	}
 }
 

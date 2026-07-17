@@ -4,6 +4,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/admin"
 	"github.com/lynai/backend/internal/auth"
+	"github.com/lynai/backend/internal/device"
 	"github.com/lynai/backend/internal/market"
 	"github.com/lynai/backend/internal/relay"
 	"github.com/lynai/backend/internal/sync"
@@ -13,6 +14,7 @@ import (
 func Setup(
 	authHandler *auth.Handler,
 	jwtMgr *auth.JWTManager,
+	deviceHandler *device.Handler,
 	marketHandler *market.Handler,
 	syncHandler *sync.Handler,
 	relayHandler *relay.Handler,
@@ -25,8 +27,8 @@ func Setup(
 	// CORS
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
-		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-LynAI-Protocol, X-LynAI-Device-ID, X-LynAI-Timestamp, X-LynAI-Request-ID, X-LynAI-Body-SHA256, X-LynAI-Signature")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
@@ -47,8 +49,22 @@ func Setup(
 		authGrp.POST("/send-otp", authHandler.SendOTP)
 		authGrp.POST("/verify-otp", authHandler.VerifyOTP)
 		authGrp.POST("/refresh", authHandler.Refresh)
-		authGrp.POST("/logout", auth.AuthMiddleware(jwtMgr), authHandler.Logout)
-		authGrp.GET("/me", auth.AuthMiddleware(jwtMgr), authHandler.Me)
+		authGrp.POST("/revoke", authHandler.Revoke)
+		authGrp.POST("/logout", auth.AuthMiddleware(jwtMgr, authHandler.Service()), authHandler.Logout)
+		authGrp.GET("/me", auth.AuthMiddleware(jwtMgr, authHandler.Service()), authHandler.Me)
+	}
+
+	if deviceHandler != nil {
+		deviceGrp := r.Group("/devices")
+		deviceGrp.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()))
+		{
+			deviceGrp.POST("/challenge", deviceHandler.Challenge)
+			deviceGrp.POST("/enroll", deviceHandler.Enroll)
+			deviceGrp.GET("", deviceHandler.List)
+			deviceGrp.GET("/current", deviceHandler.Current)
+			deviceGrp.PATCH("/:id", deviceHandler.Rename)
+			deviceGrp.DELETE("/:id", deviceHandler.Revoke)
+		}
 	}
 
 	// --- Market API (public) ---
@@ -61,7 +77,7 @@ func Setup(
 
 	// --- Market API (authenticated) ---
 	marketAuth := r.Group("/market")
-	marketAuth.Use(auth.AuthMiddleware(jwtMgr))
+	marketAuth.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()))
 	{
 		marketAuth.POST("/plugins/submit", marketHandler.SubmitPlugin)
 		marketAuth.GET("/submissions/mine", marketHandler.MySubmissions)
@@ -70,7 +86,7 @@ func Setup(
 
 	// --- Market API (admin) ---
 	marketAdmin := r.Group("/market")
-	marketAdmin.Use(auth.AuthMiddleware(jwtMgr), auth.AdminMiddleware())
+	marketAdmin.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()), auth.AdminMiddleware())
 	{
 		marketAdmin.GET("/plugins/pending", marketHandler.ListPending)
 		marketAdmin.POST("/plugins/:id/approve", marketHandler.ApprovePlugin)
@@ -79,10 +95,11 @@ func Setup(
 
 	// --- Sync API (authenticated) ---
 	syncAuth := r.Group("/sync")
-	syncAuth.Use(auth.AuthMiddleware(jwtMgr))
+	syncAuth.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()))
 	{
 		syncAuth.GET("/status", syncHandler.Status)
 		syncAuth.POST("/changes", syncHandler.UploadChanges)
+		syncAuth.POST("/v1/changes", syncHandler.UploadChanges)
 		syncAuth.GET("/changes", syncHandler.GetChanges)
 		syncAuth.GET("/blobs", syncHandler.ListBlobs)
 		syncAuth.POST("/blobs/:sha256", syncHandler.UploadBlob)
@@ -92,7 +109,7 @@ func Setup(
 	// --- Relay API (authenticated) ---
 	if relayHandler != nil {
 		relayAuth := r.Group("/relay")
-		relayAuth.Use(auth.AuthMiddleware(jwtMgr), relayHandler.LoggingMiddleware())
+		relayAuth.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()), relayHandler.LoggingMiddleware())
 		{
 			relayAuth.GET("/v2/config", relayHandler.ConfigV2)
 			relayAuth.POST("/v2/chat", relayHandler.ChatV2)

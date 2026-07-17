@@ -83,13 +83,23 @@ type LogPage struct {
 }
 
 type LogService struct {
-	db    *gorm.DB
-	queue chan database.RelayRequestLog
-	once  sync.Once
+	db        *gorm.DB
+	queue     chan database.RelayRequestLog
+	startOnce sync.Once
+	closeOnce sync.Once
+	stop      chan struct{}
+	done      chan struct{}
+	mu        sync.RWMutex
+	closed    bool
 }
 
 func NewLogService(db *gorm.DB) *LogService {
-	return &LogService{db: db, queue: make(chan database.RelayRequestLog, 256)}
+	return &LogService{
+		db:    db,
+		queue: make(chan database.RelayRequestLog, 256),
+		stop:  make(chan struct{}),
+		done:  make(chan struct{}),
+	}
 }
 
 func (s *LogService) Record(entry database.RelayRequestLog) error {
@@ -99,7 +109,12 @@ func (s *LogService) Record(entry database.RelayRequestLog) error {
 // Enqueue records a relay call without blocking the response path. A full
 // queue drops the metadata entry rather than delaying the user's request.
 func (s *LogService) Enqueue(entry database.RelayRequestLog) bool {
-	s.once.Do(func() { go s.run() })
+	s.startOnce.Do(func() { go s.run() })
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return false
+	}
 	select {
 	case s.queue <- entry:
 		return true
@@ -108,13 +123,28 @@ func (s *LogService) Enqueue(entry database.RelayRequestLog) bool {
 	}
 }
 
+// Close stops the background log writer and cleanup worker.
+func (s *LogService) Close() {
+	s.closeOnce.Do(func() {
+		s.startOnce.Do(func() { close(s.done) })
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		close(s.stop)
+		<-s.done
+	})
+}
+
 func (s *LogService) DeleteExpired(now time.Time) error {
 	return s.db.Where("created_at < ?", now.Add(-LogRetention)).Delete(&database.RelayRequestLog{}).Error
 }
 
 func (s *LogService) run() {
 	cleanup := time.NewTicker(time.Hour)
-	defer cleanup.Stop()
+	defer func() {
+		cleanup.Stop()
+		close(s.done)
+	}()
 	for {
 		select {
 		case entry := <-s.queue:
@@ -124,6 +154,17 @@ func (s *LogService) run() {
 		case now := <-cleanup.C:
 			if err := s.DeleteExpired(now); err != nil {
 				log.Printf("relay log cleanup: %v", err)
+			}
+		case <-s.stop:
+			for {
+				select {
+				case entry := <-s.queue:
+					if err := s.Record(entry); err != nil {
+						log.Printf("relay log drain: %v", err)
+					}
+				default:
+					return
+				}
 			}
 		}
 	}

@@ -26,31 +26,47 @@ const CookieName = "lynai_admin_token"
 // CSRFCookieName is the HTTP-only cookie carrying the admin CSRF token.
 const CSRFCookieName = "lynai_admin_csrf"
 
-var csrfTokenMaxAge = int(auth.RefreshTokenExpiry.Seconds())
-
 // Handler serves the HTML admin panel.
 type Handler struct {
-	db        *gorm.DB
-	relayLogs *relay.LogService
-	authSvc   *auth.Service
-	marketSvc *market.Service
-	jwtMgr    *auth.JWTManager
-	templates *template.Template
+	db             *gorm.DB
+	relayLogs      *relay.LogService
+	authSvc        *auth.Service
+	marketSvc      *market.Service
+	templates      *template.Template
+	endpointPolicy *relay.EndpointPolicy
+	sessions       *sessionService
+	sessionTTL     time.Duration
 }
 
 // NewHandler creates an admin handler using templates embedded in the binary.
 func NewHandler(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, jwtMgr *auth.JWTManager) (*Handler, error) {
+	policy, err := relay.NewEndpointPolicy(nil)
+	if err != nil {
+		return nil, err
+	}
+	return NewHandlerWithConfig(db, authSvc, marketSvc, policy, auth.RefreshTokenExpiry)
+}
+
+// NewHandlerWithEndpointPolicy creates an admin handler using the relay endpoint policy.
+func NewHandlerWithEndpointPolicy(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, jwtMgr *auth.JWTManager, policy *relay.EndpointPolicy) (*Handler, error) {
+	return NewHandlerWithConfig(db, authSvc, marketSvc, policy, auth.RefreshTokenExpiry)
+}
+
+// NewHandlerWithConfig creates an admin handler with opaque server-side sessions.
+func NewHandlerWithConfig(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, policy *relay.EndpointPolicy, sessionTTL time.Duration) (*Handler, error) {
 	tmpl, err := parseAdminTemplates()
 	if err != nil {
 		return nil, err
 	}
 	return &Handler{
-		db:        db,
-		relayLogs: relay.NewLogService(db),
-		authSvc:   authSvc,
-		marketSvc: marketSvc,
-		jwtMgr:    jwtMgr,
-		templates: tmpl,
+		db:             db,
+		relayLogs:      relay.NewLogService(db),
+		authSvc:        authSvc,
+		marketSvc:      marketSvc,
+		templates:      tmpl,
+		endpointPolicy: policy,
+		sessions:       newSessionService(db, sessionTTL),
+		sessionTTL:     sessionTTL,
 	}, nil
 }
 
@@ -103,24 +119,16 @@ func (h *Handler) adminCookieMiddleware() gin.HandlerFunc {
 			c.Abort()
 			return
 		}
-		claims, err := h.jwtMgr.Verify(token)
-		if err != nil || !claims.IsAdmin {
+		user, renewed, err := h.sessions.authenticate(token)
+		if err != nil {
 			setAdminCookie(c, CookieName, "", -1)
 			setAdminCookie(c, CSRFCookieName, "", -1)
 			c.Redirect(http.StatusFound, "/admin/login")
 			c.Abort()
 			return
 		}
-		if claims.ExpiresAt != nil && time.Until(claims.ExpiresAt.Time) < 7*24*time.Hour {
-			_, pair, err := h.authSvc.Refresh(token)
-			if err != nil {
-				setAdminCookie(c, CookieName, "", -1)
-				setAdminCookie(c, CSRFCookieName, "", -1)
-				c.Redirect(http.StatusFound, "/admin/login")
-				c.Abort()
-				return
-			}
-			setAdminCookie(c, CookieName, pair.RefreshToken, int(auth.RefreshTokenExpiry.Seconds()))
+		if renewed {
+			setAdminCookie(c, CookieName, token, int(h.sessionTTL.Seconds()))
 		}
 		csrfToken := ""
 		if isSafeMethod(c.Request.Method) {
@@ -130,14 +138,14 @@ func (h *Handler) adminCookieMiddleware() gin.HandlerFunc {
 				c.Abort()
 				return
 			}
-			setAdminCookie(c, CSRFCookieName, csrfToken, csrfTokenMaxAge)
+			setAdminCookie(c, CSRFCookieName, csrfToken, int(h.sessionTTL.Seconds()))
 		} else if existing, err := c.Cookie(CSRFCookieName); err == nil {
 			csrfToken = existing
 		}
 		c.Set("csrfToken", csrfToken)
-		c.Set("userID", claims.UserID)
-		c.Set("username", claims.Username)
-		c.Set("isAdmin", claims.IsAdmin)
+		c.Set("userID", userIDString(user))
+		c.Set("username", user.DisplayName)
+		c.Set("isAdmin", user.IsAdmin)
 		c.Next()
 	}
 }
@@ -171,20 +179,40 @@ func (h *Handler) DoLogin(c *gin.Context) {
 	phone := strings.TrimSpace(c.PostForm("phone"))
 	password := c.PostForm("password")
 
-	user, pair, err := h.authSvc.Login(phone, password)
-	if err != nil || !user.IsAdmin {
+	user, err := h.authSvc.AuthenticatePassword(phone, password)
+	if err != nil {
 		h.render(c, "login.html", map[string]interface{}{"Error": "Invalid phone, password, or not an admin"})
 		return
 	}
-
-	setAdminCookie(c, CookieName, pair.RefreshToken, int(auth.RefreshTokenExpiry.Seconds()))
+	if !user.IsAdmin {
+		h.render(c, "login.html", map[string]interface{}{"Error": "Invalid phone, password, or not an admin"})
+		return
+	}
+	token, err := h.sessions.create(user.ID)
+	if err != nil {
+		h.render(c, "login.html", map[string]interface{}{"Error": "Failed to create admin session"})
+		return
+	}
+	setAdminCookie(c, CookieName, token, int(h.sessionTTL.Seconds()))
 	c.Redirect(http.StatusFound, "/admin")
 }
 
 func (h *Handler) DoLogout(c *gin.Context) {
+	token, _ := c.Cookie(CookieName)
+	_ = h.sessions.revoke(token)
 	setAdminCookie(c, CookieName, "", -1)
 	setAdminCookie(c, CSRFCookieName, "", -1)
 	c.Redirect(http.StatusFound, "/admin/login")
+}
+
+// Close stops resources owned by the admin handler.
+func (h *Handler) Close() {
+	h.relayLogs.Close()
+}
+
+// DeleteExpiredSessions removes expired administrator browser sessions.
+func (h *Handler) DeleteExpiredSessions(now time.Time) error {
+	return h.sessions.deleteExpired(now)
 }
 
 // --- Dashboard ---
@@ -274,9 +302,13 @@ func (h *Handler) CreateAdminUser(c *gin.Context) {
 		h.redirectUsersWithError(c, "手机号和至少 6 位密码必填")
 		return
 	}
-	if _, err := h.authSvc.CreateAdmin(phone, password, displayName); err != nil {
+	if _, err := h.authSvc.CreateAdmin(c.Request.Context(), phone, password, displayName); err != nil {
 		if errors.Is(err, auth.ErrPhoneTaken) {
 			h.redirectUsersWithError(c, "手机号已注册")
+			return
+		}
+		if errors.Is(err, database.ErrSnowflakeUnavailable) {
+			c.String(http.StatusServiceUnavailable, "Service temporarily unavailable")
 			return
 		}
 		h.redirectUsersWithError(c, "创建管理员失败")
@@ -431,7 +463,7 @@ func (h *Handler) CreateRelayProvider(c *gin.Context) {
 		return
 	}
 	config := parseRelayProviderConfig(c)
-	if err := validateRelayProviderForm(apiFormat, strings.TrimSpace(c.PostForm("endpoint")), strings.TrimSpace(c.PostForm("apiKey")), config, models); err != nil {
+	if err := h.validateRelayProviderForm(apiFormat, strings.TrimSpace(c.PostForm("endpoint")), strings.TrimSpace(c.PostForm("apiKey")), config, models); err != nil {
 		h.redirectRelayNewWithError(c, err.Error())
 		return
 	}
@@ -516,7 +548,7 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 		h.redirectRelayEditWithError(c, "名称必填")
 		return
 	}
-	if err := validateRelayProviderForm(apiFormat, provider.Endpoint, provider.APIKey, config, models); err != nil {
+	if err := h.validateRelayProviderForm(apiFormat, provider.Endpoint, provider.APIKey, config, models); err != nil {
 		h.redirectRelayEditWithError(c, err.Error())
 		return
 	}
@@ -589,14 +621,6 @@ func relayModelsJSON(text string) (string, error) {
 	}
 	raw, err := json.Marshal(models)
 	return string(raw), err
-}
-
-func relayModelsText(raw string) string {
-	var models []string
-	if err := json.Unmarshal([]byte(raw), &models); err != nil {
-		return ""
-	}
-	return strings.Join(models, "\n")
 }
 
 func relayModelRowsFromProvider(provider database.RelayProvider) ([]relayModelFormRow, error) {
@@ -772,10 +796,10 @@ func validateRelayModelForm(apiFormat string, models []database.RelayModel) erro
 		}
 		params := relay.DecodeAdvancedParams(model.AdvancedParams)
 		if params.MaxTokens != nil && *params.MaxTokens <= 0 {
-			return errors.New("Max Tokens 必须大于 0")
+			return adminFormError("Max Tokens 必须大于 0")
 		}
 		if params.TopP != nil && (*params.TopP < 0 || *params.TopP > 1) {
-			return errors.New("Top P 必须在 0 到 1 之间")
+			return adminFormError("Top P 必须在 0 到 1 之间")
 		}
 	}
 	return nil
@@ -792,10 +816,12 @@ func parseRelayProviderConfig(c *gin.Context) relay.ProviderConfig {
 	}
 }
 
-func validateRelayProviderForm(apiFormat, endpoint, apiKey string, config relay.ProviderConfig, models []database.RelayModel) error {
-	u, err := url.ParseRequestURI(endpoint)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		return errors.New("Endpoint 必须是有效的 HTTP(S) URL")
+func (h *Handler) validateRelayProviderForm(apiFormat, endpoint, apiKey string, config relay.ProviderConfig, models []database.RelayModel) error {
+	if h.endpointPolicy == nil {
+		return adminFormError("Endpoint 安全策略未配置")
+	}
+	if err := h.endpointPolicy.ValidateEndpoint(endpoint); err != nil {
+		return adminFormError("Endpoint 不安全: " + err.Error())
 	}
 	if apiFormat != relay.APIFormatOllama && strings.TrimSpace(apiKey) == "" {
 		return errors.New("API Key 必填")
@@ -804,6 +830,10 @@ func validateRelayProviderForm(apiFormat, endpoint, apiKey string, config relay.
 		return errors.New("VIVO OCR/LASR 必须填写 AppID")
 	}
 	return validateRelayModelForm(apiFormat, models)
+}
+
+func adminFormError(message string) error {
+	return errors.New(message)
 }
 
 func legacyProviderAppID(provider database.RelayProvider) string {
@@ -998,7 +1028,10 @@ func redirectBack(c *gin.Context, fallback string) string {
 }
 
 func setAdminCookie(c *gin.Context, name, value string, maxAge int) {
-	c.SetCookie(name, value, maxAge, "/admin", "", c.Request.TLS != nil, true)
+	c.SetSameSite(http.SameSiteLaxMode)
+	forwardedProto := strings.TrimSpace(strings.Split(c.GetHeader("X-Forwarded-Proto"), ",")[0])
+	secure := c.Request.TLS != nil || strings.EqualFold(forwardedProto, "https")
+	c.SetCookie(name, value, maxAge, "/admin", "", secure, true)
 }
 
 func generateCSRFToken() (string, error) {

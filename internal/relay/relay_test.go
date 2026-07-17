@@ -2,12 +2,14 @@ package relay_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -55,12 +57,13 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServ
 
 	jwtMgr := auth.NewJWTManager("test-secret")
 	authSvc := auth.NewService(db, jwtMgr, database.NewSnowflakeGenerator(0))
-	_, pair, err := authSvc.Register("13800000000", "secret123", "tester")
+	_, pair, err := authSvc.Register(context.Background(), "13800000000", "secret123", "tester")
 	if err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
 	handler := relay.NewHandler(relay.NewServiceWithClient(db, testutil.NewHTTPClient()))
+	t.Cleanup(handler.Close)
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	g := r.Group("/relay")
@@ -72,6 +75,11 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServ
 	g.POST("/transcribe", handler.Transcribe)
 	g.POST("/ocr", handler.OCR)
 	g.POST("/images/generations", handler.ImageGenerations)
+	g.POST("/speech/create", handler.SpeechCreate)
+	g.POST("/speech/:audioId/upload", handler.SpeechUpload)
+	g.POST("/speech/:audioId/run", handler.SpeechRun)
+	g.GET("/speech/:audioId/progress", handler.SpeechProgress)
+	g.GET("/speech/:audioId/result", handler.SpeechResult)
 	g.GET("/models", handler.Models)
 	g.GET("/config", handler.Config)
 	g.GET("/v2/config", handler.ConfigV2)
@@ -710,6 +718,148 @@ func TestTranscribeForwardsSpeechModel(t *testing.T) {
 	}
 }
 
+func TestMultipartRequestRejectsTotalSizeOverLimit(t *testing.T) {
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
+		t.Fatal("upstream should not be called for oversized multipart request")
+	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("api_format", relay.APIFormatOpenAISpeech).Error; err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+
+	body, contentType := multipartBodyWithFile(t, map[string]string{"model": "whisper-test", "api_type": "openai_speech"}, bytes.Repeat([]byte("a"), (8<<20)+1))
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/transcribe", token, contentType, body)
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status = %d, want 400: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestNonStreamingUpstreamResponseRejectsOversize(t *testing.T) {
+	server, token, _ := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(bytes.Repeat([]byte("a"), (16<<20)+1))
+	})
+	body := []byte(`{"model":"gpt-test","api_type":"openai","messages":[{"role":"user","content":"ping"}]}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status = %d, want 502: %s", resp.StatusCode, raw)
+	}
+}
+
+func TestSpeechSessionIsUserScopedAndMalformedResultCanRetry(t *testing.T) {
+	var mu sync.Mutex
+	paths := make([]string, 0, 5)
+	resultCalls := 0
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/lasr/create":
+			_, _ = w.Write([]byte(`{"data":{"audio_id":"upstream-audio"}}`))
+		case "/lasr/run":
+			_, _ = w.Write([]byte(`{"data":{"task_id":"upstream-task"}}`))
+		case "/lasr/result":
+			resultCalls++
+			if resultCalls == 1 {
+				_, _ = w.Write([]byte(`{"data":`))
+				return
+			}
+			if resultCalls == 2 {
+				_, _ = w.Write([]byte(`{"data":{"result":"malformed"}}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"data":{"result":[{"onebest":"hello"}]}}`))
+		default:
+			t.Errorf("unexpected upstream path %s", r.URL.Path)
+		}
+	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Updates(map[string]interface{}{
+		"models":     "",
+		"api_format": relay.APIFormatVivoLASR,
+		"config":     relay.EncodeProviderConfig(relay.ProviderConfig{AppID: "test-app"}),
+	}).Error; err != nil {
+		t.Fatalf("update provider: %v", err)
+	}
+	if err := db.Model(&database.RelayModel{}).Where("model_id = ?", "whisper-test").Update("enabled", false).Error; err != nil {
+		t.Fatalf("disable old speech model: %v", err)
+	}
+	model := database.RelayModel{ProviderID: 1, ModelID: "vivo-speech", Category: relay.CategorySpeech, Enabled: true}
+	if err := db.Create(&model).Error; err != nil {
+		t.Fatalf("create speech model: %v", err)
+	}
+
+	createBody := bytes.NewBufferString(`{"model":"vivo-speech","api_type":"vivo_lasr","audio_type":"wav","slice_num":1}`)
+	createReq := authedRequest(t, http.MethodPost, server.URL+"/relay/speech/create", token, "application/json", createBody)
+	createResp := testutil.Do(t, createReq)
+	defer createResp.Body.Close()
+	var created struct {
+		Data struct {
+			AudioID string `json:"audio_id"`
+		} `json:"data"`
+	}
+	testutil.DecodeJSON(t, createResp, &created)
+	if createResp.StatusCode != http.StatusOK || len(created.Data.AudioID) != 32 {
+		t.Fatalf("create status/session = %d/%q", createResp.StatusCode, created.Data.AudioID)
+	}
+
+	jwtMgr := auth.NewJWTManager("test-secret")
+	otherToken, _, err := jwtMgr.GenerateAccessToken("999999", "other", false)
+	if err != nil {
+		t.Fatalf("create other user token: %v", err)
+	}
+	otherReq := authedRequest(t, http.MethodGet, server.URL+"/relay/speech/"+created.Data.AudioID+"/progress", otherToken, "", nil)
+	otherResp := testutil.Do(t, otherReq)
+	otherResp.Body.Close()
+	if otherResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("cross-user status = %d, want 404", otherResp.StatusCode)
+	}
+
+	runReq := authedRequest(t, http.MethodPost, server.URL+"/relay/speech/"+created.Data.AudioID+"/run", token, "application/json", nil)
+	runResp := testutil.Do(t, runReq)
+	runResp.Body.Close()
+	if runResp.StatusCode != http.StatusOK {
+		t.Fatalf("run status = %d, want 200", runResp.StatusCode)
+	}
+	resultURL := server.URL + "/relay/speech/" + created.Data.AudioID + "/result"
+	resultReq := authedRequest(t, http.MethodGet, resultURL, token, "", nil)
+	resultResp := testutil.Do(t, resultReq)
+	resultResp.Body.Close()
+	if resultResp.StatusCode != http.StatusOK {
+		t.Fatalf("result status = %d, want 200", resultResp.StatusCode)
+	}
+	secondReq := authedRequest(t, http.MethodGet, resultURL, token, "", nil)
+	secondResp := testutil.Do(t, secondReq)
+	secondResp.Body.Close()
+	if secondResp.StatusCode != http.StatusOK {
+		t.Fatalf("retry status = %d, want 200", secondResp.StatusCode)
+	}
+	thirdReq := authedRequest(t, http.MethodGet, resultURL, token, "", nil)
+	thirdResp := testutil.Do(t, thirdReq)
+	thirdResp.Body.Close()
+	if thirdResp.StatusCode != http.StatusOK {
+		t.Fatalf("valid result status = %d, want 200", thirdResp.StatusCode)
+	}
+	fourthReq := authedRequest(t, http.MethodGet, resultURL, token, "", nil)
+	fourthResp := testutil.Do(t, fourthReq)
+	fourthResp.Body.Close()
+	if fourthResp.StatusCode != http.StatusNotFound {
+		t.Fatalf("completed session status = %d, want 404", fourthResp.StatusCode)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(paths) != 5 {
+		t.Fatalf("upstream calls = %v, want create/run/result/result/result", paths)
+	}
+}
+
 func TestImageGenerationsForwardsImageModel(t *testing.T) {
 	var seenBody map[string]interface{}
 	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
@@ -739,6 +889,10 @@ func TestImageGenerationsForwardsImageModel(t *testing.T) {
 }
 
 func multipartBody(t *testing.T, fields map[string]string) (*bytes.Buffer, string) {
+	return multipartBodyWithFile(t, fields, []byte("audio"))
+}
+
+func multipartBodyWithFile(t *testing.T, fields map[string]string, file []byte) (*bytes.Buffer, string) {
 	t.Helper()
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
@@ -751,7 +905,7 @@ func multipartBody(t *testing.T, fields map[string]string) (*bytes.Buffer, strin
 	if err != nil {
 		t.Fatalf("create file: %v", err)
 	}
-	if _, err := part.Write([]byte("audio")); err != nil {
+	if _, err := part.Write(file); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 	if err := w.Close(); err != nil {
