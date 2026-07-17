@@ -17,11 +17,13 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/database"
+	"github.com/lynai/backend/internal/requestbody"
 )
 
 const (
 	maxRelayBodyBytes             = 8 << 20
 	maxRelayUpstreamResponseBytes = 16 << 20
+	maxSpeechCreateBodyBytes      = 16 << 10
 )
 
 var errUpstreamResponseTooLarge = errors.New("upstream response is too large")
@@ -429,8 +431,13 @@ func (h *Handler) OCR(c *gin.Context) {
 
 // SpeechCreate starts a managed long-running speech transcription session.
 func (h *Handler) SpeechCreate(c *gin.Context) {
+	requestbody.Limit(c, maxSpeechCreateBodyBytes)
 	var body map[string]interface{}
-	if err := c.BindJSON(&body); err != nil {
+	if err := c.ShouldBindJSON(&body); err != nil {
+		if requestbody.TooLarge(err) {
+			writeOpenAIError(c, http.StatusRequestEntityTooLarge, "invalid_request_error", "request body is too large")
+			return
+		}
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid JSON body")
 		return
 	}

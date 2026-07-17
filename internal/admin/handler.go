@@ -17,6 +17,7 @@ import (
 	"github.com/lynai/backend/internal/database"
 	"github.com/lynai/backend/internal/market"
 	"github.com/lynai/backend/internal/relay"
+	"github.com/lynai/backend/internal/requestbody"
 	"gorm.io/gorm"
 )
 
@@ -25,6 +26,8 @@ const CookieName = "lynai_admin_token"
 
 // CSRFCookieName is the HTTP-only cookie carrying the admin CSRF token.
 const CSRFCookieName = "lynai_admin_csrf"
+
+const adminLoginBodyLimit = 16 << 10
 
 // Handler serves the HTML admin panel.
 type Handler struct {
@@ -176,6 +179,15 @@ func (h *Handler) ShowLogin(c *gin.Context) {
 }
 
 func (h *Handler) DoLogin(c *gin.Context) {
+	requestbody.Limit(c, adminLoginBodyLimit)
+	if err := c.Request.ParseForm(); err != nil {
+		if requestbody.TooLarge(err) {
+			c.String(http.StatusRequestEntityTooLarge, "Request body is too large")
+			return
+		}
+		h.render(c, "login.html", map[string]interface{}{"Error": "Invalid login request"})
+		return
+	}
 	phone := strings.TrimSpace(c.PostForm("phone"))
 	password := c.PostForm("password")
 

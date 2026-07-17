@@ -3,9 +3,11 @@ package market
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"sync"
 
+	"github.com/Masterminds/semver/v3"
 	"github.com/lynai/backend/internal/database"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -16,6 +18,10 @@ var ErrPluginNotFound = errors.New("plugin not found")
 
 // ErrPluginNotOwned is returned when another user owns a submitted plugin ID.
 var ErrPluginNotOwned = errors.New("plugin belongs to another submitter")
+
+// ErrPluginVersionConflict is returned when immutable archive contents change
+// without a version change.
+var ErrPluginVersionConflict = errors.New("plugin version already has different archive contents")
 
 // Service handles marketplace queries, submissions, and review operations.
 type Service struct {
@@ -108,9 +114,9 @@ func (s *Service) GetPluginAnyStatus(id string) (*database.Plugin, error) {
 }
 
 // IncrementDownloadCount atomically bumps the download counter.
-func (s *Service) IncrementDownloadCount(id string) {
-	s.db.Model(&database.Plugin{}).Where("id = ?", id).
-		UpdateColumn("download_count", gorm.Expr("download_count + 1"))
+func (s *Service) IncrementDownloadCount(id string) error {
+	return s.db.Model(&database.Plugin{}).Where("id = ?", id).
+		UpdateColumn("download_count", gorm.Expr("download_count + 1")).Error
 }
 
 // ListPending returns plugins with pending status.
@@ -175,6 +181,9 @@ func (s *Service) Reject(pluginID string, reviewerID int64, reason string) error
 
 // UpdatePlugin updates editable plugin metadata from the admin panel.
 func (s *Service) UpdatePlugin(pluginID, name, description, category, version string) error {
+	if !isValidSemVer(version) {
+		return fmt.Errorf("invalid plugin version")
+	}
 	updates := map[string]interface{}{
 		"name":        name,
 		"description": description,
@@ -288,6 +297,9 @@ func (s *Service) UpsertSubmission(m *manifestJSON, tempPath string, sha *string
 		if queryErr == nil && existing.SubmittedBy != submitterID {
 			return ErrPluginNotOwned
 		}
+		if queryErr == nil && existing.Version == m.Version && !sameArchiveSHA(existing.SHA256, sha) {
+			return ErrPluginVersionConflict
+		}
 		if queryErr == nil {
 			oldZipPath = existing.ZipPath
 		}
@@ -304,9 +316,7 @@ func (s *Service) UpsertSubmission(m *manifestJSON, tempPath string, sha *string
 				Status:      database.PluginStatusPending,
 				SubmittedBy: submitterID,
 			}
-			if m.Icon != "" {
-				plugin.IconURL = &m.Icon
-			}
+			plugin.IconURL = marketIconURL(m.Icon)
 			if err := tx.Create(&plugin).Error; err != nil {
 				return fmt.Errorf("create plugin: %w", err)
 			}
@@ -322,9 +332,7 @@ func (s *Service) UpsertSubmission(m *manifestJSON, tempPath string, sha *string
 				"reviewed_by": nil,
 				"review_note": nil,
 			}
-			if m.Icon != "" {
-				updates["icon_url"] = m.Icon
-			}
+			updates["icon_url"] = marketIconURL(m.Icon)
 			if err := tx.Model(&existing).Updates(updates).Error; err != nil {
 				return fmt.Errorf("update plugin: %w", err)
 			}
@@ -422,7 +430,16 @@ func (s *Service) CheckUpdates(items []InstalledItem) ([]UpdateEntry, error) {
 
 	var updates []UpdateEntry
 	for _, p := range plugins {
-		if p.Version != installedVersions[p.ID] {
+		marketVersion, err := semver.NewVersion(p.Version)
+		if err != nil {
+			continue
+		}
+		installedVersion, err := semver.NewVersion(installedVersions[p.ID])
+		if err != nil {
+			updates = append(updates, pluginToUpdateEntry(&p))
+			continue
+		}
+		if marketVersion.GreaterThan(installedVersion) {
 			updates = append(updates, pluginToUpdateEntry(&p))
 		}
 	}
@@ -430,6 +447,18 @@ func (s *Service) CheckUpdates(items []InstalledItem) ([]UpdateEntry, error) {
 		updates = []UpdateEntry{}
 	}
 	return updates, nil
+}
+
+func isValidSemVer(version string) bool {
+	_, err := semver.StrictNewVersion(version)
+	return err == nil
+}
+
+func sameArchiveSHA(a, b *string) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	return *a == *b
 }
 
 // pluginToUpdateEntry converts a Plugin model to the update-check response format.
@@ -440,7 +469,7 @@ func pluginToUpdateEntry(p *database.Plugin) UpdateEntry {
 		Author:      p.Author,
 		Description: p.Description,
 		Version:     p.Version,
-		IconURL:     p.IconURL,
+		IconURL:     sanitizedMarketIconURL(p.IconURL),
 		Screenshots: screenshotURLs(p.Screenshots),
 		Permissions: permissionNames(p.Permissions),
 		DownloadURL: fmt.Sprintf("/market/plugins/%s/download", p.ID),
@@ -465,4 +494,19 @@ func permissionNames(perms []database.PluginPermission) []string {
 		out = append(out, p.Permission)
 	}
 	return out
+}
+
+func marketIconURL(value string) *string {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Host == "" || parsed.User != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return nil
+	}
+	return &value
+}
+
+func sanitizedMarketIconURL(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	return marketIconURL(*value)
 }

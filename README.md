@@ -34,7 +34,7 @@ make build
 | 变量 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
 | `DB_DSN` | 是 | — | PostgreSQL 连接串，如 `host=localhost port=5432 user=postgres dbname=lynai sslmode=disable` |
-| `JWT_SECRET` | 是 | — | JWT 签名密钥，生产环境务必用随机长字符串 |
+| `JWT_SECRET` | 是 | — | JWT 签名密钥，至少 32 bytes，必须使用随机值，拒绝示例或默认占位值 |
 | `ADMIN_PASSWORD` | 是 | — | 管理员账号初始密码 |
 | `PORT` | 否 | `8080` | 监听端口 |
 | `STORAGE_DIR` | 否 | `./storage` | 插件 ZIP 存储目录 |
@@ -58,7 +58,7 @@ make build
 
 ```bash
 export DB_DSN="host=localhost port=5432 user=postgres dbname=lynai sslmode=disable"
-export JWT_SECRET="your-random-secret-key"
+export JWT_SECRET="$(openssl rand -base64 48)"
 export ADMIN_PASSWORD="your-admin-password"
 export MACHINE_ID="REPLACE_WITH_A_UNIQUE_ID_FROM_0_TO_1023"
 
@@ -75,7 +75,7 @@ make migrate
 ./bin/lynai-backend migrate
 ```
 
-迁移使用内嵌、版本化 PostgreSQL SQL，在 `schema_migrations` 中保存 SHA-256 校验和，并使用 PostgreSQL advisory lock 防止多实例并发执行。普通启动只校验数据库已应用全部已知版本且校验和一致，不会运行 `AutoMigrate` 或修改表结构。迁移完成后的首次普通启动会创建管理员账号（默认手机号 `0000000000`，密码为你设置的 `ADMIN_PASSWORD`）。
+迁移使用内嵌、版本化 PostgreSQL SQL，在 `schema_migrations` 中保存 SHA-256 校验和，并使用 PostgreSQL advisory lock 防止多实例并发执行。普通启动只校验数据库已应用全部已知版本且校验和一致，不会运行 `AutoMigrate` 或修改表结构。迁移完成后的首次普通启动会创建管理员账号（默认手机号 `0000000000`，密码为你设置的 `ADMIN_PASSWORD`）。如果该手机号已属于普通用户，启动会明确报错且不会将其提升为管理员。
 
 systemd 示例从 `/etc/lynai-backend/environment` 读取必需配置；文件不存在时 systemd 不会启动服务，缺少 `MACHINE_ID` 等必需变量时程序会报错退出。请显式填写每个实例唯一的 `MACHINE_ID`，不要复制复用示例节点 ID。
 
@@ -244,7 +244,9 @@ curl -X POST http://localhost:8080/market/plugins/submit \
   -F "zip=@my-plugin.zip"
 ```
 
-ZIP 包内必须包含 `plugin.json` 文件，字段如下：
+提交 ZIP 的净文件大小上限为 16 MiB；multipart 请求体上限会额外预留协议开销。ZIP 根目录必须且只能包含一个规范路径 `plugin.json`，不接受嵌套、重复、反斜线或 `.` / `..` 等非规范路径。版本必须是完整 SemVer（例如 `1.2.3`）。客户端本地安装 ZIP 的 32 MiB 安全上限是独立限制，不代表市场提交上限。
+
+`plugin.json` 字段如下：
 
 ```json
 {
@@ -364,7 +366,7 @@ sudoedit /etc/lynai-backend/environment
 
 ```ini
 DB_DSN=host=/var/run/postgresql port=5432 user=lynai dbname=lynai sslmode=disable
-JWT_SECRET=REPLACE_WITH_A_RANDOM_SECRET
+JWT_SECRET=<粘贴 openssl rand -base64 48 的输出>
 ADMIN_PASSWORD=REPLACE_WITH_A_STRONG_PASSWORD
 MACHINE_ID=REPLACE_WITH_A_UNIQUE_ID_FROM_0_TO_1023
 ```
@@ -379,7 +381,7 @@ sudo chmod 600 /etc/lynai-backend/environment
 必需环境变量：
 
 - `DB_DSN` — PostgreSQL 连接串
-- `JWT_SECRET` — JWT 签名密钥，生产环境务必使用随机长字符串
+- `JWT_SECRET` — 至少 32 bytes 的随机 JWT 签名密钥；可用 `openssl rand -base64 48` 生成
 - `ADMIN_PASSWORD` — 初始管理员密码
 - `MACHINE_ID` — Snowflake 节点 ID，范围 0-1023，多实例必须各不相同
 

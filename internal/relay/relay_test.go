@@ -133,6 +133,19 @@ func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*testutil.Tes
 	return server, token, db
 }
 
+func TestSpeechCreateBodyLimit(t *testing.T) {
+	server, token, _ := setupRelayTest(t, func(http.ResponseWriter, *http.Request) {
+		t.Fatal("oversized speech create reached upstream")
+	})
+	body := strings.NewReader(`{"model":"gpt-test","padding":"` + strings.Repeat("x", 20<<10) + `"}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/speech/create", token, "application/json", body)
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("speech create status = %d, want 413", resp.StatusCode)
+	}
+}
+
 func authedRequest(t *testing.T, method, target, token, contentType string, body io.Reader) *http.Request {
 	t.Helper()
 	req := testutil.NewRequest(t, method, target, body)

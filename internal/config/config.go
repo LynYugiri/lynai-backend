@@ -113,8 +113,24 @@ func Load() (*Config, error) {
 	if cfg.JWTSecret == "" {
 		return nil, fmt.Errorf("JWT_SECRET environment variable is required")
 	}
+	if len([]byte(cfg.JWTSecret)) < 32 {
+		return nil, fmt.Errorf("JWT_SECRET must be at least 32 bytes")
+	}
+	if insecureJWTSecret(cfg.JWTSecret) {
+		return nil, fmt.Errorf("JWT_SECRET must not use an example or default value")
+	}
 
 	return cfg, nil
+}
+
+func insecureJWTSecret(secret string) bool {
+	value := strings.ToLower(strings.TrimSpace(secret))
+	for _, marker := range []string{"change-me", "changeme", "default", "example", "replace-with", "replace_with", "your-"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func positiveDuration(key, fallback string) (time.Duration, error) {

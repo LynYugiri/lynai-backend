@@ -447,7 +447,12 @@ func (s *Service) ListBlobs(userID int64, after uint64, limit int) ([]BlobInfo, 
 	return result, nextAfter, hasMore, nil
 }
 
-// PrepareBlob streams and verifies an upload before authorization and commit.
+// CheckReplay returns a stored response before an upload body is staged.
+func (s *Service) CheckReplay(userID int64, requestID string, bodyHash []byte, operation string) (ReplayResponse, bool, error) {
+	return s.lookupReplay(userID, requestID, bodyHash, operation)
+}
+
+// PrepareBlob streams and verifies an authorized upload before commit.
 func (s *Service) PrepareBlob(userID int64, sha256 string, src io.Reader) (*PreparedBlob, error) {
 	return s.blob.PrepareBlob(userID, sha256, src)
 }

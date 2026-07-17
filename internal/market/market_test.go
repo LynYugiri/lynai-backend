@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -52,6 +53,76 @@ func createPluginZip(t *testing.T, id, name, version string) []byte {
 	}
 
 	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func createPluginZipWithExactSize(t *testing.T, id, name, version string, size int) []byte {
+	t.Helper()
+	build := func(paddingSize int) []byte {
+		buf := &bytes.Buffer{}
+		writer := zip.NewWriter(buf)
+		manifest, err := json.Marshal(map[string]interface{}{
+			"id": id, "name": name, "version": version,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		manifestFile, err := writer.Create("plugin.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := manifestFile.Write(manifest); err != nil {
+			t.Fatal(err)
+		}
+		paddingHeader := &zip.FileHeader{Name: "padding.bin", Method: zip.Store}
+		paddingFile, err := writer.CreateHeader(paddingHeader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if paddingSize > 0 {
+			if _, err := paddingFile.Write(bytes.Repeat([]byte{0}, paddingSize)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		return buf.Bytes()
+	}
+
+	base := build(0)
+	if len(base) > size {
+		t.Fatalf("minimum plugin ZIP size = %d, exceeds target %d", len(base), size)
+	}
+	result := build(size - len(base))
+	if len(result) != size {
+		t.Fatalf("plugin ZIP size = %d, want %d", len(result), size)
+	}
+	if _, err := zip.NewReader(bytes.NewReader(result), int64(len(result))); err != nil {
+		t.Fatalf("exact-size fixture is not a valid ZIP: %v", err)
+	}
+	return result
+}
+
+func createZipWithEntries(t *testing.T, entries ...struct {
+	name string
+	body string
+}) []byte {
+	t.Helper()
+	buf := &bytes.Buffer{}
+	zw := zip.NewWriter(buf)
+	for _, entry := range entries {
+		writer, err := zw.Create(entry.name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(writer, entry.body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
 		t.Fatal(err)
 	}
 	return buf.Bytes()
@@ -174,9 +245,81 @@ func TestSubmitRejectsOversizedUpload(t *testing.T) {
 	defer cleanup()
 
 	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000013", testPassword)
-	resp := submitPluginResponse(t, ts, token, bytes.Repeat([]byte("x"), 16<<20))
+	zipBytes := createPluginZipWithExactSize(t, "oversized-plugin", "Oversized", "1.0.0", (16<<20)+1)
+	resp := submitPluginResponse(t, ts, token, zipBytes)
 	defer resp.Body.Close()
 	testutil.RequireStatus(t, resp, http.StatusRequestEntityTooLarge)
+}
+
+func TestSubmitAcceptsExactly16MiBZip(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000019", testPassword)
+	zipBytes := createPluginZipWithExactSize(t, "limit-plugin", "Limit", "1.0.0", 16<<20)
+	resp := submitPluginResponse(t, ts, token, zipBytes)
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusOK)
+}
+
+func TestSubmitRejectsUnsafeManifestArchiveLayout(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000016", testPassword)
+	manifest := `{"id":"safe-plugin","name":"Safe","version":"1.0.0"}`
+
+	tests := []struct {
+		name    string
+		entries []struct{ name, body string }
+	}{
+		{name: "nested manifest", entries: []struct{ name, body string }{{"nested/plugin.json", manifest}}},
+		{name: "duplicate manifest", entries: []struct{ name, body string }{{"plugin.json", manifest}, {"plugin.json", manifest}}},
+		{name: "backslash path", entries: []struct{ name, body string }{{`folder\plugin.json`, manifest}, {"plugin.json", manifest}}},
+		{name: "dot segment", entries: []struct{ name, body string }{{"./plugin.json", manifest}}},
+		{name: "parent segment", entries: []struct{ name, body string }{{"folder/../plugin.json", manifest}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := submitPluginResponse(t, ts, token, createZipWithEntries(t, tc.entries...))
+			defer resp.Body.Close()
+			testutil.RequireStatus(t, resp, http.StatusBadRequest)
+		})
+	}
+}
+
+func TestSubmitRejectsInvalidSemVer(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000017", testPassword)
+	for _, version := range []string{"1", "1.0", "v1.0.0", "1.0.0_bad"} {
+		t.Run(version, func(t *testing.T) {
+			resp := submitPluginResponse(t, ts, token, createPluginZip(t, "invalid-version", "Invalid", version))
+			defer resp.Body.Close()
+			testutil.RequireStatus(t, resp, http.StatusBadRequest)
+		})
+	}
+}
+
+func TestSubmitOnlyPublishesAbsoluteHTTPIcons(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000018", testPassword)
+	for _, tc := range []struct {
+		name string
+		icon string
+		want interface{}
+	}{
+		{name: "relative", icon: "icons/plugin.png", want: nil},
+		{name: "javascript", icon: "javascript:alert(1)", want: nil},
+		{name: "https", icon: "https://cdn.example/plugin.png", want: "https://cdn.example/plugin.png"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			manifest := fmt.Sprintf(`{"id":"icon-%s","name":"Icon","version":"1.0.0","icon":%q}`, tc.name, tc.icon)
+			result := submitPlugin(t, ts, token, createZipWithEntries(t, struct{ name, body string }{"plugin.json", manifest}))
+			if result["iconUrl"] != tc.want {
+				t.Fatalf("iconUrl = %v, want %v", result["iconUrl"], tc.want)
+			}
+		})
+	}
 }
 
 func TestSubmitRejectsOversizedManifest(t *testing.T) {
@@ -463,6 +606,18 @@ func TestDownloadPlugin(t *testing.T) {
 		t.Fatal(err)
 	}
 	testutil.RequireStatus(t, resp, http.StatusOK)
+	if got := resp.Header.Get("Content-Type"); got != "application/zip" {
+		t.Fatalf("Content-Type = %q, want application/zip", got)
+	}
+	if got := resp.Header.Get("X-Content-Type-Options"); got != "nosniff" {
+		t.Fatalf("X-Content-Type-Options = %q, want nosniff", got)
+	}
+	if got := resp.Header.Get("ETag"); got == "" {
+		t.Fatal("ETag should be set when SHA-256 is available")
+	}
+	if got := resp.Header.Get("Content-Disposition"); got != `attachment; filename="download-me-1.0.0.zip"` {
+		t.Fatalf("Content-Disposition = %q", got)
+	}
 	data := testutil.ReadAll(t, resp.Body)
 	resp.Body.Close()
 
@@ -519,6 +674,99 @@ func TestCheckUpdates(t *testing.T) {
 	if entry["version"] != "2.0.0" {
 		t.Fatalf("update version = %v, want 2.0.0", entry["version"])
 	}
+}
+
+func TestCheckUpdatesUsesSemVerOrdering(t *testing.T) {
+	tests := []struct {
+		name      string
+		installed string
+		market    string
+		want      int
+	}{
+		{name: "higher major", installed: "1.9.9", market: "2.0.0", want: 1},
+		{name: "numeric comparison", installed: "1.9.0", market: "1.10.0", want: 1},
+		{name: "equal", installed: "1.0.0", market: "1.0.0", want: 0},
+		{name: "installed newer", installed: "2.0.0", market: "1.0.0", want: 0},
+		{name: "release beats prerelease", installed: "1.0.0-beta.1", market: "1.0.0", want: 1},
+		{name: "loose installed", installed: "v1.0", market: "2.0.0", want: 1},
+		{name: "invalid installed updated", installed: "development", market: "2.0.0", want: 1},
+	}
+	for index, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			adminPhone, adminPassword, ts, cleanup := testutil.SetupTest()
+			defer cleanup()
+			token := testutil.RegisterAndGetToken(t, ts.URL, fmt.Sprintf("13900000%03d", index), testPassword)
+			submitPlugin(t, ts, token, createPluginZip(t, "semver-plugin", "SemVer", tc.market))
+			adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+			req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/market/plugins/semver-plugin/approve", nil)
+			testutil.SetBearer(req, adminToken)
+			resp := testutil.Do(t, req)
+			testutil.RequireStatus(t, resp, http.StatusOK)
+			resp.Body.Close()
+
+			req = testutil.NewJSONRequest(t, http.MethodPost, ts.URL+"/market/updates", map[string]interface{}{
+				"installed": []map[string]string{{"id": "semver-plugin", "version": tc.installed}},
+			})
+			testutil.SetBearer(req, token)
+			resp = testutil.Do(t, req)
+			testutil.RequireStatus(t, resp, http.StatusOK)
+			var result map[string]interface{}
+			testutil.DecodeJSON(t, resp, &result)
+			resp.Body.Close()
+			updates, _ := result["updates"].([]interface{})
+			if len(updates) != tc.want {
+				t.Fatalf("updates len = %d, want %d", len(updates), tc.want)
+			}
+		})
+	}
+}
+
+func TestMarketJSONLimitsAndUpdateValidation(t *testing.T) {
+	adminPhone, adminPassword, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000020", testPassword)
+	adminToken := testutil.LoginAndGetToken(t, ts.URL, adminPhone, adminPassword)
+	submitPlugin(t, ts, token, createPluginZip(t, "reject-limit", "Reject Limit", "1.0.0"))
+
+	for _, tc := range []struct {
+		path  string
+		token string
+	}{
+		{path: "/market/updates", token: token},
+		{path: "/market/plugins/reject-limit/reject", token: adminToken},
+	} {
+		body := strings.NewReader(`{"padding":"` + strings.Repeat("x", 600<<10) + `"}`)
+		req := testutil.NewRequest(t, http.MethodPost, ts.URL+tc.path, body)
+		req.Header.Set("Content-Type", "application/json")
+		testutil.SetBearer(req, tc.token)
+		resp := testutil.Do(t, req)
+		testutil.RequireStatus(t, resp, http.StatusRequestEntityTooLarge)
+		resp.Body.Close()
+	}
+
+	tests := []map[string]interface{}{
+		{"installed": make([]map[string]string, 1025)},
+		{"installed": []map[string]string{{"id": strings.Repeat("i", 129), "version": "1.0.0"}}},
+		{"installed": []map[string]string{{"id": "plugin", "version": strings.Repeat("v", 129)}}},
+		{"installed": []map[string]string{{"id": "plugin", "version": ""}}},
+	}
+	for _, body := range tests {
+		req := testutil.NewJSONRequest(t, http.MethodPost, ts.URL+"/market/updates", body)
+		testutil.SetBearer(req, token)
+		resp := testutil.Do(t, req)
+		testutil.RequireStatus(t, resp, http.StatusBadRequest)
+		resp.Body.Close()
+	}
+}
+
+func TestSubmitRejectsDifferentArchiveForSameVersion(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13800000021", testPassword)
+	submitPlugin(t, ts, token, createPluginZip(t, "immutable-version", "First", "1.0.0"))
+	resp := submitPluginResponse(t, ts, token, createPluginZip(t, "immutable-version", "Changed", "1.0.0"))
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusConflict)
 }
 
 func TestSubmitRequiresAuth(t *testing.T) {

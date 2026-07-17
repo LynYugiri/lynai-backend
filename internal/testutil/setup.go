@@ -73,7 +73,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 		panic("blob storage: " + err.Error())
 	}
 
-	jwtMgr := auth.NewJWTManager("test-secret-key-for-testing")
+	jwtMgr := auth.NewJWTManager("test-secret-key-for-testing-at-least-32-bytes")
 	authSvc := auth.NewService(db, jwtMgr, snowflake)
 	deviceSvc := device.NewService(db)
 	marketSvc := market.NewService(db, storage)

@@ -6,9 +6,11 @@ import (
 	"time"
 )
 
+const validTestJWTSecret = "test-jwt-secret-with-at-least-32-bytes"
+
 func TestLoadDefaultsAndMachineID(t *testing.T) {
 	t.Setenv("DB_DSN", "test-dsn")
-	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_SECRET", validTestJWTSecret)
 	t.Setenv("PORT", "")
 	t.Setenv("STORAGE_DIR", "")
 	t.Setenv("MACHINE_ID", "0")
@@ -43,7 +45,7 @@ func TestLoadDefaultsAndMachineID(t *testing.T) {
 
 func TestLoadValidatesSyncTimingConfiguration(t *testing.T) {
 	t.Setenv("DB_DSN", "test-dsn")
-	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_SECRET", validTestJWTSecret)
 	t.Setenv("MACHINE_ID", "0")
 	for _, tc := range []struct {
 		name, key, value string
@@ -62,7 +64,7 @@ func TestLoadValidatesSyncTimingConfiguration(t *testing.T) {
 
 func TestLoadRejectsInvalidMachineID(t *testing.T) {
 	t.Setenv("DB_DSN", "test-dsn")
-	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_SECRET", validTestJWTSecret)
 
 	for _, machineID := range []string{"", "-1", "1024", "invalid"} {
 		t.Run(machineID, func(t *testing.T) {
@@ -77,7 +79,7 @@ func TestLoadRejectsInvalidMachineID(t *testing.T) {
 
 func TestLoadValidatesSessionAndRelayLimits(t *testing.T) {
 	t.Setenv("DB_DSN", "test-dsn")
-	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_SECRET", validTestJWTSecret)
 	t.Setenv("MACHINE_ID", "0")
 	for _, tc := range []struct {
 		key, value string
@@ -106,7 +108,7 @@ func TestLoadValidatesSessionAndRelayLimits(t *testing.T) {
 func TestLoadRequiresDatabaseAndJWTConfiguration(t *testing.T) {
 	t.Setenv("MACHINE_ID", "0")
 	t.Setenv("DB_DSN", "")
-	t.Setenv("JWT_SECRET", "test-secret")
+	t.Setenv("JWT_SECRET", validTestJWTSecret)
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "DB_DSN") {
 		t.Fatalf("Load() error = %v, want DB_DSN error", err)
 	}
@@ -115,5 +117,22 @@ func TestLoadRequiresDatabaseAndJWTConfiguration(t *testing.T) {
 	t.Setenv("JWT_SECRET", "")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "JWT_SECRET") {
 		t.Fatalf("Load() error = %v, want JWT_SECRET error", err)
+	}
+}
+
+func TestLoadRejectsWeakJWTSecrets(t *testing.T) {
+	t.Setenv("DB_DSN", "test-dsn")
+	t.Setenv("MACHINE_ID", "0")
+	for _, secret := range []string{
+		"short-secret",
+		"REPLACE_WITH_A_RANDOM_SECRET_THAT_IS_LONG_ENOUGH",
+		"your-example-secret-that-is-long-enough-for-hmac",
+	} {
+		t.Run(secret, func(t *testing.T) {
+			t.Setenv("JWT_SECRET", secret)
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), "JWT_SECRET") {
+				t.Fatalf("Load() error = %v, want JWT_SECRET validation error", err)
+			}
+		})
 	}
 }

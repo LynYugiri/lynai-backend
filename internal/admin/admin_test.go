@@ -359,6 +359,18 @@ func TestAdminPanelRelayLogPages(t *testing.T) {
 	}
 }
 
+func TestAdminLoginBodyLimit(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTestWithAdminPanel()
+	defer cleanup()
+	client := adminClient(t)
+	values := url.Values{"phone": {"0000000000"}, "password": {strings.Repeat("x", 20<<10)}}
+	resp := postForm(t, client, ts.URL+"/admin/login", values)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("admin login status = %d, want 413", resp.StatusCode)
+	}
+}
+
 func adminClient(t *testing.T) *http.Client {
 	t.Helper()
 	jar, err := cookiejar.New(nil)

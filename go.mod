@@ -3,6 +3,7 @@ module github.com/lynai/backend
 go 1.26.4
 
 require (
+	github.com/Masterminds/semver/v3 v3.4.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	golang.org/x/crypto v0.53.0

@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/lynai/backend/internal/database"
 	"golang.org/x/crypto/bcrypt"
 	"gorm.io/gorm"
@@ -67,12 +69,6 @@ func (s *Service) CreateAdmin(ctx context.Context, phone, password, displayName 
 }
 
 func (s *Service) createUser(ctx context.Context, phone, password, displayName string, isAdmin bool) (*database.User, error) {
-	var existing int64
-	s.db.Model(&database.User{}).Where("phone = ?", phone).Count(&existing)
-	if existing > 0 {
-		return nil, ErrPhoneTaken
-	}
-
 	passwordHash, err := HashPassword(password)
 	if err != nil {
 		return nil, fmt.Errorf("hash password: %w", err)
@@ -95,9 +91,21 @@ func (s *Service) createUser(ctx context.Context, phone, password, displayName s
 		IsAdmin:      isAdmin,
 	}
 	if err := s.db.Create(&user).Error; err != nil {
+		if isPhoneUniqueViolation(err) {
+			return nil, ErrPhoneTaken
+		}
 		return nil, fmt.Errorf("create user: %w", err)
 	}
 	return &user, nil
+}
+
+func isPhoneUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "23505" && pgErr.ConstraintName == "idx_users_phone"
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "unique constraint failed: users.phone")
 }
 
 // ListUsers returns users in reverse creation order.

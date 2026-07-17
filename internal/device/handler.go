@@ -8,8 +8,11 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/database"
+	"github.com/lynai/backend/internal/requestbody"
 	"gorm.io/gorm"
 )
+
+const deviceRequestBodyLimit = 16 << 10
 
 type Handler struct {
 	svc *Service
@@ -35,8 +38,13 @@ func (h *Handler) Challenge(c *gin.Context) {
 	if !ok {
 		return
 	}
+	requestbody.Limit(c, deviceRequestBodyLimit)
 	var req proposalRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -80,8 +88,13 @@ func (h *Handler) Enroll(c *gin.Context) {
 	if !ok {
 		return
 	}
+	requestbody.Limit(c, deviceRequestBodyLimit)
 	var req enrollRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -155,8 +168,13 @@ func (h *Handler) Rename(c *gin.Context) {
 	if !ok {
 		return
 	}
+	requestbody.Limit(c, deviceRequestBodyLimit)
 	var req renameRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

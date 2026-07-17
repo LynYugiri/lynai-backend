@@ -8,7 +8,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/database"
+	"github.com/lynai/backend/internal/requestbody"
 )
+
+const authRequestBodyLimit = 16 << 10
 
 // Handler exposes the /auth/* API endpoints.
 type Handler struct {
@@ -69,8 +72,13 @@ type registerRequest struct {
 
 // Register handles POST /auth/register.
 func (h *Handler) Register(c *gin.Context) {
+	requestbody.Limit(c, authRequestBodyLimit)
 	var req registerRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -102,8 +110,13 @@ type loginRequest struct {
 
 // Login handles POST /auth/login.
 func (h *Handler) Login(c *gin.Context) {
+	requestbody.Limit(c, authRequestBodyLimit)
 	var req loginRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -131,8 +144,13 @@ type sendOTPRequest struct {
 // SendOTP handles POST /auth/send-otp.
 // SMS verification is reserved but disabled until an SMS provider ships.
 func (h *Handler) SendOTP(c *gin.Context) {
+	requestbody.Limit(c, authRequestBodyLimit)
 	var req sendOTPRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -156,8 +174,13 @@ type verifyOTPRequest struct {
 // VerifyOTP handles POST /auth/verify-otp.
 // SMS verification is reserved but disabled until an SMS provider ships.
 func (h *Handler) VerifyOTP(c *gin.Context) {
+	requestbody.Limit(c, authRequestBodyLimit)
 	var req verifyOTPRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -184,8 +207,13 @@ type refreshRequest struct {
 
 // Refresh handles POST /auth/refresh.
 func (h *Handler) Refresh(c *gin.Context) {
+	requestbody.Limit(c, authRequestBodyLimit)
 	var req refreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
@@ -209,8 +237,13 @@ func (h *Handler) Refresh(c *gin.Context) {
 // Revoke handles POST /auth/revoke using a refresh token without requiring a
 // still-valid access token.
 func (h *Handler) Revoke(c *gin.Context) {
+	requestbody.Limit(c, authRequestBodyLimit)
 	var req refreshRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
+		if requestbody.TooLarge(err) {
+			c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": "request body is too large"})
+			return
+		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

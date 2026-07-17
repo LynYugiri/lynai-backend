@@ -209,6 +209,25 @@ func (h *Handler) UploadBlob(c *gin.Context) {
 		return
 	}
 
+	digest, _ := hex.DecodeString(sha256)
+	signed, err := verifySignedRequest(h.svc.db, syncHeaders(c), userID, c.GetString("sessionID"), c.Request.Method, c.FullPath(), digest, h.now(), h.clockSkew)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		return
+	}
+	operation := c.Request.Method + " " + c.FullPath()
+	if replay, found, err := h.svc.CheckReplay(userID, signed.RequestID, signed.BodyHash, operation); err != nil {
+		if errors.Is(err, ErrReplayConflict) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save blob"})
+		return
+	} else if found {
+		c.Data(replay.Status, replay.ContentType, replay.Body)
+		return
+	}
+
 	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, MaxBlobBytes)
 	prepared, err := h.svc.PrepareBlob(userID, sha256, c.Request.Body)
 	if err != nil {
@@ -224,14 +243,7 @@ func (h *Handler) UploadBlob(c *gin.Context) {
 		return
 	}
 	defer prepared.Close()
-
-	digest, _ := hex.DecodeString(sha256)
-	signed, err := verifySignedRequest(h.svc.db, syncHeaders(c), userID, c.GetString("sessionID"), c.Request.Method, c.FullPath(), digest, h.now(), h.clockSkew)
-	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
-		return
-	}
-	response, err := h.svc.SavePreparedBlobIdempotent(userID, prepared, signed.RequestID, signed.BodyHash, c.Request.Method+" "+c.FullPath())
+	response, err := h.svc.SavePreparedBlobIdempotent(userID, prepared, signed.RequestID, signed.BodyHash, operation)
 	if err != nil {
 		if errors.Is(err, ErrReplayConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})

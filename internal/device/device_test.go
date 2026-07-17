@@ -68,6 +68,28 @@ func TestDeviceEnrollmentAndLifecycle(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestDeviceJSONBodyLimits(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13810000010", "secret123")
+	for _, tc := range []struct {
+		method string
+		path   string
+	}{
+		{method: http.MethodPost, path: "/devices/challenge"},
+		{method: http.MethodPost, path: "/devices/enroll"},
+		{method: http.MethodPatch, path: "/devices/device-id"},
+	} {
+		body := strings.NewReader(`{"padding":"` + strings.Repeat("x", 20<<10) + `"}`)
+		req := testutil.NewRequest(t, tc.method, ts.URL+tc.path, body)
+		req.Header.Set("Content-Type", "application/json")
+		testutil.SetBearer(req, token)
+		resp := testutil.Do(t, req)
+		testutil.RequireStatus(t, resp, http.StatusRequestEntityTooLarge)
+		resp.Body.Close()
+	}
+}
+
 func TestDeviceRevokeOnlyRevokesItsAssociatedSession(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()

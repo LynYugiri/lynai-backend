@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 
@@ -103,6 +104,60 @@ func TestRegisterDuplicate(t *testing.T) {
 	resp = testutil.PostJSON(t, ts.URL+"/auth/register", body)
 	testutil.RequireStatus(t, resp, http.StatusConflict)
 	resp.Body.Close()
+}
+
+func TestConcurrentRegisterDuplicateReturnsConflict(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	body, err := json.Marshal(map[string]string{"phone": "13700003334", "password": testPassword})
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := make(chan struct{})
+	statuses := make(chan int, 2)
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			req := testutil.NewRequest(t, http.MethodPost, ts.URL+"/auth/register", bytes.NewReader(body))
+			req.Header.Set("Content-Type", "application/json")
+			resp := testutil.Do(t, req)
+			statuses <- resp.StatusCode
+			resp.Body.Close()
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(statuses)
+	counts := map[int]int{}
+	for status := range statuses {
+		counts[status]++
+	}
+	if counts[http.StatusOK] != 1 || counts[http.StatusConflict] != 1 {
+		t.Fatalf("concurrent registration statuses = %v, want one 200 and one 409", counts)
+	}
+}
+
+func TestAuthJSONBodyLimits(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	for _, path := range []string{
+		"/auth/register",
+		"/auth/login",
+		"/auth/send-otp",
+		"/auth/verify-otp",
+		"/auth/refresh",
+		"/auth/revoke",
+	} {
+		body := strings.NewReader(`{"phone":"13800000000","password":"secret123","padding":"` + strings.Repeat("x", 20<<10) + `"}`)
+		req := testutil.NewRequest(t, http.MethodPost, ts.URL+path, body)
+		req.Header.Set("Content-Type", "application/json")
+		resp := testutil.Do(t, req)
+		testutil.RequireStatus(t, resp, http.StatusRequestEntityTooLarge)
+		resp.Body.Close()
+	}
 }
 
 func TestLoginUnregistered(t *testing.T) {

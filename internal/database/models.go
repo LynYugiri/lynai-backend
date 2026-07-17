@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // User is the account model. Phone is the unique login identifier.
@@ -254,25 +255,12 @@ func AllModels() []interface{} {
 	}
 }
 
-// EnsureAdminSeed creates the initial admin account if it does not exist.
-// Uses the snowflake generator for the user ID.
+// ErrAdminSeedConflict is returned when the seed phone belongs to a non-admin.
+var ErrAdminSeedConflict = errors.New("admin seed phone belongs to a non-admin user")
+
+// EnsureAdminSeed creates the initial admin account if it does not exist. An
+// existing administrator is preserved, while a non-admin produces an error.
 func EnsureAdminSeed(ctx context.Context, db *gorm.DB, phone, displayName, passwordHash string, snowflake *SnowflakeGenerator) error {
-	var existing User
-	if err := db.Where("phone = ?", phone).First(&existing).Error; err == nil {
-		updates := map[string]interface{}{}
-		if existing.PasswordHash == "" {
-			updates["password_hash"] = passwordHash
-		}
-		if !existing.IsAdmin {
-			updates["is_admin"] = true
-		}
-		if len(updates) == 0 {
-			return nil
-		}
-		return db.Model(&existing).Updates(updates).Error
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return err
-	}
 	id, err := snowflake.NextID(ctx)
 	if err != nil {
 		return err
@@ -284,5 +272,21 @@ func EnsureAdminSeed(ctx context.Context, db *gorm.DB, phone, displayName, passw
 		DisplayName:  displayName,
 		IsAdmin:      true,
 	}
-	return db.Create(&admin).Error
+	if err := db.WithContext(ctx).Clauses(clause.OnConflict{DoNothing: true}).Create(&admin).Error; err != nil {
+		return err
+	}
+
+	var existing User
+	if err := db.WithContext(ctx).Where("phone = ?", phone).First(&existing).Error; err != nil {
+		return err
+	}
+	if !existing.IsAdmin {
+		return ErrAdminSeedConflict
+	}
+	if existing.PasswordHash != "" {
+		return nil
+	}
+	return db.WithContext(ctx).Model(&User{}).
+		Where("id = ? AND is_admin = ? AND password_hash = ''", existing.ID, true).
+		Update("password_hash", passwordHash).Error
 }

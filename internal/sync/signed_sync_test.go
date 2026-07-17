@@ -315,10 +315,14 @@ func doSignedSync(t testing.TB, target, token string, device syncDevice, request
 
 func doSignedBlob(t testing.TB, target, token string, device syncDevice, requestID string, body []byte) *http.Response {
 	t.Helper()
-	digest := sha256.Sum256(body)
+	sha := target[strings.LastIndex(target, "/")+1:]
+	digest, err := hex.DecodeString(sha)
+	if err != nil || len(digest) != sha256.Size {
+		t.Fatalf("decode blob target SHA-256 %q: %v", sha, err)
+	}
 	path := "/sync/blobs/:sha256"
 	timestamp := time.Now().UnixMilli()
-	message := syncapi.SyncRequestMessage(1, device.userID, device.sessionID, device.deviceID, timestamp, requestID, http.MethodPost, path, digest[:])
+	message := syncapi.SyncRequestMessage(1, device.userID, device.sessionID, device.deviceID, timestamp, requestID, http.MethodPost, path, digest)
 	req := testutil.NewRequest(t, http.MethodPost, target, bytes.NewReader(body))
 	testutil.SetBearer(req, token)
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -326,7 +330,7 @@ func doSignedBlob(t testing.TB, target, token string, device syncDevice, request
 	req.Header.Set("X-LynAI-Device-ID", device.deviceID)
 	req.Header.Set("X-LynAI-Timestamp", strconv.FormatInt(timestamp, 10))
 	req.Header.Set("X-LynAI-Request-ID", requestID)
-	req.Header.Set("X-LynAI-Body-SHA256", hex.EncodeToString(digest[:]))
+	req.Header.Set("X-LynAI-Body-SHA256", sha)
 	req.Header.Set("X-LynAI-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(device.privateKey, message)))
 	return testutil.Do(t, req)
 }
