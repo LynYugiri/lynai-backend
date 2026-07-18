@@ -2,6 +2,7 @@ package auth
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 )
@@ -43,6 +44,48 @@ func AuthMiddleware(jwtMgr *JWTManager, services ...*Service) gin.HandlerFunc {
 			return
 		}
 
+		c.Set("userID", claims.UserID)
+		c.Set("username", claims.Username)
+		c.Set("sessionID", claims.SessionID)
+		c.Set("isAdmin", userIsAdmin)
+		c.Next()
+	}
+}
+
+// OptionalAuthMiddleware authenticates a supplied Bearer token while allowing
+// requests with no Authorization header to continue as guests.
+func OptionalAuthMiddleware(jwtMgr *JWTManager, services ...*Service) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		header := c.GetHeader("Authorization")
+		if header == "" {
+			c.Next()
+			return
+		}
+		if !strings.HasPrefix(header, "Bearer ") || strings.TrimSpace(strings.TrimPrefix(header, "Bearer ")) == "" {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+			return
+		}
+		token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+		var claims *Claims
+		var userIsAdmin bool
+		var err error
+		if len(services) > 0 && services[0] != nil {
+			user, authenticatedClaims, authErr := services[0].AuthenticateAccess(token)
+			err = authErr
+			claims = authenticatedClaims
+			if user != nil {
+				userIsAdmin = user.IsAdmin
+			}
+		} else {
+			claims, err = jwtMgr.Verify(token)
+			if claims != nil {
+				userIsAdmin = claims.IsAdmin
+			}
+		}
+		if err != nil || claims == nil || claims.TokenType != TokenTypeAccess {
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "invalid or expired token"})
+			return
+		}
 		c.Set("userID", claims.UserID)
 		c.Set("username", claims.Username)
 		c.Set("sessionID", claims.SessionID)

@@ -28,8 +28,8 @@ func TestPostgresEmbeddedMigrationsAndValidation(t *testing.T) {
 	if err := db.Table("schema_migrations").Count(&count).Error; err != nil {
 		t.Fatalf("count applied migrations: %v", err)
 	}
-	if count != 6 {
-		t.Fatalf("applied migration count = %d, want 6", count)
+	if count != 7 {
+		t.Fatalf("applied migration count = %d, want 7", count)
 	}
 	for _, index := range []string{"idx_user_devices_device_id_global", "idx_user_devices_public_key_global"} {
 		var exists bool
@@ -38,6 +38,15 @@ func TestPostgresEmbeddedMigrationsAndValidation(t *testing.T) {
 		}
 		if !exists {
 			t.Errorf("embedded migrations did not create index %s", index)
+		}
+	}
+	for _, table := range []string{"community_profiles", "community_posts", "community_comments", "community_likes", "community_favorites", "community_media", "community_post_media", "community_audit_records"} {
+		var exists bool
+		if err := db.Raw("SELECT to_regclass(?) IS NOT NULL", table).Scan(&exists).Error; err != nil {
+			t.Fatalf("look up table %s: %v", table, err)
+		}
+		if !exists {
+			t.Errorf("embedded migrations did not create table %s", table)
 		}
 	}
 }

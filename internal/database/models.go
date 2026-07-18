@@ -233,6 +233,85 @@ type RelaySpeechSession struct {
 	UpdatedAt       time.Time `gorm:"not null" json:"updatedAt"`
 }
 
+// CommunityProfile stores public community-only profile data.
+type CommunityProfile struct {
+	UserID       int64     `gorm:"primaryKey;autoIncrement:false" json:"userId,string"`
+	Bio          string    `gorm:"not null;type:text" json:"bio"`
+	PinnedPostID *int64    `gorm:"index" json:"pinnedPostId,string"`
+	CreatedAt    time.Time `gorm:"not null" json:"createdAt"`
+	UpdatedAt    time.Time `gorm:"not null" json:"updatedAt"`
+}
+
+// CommunityPost is a user-authored Markdown post. DeletedAt is an explicit
+// soft-delete marker so administrators can restore records through the API.
+type CommunityPost struct {
+	ID        int64      `gorm:"primaryKey;autoIncrement:false" json:"id,string"`
+	AuthorID  int64      `gorm:"not null;index" json:"authorId,string"`
+	Title     string     `gorm:"not null;size:120" json:"title"`
+	Content   string     `gorm:"not null;type:text" json:"content"`
+	DeletedAt *time.Time `gorm:"index" json:"deletedAt"`
+	CreatedAt time.Time  `gorm:"not null" json:"createdAt"`
+	UpdatedAt time.Time  `gorm:"not null" json:"updatedAt"`
+}
+
+// CommunityComment is a Markdown comment on a post.
+type CommunityComment struct {
+	ID        int64      `gorm:"primaryKey;autoIncrement:false" json:"id,string"`
+	PostID    int64      `gorm:"not null;index" json:"postId,string"`
+	AuthorID  int64      `gorm:"not null;index" json:"authorId,string"`
+	Content   string     `gorm:"not null;type:text" json:"content"`
+	DeletedAt *time.Time `gorm:"index" json:"deletedAt"`
+	CreatedAt time.Time  `gorm:"not null" json:"createdAt"`
+	UpdatedAt time.Time  `gorm:"not null" json:"updatedAt"`
+}
+
+// CommunityLike records one user's idempotent like of a post.
+type CommunityLike struct {
+	UserID    int64     `gorm:"primaryKey;autoIncrement:false" json:"userId,string"`
+	PostID    int64     `gorm:"primaryKey;autoIncrement:false;index" json:"postId,string"`
+	CreatedAt time.Time `gorm:"not null" json:"createdAt"`
+}
+
+// CommunityFavorite records one user's private saved post.
+type CommunityFavorite struct {
+	UserID    int64     `gorm:"primaryKey;autoIncrement:false;index" json:"userId,string"`
+	PostID    int64     `gorm:"primaryKey;autoIncrement:false" json:"postId,string"`
+	CreatedAt time.Time `gorm:"not null;index" json:"createdAt"`
+}
+
+// CommunityMedia describes one immutable content-addressed image.
+type CommunityMedia struct {
+	ID          int64      `gorm:"primaryKey;autoIncrement:false" json:"id,string"`
+	OwnerUserID int64      `gorm:"not null;index" json:"ownerUserId,string"`
+	SHA256      string     `gorm:"not null;size:64;index" json:"sha256"`
+	Path        string     `gorm:"not null" json:"-"`
+	MediaType   string     `gorm:"not null;size:32" json:"mimeType"`
+	Size        int64      `gorm:"not null" json:"size"`
+	Width       int        `gorm:"not null" json:"width"`
+	Height      int        `gorm:"not null" json:"height"`
+	AttachedAt  *time.Time `gorm:"index" json:"attachedAt"`
+	DeletedAt   *time.Time `gorm:"index" json:"deletedAt"`
+	CreatedAt   time.Time  `gorm:"not null" json:"createdAt"`
+}
+
+// CommunityPostMedia preserves image order independently of post topology.
+type CommunityPostMedia struct {
+	PostID    int64 `gorm:"primaryKey;autoIncrement:false" json:"postId,string"`
+	MediaID   int64 `gorm:"not null;uniqueIndex" json:"mediaId,string"`
+	SortOrder int   `gorm:"primaryKey;autoIncrement:false" json:"sortOrder"`
+}
+
+// CommunityAuditRecord stores administrator restore and purge actions.
+type CommunityAuditRecord struct {
+	ID         int64     `gorm:"primaryKey;autoIncrement:false" json:"id,string"`
+	ActorID    int64     `gorm:"not null;index" json:"actorId,string"`
+	Action     string    `gorm:"not null;size:64" json:"action"`
+	TargetType string    `gorm:"not null;size:32;index:idx_community_audit_target,priority:1" json:"targetType"`
+	TargetID   int64     `gorm:"not null;index:idx_community_audit_target,priority:2" json:"targetId,string"`
+	Detail     string    `gorm:"not null;type:text" json:"detail"`
+	CreatedAt  time.Time `gorm:"not null;index" json:"createdAt"`
+}
+
 // AllModels returns every model that should be auto-migrated.
 func AllModels() []interface{} {
 	return []interface{}{
@@ -252,6 +331,14 @@ func AllModels() []interface{} {
 		&RelayModel{},
 		&RelayRequestLog{},
 		&RelaySpeechSession{},
+		&CommunityProfile{},
+		&CommunityPost{},
+		&CommunityComment{},
+		&CommunityLike{},
+		&CommunityFavorite{},
+		&CommunityMedia{},
+		&CommunityPostMedia{},
+		&CommunityAuditRecord{},
 	}
 }
 

@@ -17,8 +17,8 @@ func TestEmbeddedMigrationsAreOrderedAndChecksummed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 6 {
-		t.Fatalf("migration count = %d, want 6", len(migrations))
+	if len(migrations) != 7 {
+		t.Fatalf("migration count = %d, want 7", len(migrations))
 	}
 	for i, migration := range migrations {
 		if migration.version != int64(i+1) {
@@ -35,7 +35,7 @@ func TestRelayProviderSequenceMigrationSQL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sql := migrations[len(migrations)-1].sql
+	sql := migrations[5].sql
 	for _, fragment := range []string{
 		"CREATE SEQUENCE IF NOT EXISTS relay_providers_id_seq",
 		"SELECT MAX(id) + 1 FROM relay_providers",
@@ -47,6 +47,31 @@ func TestRelayProviderSequenceMigrationSQL(t *testing.T) {
 	} {
 		if !strings.Contains(sql, fragment) {
 			t.Fatalf("migration 0006 missing %q", fragment)
+		}
+	}
+}
+
+func TestCommunityMigrationContract(t *testing.T) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := migrations[6].sql
+	for _, fragment := range []string{
+		"pinned_post_id BIGINT",
+		"title VARCHAR(120)",
+		"owner_user_id BIGINT NOT NULL",
+		"attached_at TIMESTAMPTZ",
+		"deleted_at TIMESTAMPTZ",
+		"UNIQUE (media_id)",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0007 missing %q", fragment)
+		}
+	}
+	for _, forbidden := range []string{"sha256 VARCHAR(64) NOT NULL UNIQUE", "path TEXT NOT NULL UNIQUE", "pinned_at"} {
+		if strings.Contains(sql, forbidden) {
+			t.Fatalf("migration 0007 contains obsolete fragment %q", forbidden)
 		}
 	}
 }

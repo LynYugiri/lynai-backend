@@ -1,6 +1,6 @@
 # LynAI Backend
 
-LynAI 后端服务，提供账号认证和插件市场 API。
+LynAI 后端服务，提供账号认证、社区和插件市场 API。
 
 ## 技术栈
 
@@ -37,7 +37,7 @@ make build
 | `JWT_SECRET` | 是 | — | JWT 签名密钥，至少 32 bytes，必须使用随机值，拒绝示例或默认占位值 |
 | `ADMIN_PASSWORD` | 是 | — | 管理员账号初始密码 |
 | `PORT` | 否 | `8080` | 监听端口 |
-| `STORAGE_DIR` | 否 | `./storage` | 插件 ZIP 存储目录 |
+| `STORAGE_DIR` | 否 | `./storage` | 插件 ZIP、同步 blob 和社区图片存储根目录 |
 | `ADMIN_PHONE` | 否 | `0000000000` | 管理员手机号 |
 | `ADMIN_DISPLAY_NAME` | 否 | `管理员` | 管理员显示名 |
 | `MACHINE_ID` | 是 | — | Server 模式必需的 Snowflake 节点 ID，范围 0-1023；多实例必须各不相同。`migrate` 子命令不需要 |
@@ -216,6 +216,37 @@ curl -X POST http://localhost:8080/relay/chat \
   -d '{"api_type":"openai","model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}],"stream":true}'
 ```
 
+### 社区
+
+公开读取端点允许访客访问；未提供 `Authorization` 时按访客处理，但只要提供了无效、过期或非 access Bearer token 就返回 401。所有 ID 在 JSON 中均为十进制字符串，列表使用 `page` / `page_size`，默认 20，`page_size` 最大 50。公开响应只包含用户 ID、显示名、头像和社区简介，不返回 phone/email。
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| GET | `/community/posts` | 可选 Bearer | 公开 feed |
+| GET | `/community/posts/:id` | 可选 Bearer | 帖子详情 |
+| POST | `/community/media` | Bearer | multipart 上传一张图片，字段名 `file`，返回当前用户拥有的未附加 media |
+| POST | `/community/posts` | Bearer | JSON 创建帖子：`{title,content,mediaIds}` |
+| PATCH / DELETE | `/community/posts/:id` | Bearer | 用相同 JSON 原子编辑及重排/移除图片；作者或管理员可软删除 |
+| PUT / DELETE | `/community/me/pinned-post/:id` | Bearer | 设置 / 清除当前用户唯一的主页置顶帖子 |
+| PUT / DELETE | `/community/posts/:id/like` | Bearer | 幂等点赞 / 取消点赞 |
+| PUT / DELETE | `/community/posts/:id/favorite` | Bearer | 幂等收藏 / 取消收藏 |
+| GET | `/community/me/favorites` | Bearer | 当前用户收藏列表 |
+| GET / POST | `/community/posts/:id/comments` | 公开 / Bearer | 评论列表 / 创建 Markdown 评论 |
+| PATCH / DELETE | `/community/comments/:id` | Bearer | 评论作者可编辑；评论作者、帖子作者或管理员可软删除 |
+| GET | `/community/users/:id` | 可选 Bearer | 公开用户资料 |
+| GET | `/community/users/:id/posts` | 可选 Bearer | 用户帖子；仅此列表把该用户唯一置顶帖子排在最前 |
+| PATCH | `/community/me/profile` | Bearer | 更新账号 displayName 和社区 bio；本版本明确拒绝 `avatarMediaId` |
+| GET | `/community/media/:id` | 可选 Bearer | 已附加到可见帖子的图片公开；未附加图片仅上传者可读 |
+| GET | `/community/admin/audit` | Admin | 分页查看社区 delete/restore/purge 审计记录 |
+| POST / DELETE | `/community/admin/posts/:id/restore|purge` | Admin | 恢复 / 永久删除帖子并写审计记录 |
+| POST / DELETE | `/community/admin/comments/:id/restore|purge` | Admin | 恢复 / 永久删除评论并写审计记录 |
+
+帖子 title 最长 120 字符，正文最长 20000 字符，评论最长 4000 字符，每帖最多 9 张图片。media 只能由上传者附加，且一个 media ID 最多属于一个帖子；PATCH 在同一事务中校验所有权、替换顺序并释放移除项。每张图片净大小上限 8 MiB，仅接受实际可解码的 JPEG、PNG、WebP 或 GIF；宽高各不超过 8192，像素总数不超过 4000 万。文件按 SHA-256 保存到 `STORAGE_DIR/community/media/<hash-prefix>/<hash>.<ext>`，物理内容可复用，但每次上传仍创建独立的所有权 metadata ID。
+
+未附加到帖子的 media 仅上传者可读取，并使用 `private, no-store` 缓存策略；服务启动时及运行期间会清理超过 24 小时仍未附加的上传。已附加到可见帖子的图片使用不可变公共缓存。社区内容是服务端数据，不进入 Flutter 客户端的本地备份、云同步或局域网同步。
+
+兼容别名保留 `/community/profiles/:id`、`/community/favorites` 和 `/community/posts/:id/pin`；新客户端应使用上表 canonical 路径。全局 feed 始终只按发布时间排序，不受任何用户的主页置顶影响。管理员 purge 只接受已经软删除的目标。
+
 ### 插件市场
 
 | 方法 | 路径 | 鉴权 | 说明 |
@@ -305,11 +336,13 @@ internal/
   config/                       # 环境变量配置
   database/                     # GORM 连接 + 模型定义
   auth/                         # JWT、注册/登录/刷新、中间件
+  community/                    # 社区帖子、评论、互动、媒体和管理 JSON API
   market/                       # 市场查询、提交、审核、存储
   relay/                        # 登录用户可用的 LynAI 中转
   admin/                        # Admin Web 面板（HTML 模板）
   server/                       # 路由注册
   testutil/                     # 测试工具（SQLite 内存数据库）
+storage/community/media/        # 社区 content-addressed 图片
 storage/plugins/                # 插件 ZIP 文件存储
 ```
 

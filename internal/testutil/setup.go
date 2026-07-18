@@ -7,6 +7,7 @@ import (
 
 	"github.com/lynai/backend/internal/admin"
 	"github.com/lynai/backend/internal/auth"
+	"github.com/lynai/backend/internal/community"
 	"github.com/lynai/backend/internal/database"
 	"github.com/lynai/backend/internal/device"
 	"github.com/lynai/backend/internal/market"
@@ -77,6 +78,11 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 	authSvc := auth.NewService(db, jwtMgr, snowflake)
 	deviceSvc := device.NewService(db)
 	marketSvc := market.NewService(db, storage)
+	communityStorage, err := community.NewStorage(tmpDir)
+	if err != nil {
+		panic("community storage: " + err.Error())
+	}
+	communitySvc := community.NewService(db, communityStorage, snowflake)
 	syncSvc := sync.NewService(db, blobStorage)
 	relaySvc := relay.NewService(db)
 	endpointPolicy, err := relay.NewEndpointPolicy([]string{"localhost:11434"})
@@ -87,6 +93,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 	authHandler := auth.NewHandler(authSvc)
 	deviceHandler := device.NewHandler(deviceSvc)
 	marketHandler := market.NewHandler(marketSvc)
+	communityHandler := community.NewHandler(communitySvc)
 	syncHandler := sync.NewHandlerWithClockSkew(syncSvc, 5*time.Minute)
 	relayHandler := relay.NewHandler(relaySvc)
 
@@ -98,7 +105,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 		}
 	}
 
-	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, syncHandler, relayHandler, adminHandler)
+	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, communityHandler, syncHandler, relayHandler, adminHandler)
 	ts = NewTestServer(r)
 
 	cleanup = func() {

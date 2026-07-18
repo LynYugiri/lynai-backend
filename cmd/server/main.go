@@ -13,6 +13,7 @@ import (
 
 	"github.com/lynai/backend/internal/admin"
 	"github.com/lynai/backend/internal/auth"
+	"github.com/lynai/backend/internal/community"
 	"github.com/lynai/backend/internal/config"
 	"github.com/lynai/backend/internal/database"
 	"github.com/lynai/backend/internal/device"
@@ -101,6 +102,14 @@ func run(args []string) error {
 		return fmt.Errorf("storage: %w", err)
 	}
 	marketSvc := market.NewService(db, storage)
+	communityStorage, err := community.NewStorage(cfg.StorageDir)
+	if err != nil {
+		return fmt.Errorf("community storage: %w", err)
+	}
+	communitySvc := community.NewService(db, communityStorage, snowflake)
+	if err := communitySvc.DeleteOrphanMedia(context.Background(), time.Now().Add(-24*time.Hour)); err != nil {
+		log.Printf("community orphan media cleanup: %v", err)
+	}
 
 	blobStorage, err := sync.NewBlobStorage(cfg.StorageDir)
 	if err != nil {
@@ -128,6 +137,7 @@ func run(args []string) error {
 	authHandler := auth.NewHandler(authSvc)
 	deviceHandler := device.NewHandler(deviceSvc)
 	marketHandler := market.NewHandler(marketSvc)
+	communityHandler := community.NewHandler(communitySvc)
 	syncHandler := sync.NewHandlerWithClockSkew(syncSvc, cfg.SyncClockSkew)
 	relayHandler := relay.NewHandlerWithConfig(relaySvc, cfg.RelaySpeechSessionTTL, cfg.RelaySpeechPerUser, cfg.RelaySpeechGlobal, cfg.RelayNonStreamTimeout, cfg.RelayStreamIdleTimeout, cfg.RelayStreamMaxDuration)
 	defer relayHandler.Close()
@@ -140,7 +150,7 @@ func run(args []string) error {
 	defer adminHandler.Close()
 
 	// Server
-	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, syncHandler, relayHandler, adminHandler)
+	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, communityHandler, syncHandler, relayHandler, adminHandler)
 
 	addr := ":" + cfg.Port
 	httpServer := &http.Server{
@@ -156,6 +166,11 @@ func run(args []string) error {
 	defer stop()
 	go syncSvc.RunCleanup(ctx, time.Hour, time.Hour, func(err error) {
 		log.Printf("sync cleanup: %v", err)
+	})
+	go runPeriodicCleanup(ctx, time.Hour, func(now time.Time) error {
+		return communitySvc.DeleteOrphanMedia(ctx, now.Add(-24*time.Hour))
+	}, func(err error) {
+		log.Printf("community orphan media cleanup: %v", err)
 	})
 	go runSessionCleanup(ctx, cfg.SessionCleanupInterval, func(now time.Time) error {
 		if err := authSvc.DeleteExpiredSessions(now); err != nil {
@@ -207,6 +222,26 @@ func runSessionCleanup(ctx context.Context, interval time.Duration, cleanup func
 		case now := <-ticker.C:
 			if err := cleanup(now); err != nil {
 				log.Printf("session cleanup: %v", err)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func runPeriodicCleanup(
+	ctx context.Context,
+	interval time.Duration,
+	cleanup func(time.Time) error,
+	onError func(error),
+) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			if err := cleanup(now); err != nil {
+				onError(err)
 			}
 		case <-ctx.Done():
 			return
