@@ -167,13 +167,16 @@ func TestAdminPanelRelayProviderManage(t *testing.T) {
 	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
 	csrf := extractCSRF(t, body)
 	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
-		"_csrf":     {csrf},
-		"name":      {"OpenAI Test"},
-		"endpoint":  {"https://api.example.com/v1"},
-		"apiFormat": {"openai"},
-		"apiKey":    {"secret-key"},
-		"models":    {"gpt-test\ngpt-other"},
-		"enabled":   {"on"},
+		"_csrf":          {csrf},
+		"name":           {"OpenAI Test"},
+		"endpoint":       {"https://api.example.com/v1"},
+		"apiFormat":      {"openai"},
+		"apiKey":         {"secret-key"},
+		"modelId":        {"gpt-test", "gpt-other"},
+		"category":       {"chat", "chat"},
+		"modelEnabled_0": {"on"},
+		"modelEnabled_1": {"on"},
+		"enabled":        {"on"},
 	})
 	body = getAdminPage(t, client, ts.URL+"/admin/relay")
 	if !strings.Contains(body, "OpenAI Test") || !strings.Contains(body, "gpt-test") || !strings.Contains(body, "openai") {

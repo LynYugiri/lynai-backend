@@ -2,6 +2,7 @@ package database_test
 
 import (
 	"context"
+	"reflect"
 	"sync"
 	"testing"
 
@@ -28,8 +29,8 @@ func TestPostgresEmbeddedMigrationsAndValidation(t *testing.T) {
 	if err := db.Table("schema_migrations").Count(&count).Error; err != nil {
 		t.Fatalf("count applied migrations: %v", err)
 	}
-	if count != 7 {
-		t.Fatalf("applied migration count = %d, want 7", count)
+	if count != 8 {
+		t.Fatalf("applied migration count = %d, want 8", count)
 	}
 	for _, index := range []string{"idx_user_devices_device_id_global", "idx_user_devices_public_key_global"} {
 		var exists bool
@@ -68,7 +69,8 @@ func TestPostgresRelayProviderSequenceAdvancesPastExistingRows(t *testing.T) {
 	)`).Error; err != nil {
 		t.Fatalf("create legacy relay_providers: %v", err)
 	}
-	if err := db.Exec("INSERT INTO relay_providers (id, name, endpoint, api_key, api_format) VALUES (41, 'legacy', 'https://example.com', 'key', 'openai')").Error; err != nil {
+	if err := db.Exec(`INSERT INTO relay_providers (id, name, endpoint, api_key, api_format, models)
+		VALUES (41, 'legacy', 'https://example.com', 'key', 'openai', '["legacy-a", "legacy-b"]')`).Error; err != nil {
 		t.Fatalf("insert legacy provider: %v", err)
 	}
 	if err := database.Migrate(ctx, db); err != nil {
@@ -80,6 +82,99 @@ func TestPostgresRelayProviderSequenceAdvancesPastExistingRows(t *testing.T) {
 	}
 	if id != 42 {
 		t.Fatalf("generated relay provider ID = %d, want 42", id)
+	}
+	var models []string
+	if err := db.Raw("SELECT model_id FROM relay_models WHERE provider_id = 41 ORDER BY model_id").Scan(&models).Error; err != nil {
+		t.Fatalf("list expanded relay models: %v", err)
+	}
+	if len(models) != 2 || models[0] != "legacy-a" || models[1] != "legacy-b" {
+		t.Fatalf("expanded relay models = %#v", models)
+	}
+	var modelsColumnExists bool
+	if err := db.Raw(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'relay_providers' AND column_name = 'models'
+	)`).Scan(&modelsColumnExists).Error; err != nil {
+		t.Fatalf("check relay_providers.models: %v", err)
+	}
+	if modelsColumnExists {
+		t.Fatal("relay_providers.models still exists after migration")
+	}
+}
+
+func TestPostgresRelayModelsMigrationRejectsInvalidJSONAndRollsBack(t *testing.T) {
+	db := pgtest.Open(t)
+	ctx := context.Background()
+	if err := db.Exec(`CREATE TABLE relay_providers (
+		id BIGINT PRIMARY KEY,
+		name TEXT NOT NULL,
+		endpoint TEXT NOT NULL,
+		api_key TEXT NOT NULL,
+		api_format TEXT NOT NULL,
+		config TEXT,
+		models TEXT,
+		enabled BOOLEAN DEFAULT TRUE,
+		created_at TIMESTAMPTZ,
+		updated_at TIMESTAMPTZ
+	)`).Error; err != nil {
+		t.Fatalf("create legacy relay_providers: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO relay_providers (id, name, endpoint, api_key, api_format, models)
+		VALUES (1, 'invalid', 'https://example.com', 'key', 'openai', '["valid", 2]')`).Error; err != nil {
+		t.Fatalf("insert invalid legacy provider: %v", err)
+	}
+	if err := database.Migrate(ctx, db); err == nil {
+		t.Fatal("migration accepted a non-string legacy model")
+	}
+	var modelsColumnExists bool
+	if err := db.Raw(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'relay_providers' AND column_name = 'models'
+	)`).Scan(&modelsColumnExists).Error; err != nil {
+		t.Fatalf("check relay_providers.models: %v", err)
+	}
+	if !modelsColumnExists {
+		t.Fatal("failed migration did not roll back relay_providers.models")
+	}
+	var migrationCount int64
+	if err := db.Table("schema_migrations").Where("version = ?", 8).Count(&migrationCount).Error; err != nil {
+		t.Fatalf("count migration 0008: %v", err)
+	}
+	if migrationCount != 0 {
+		t.Fatalf("migration 0008 record count = %d, want 0", migrationCount)
+	}
+}
+
+func TestPostgresRelayModelsMigrationTrimsDeduplicatesAndSkipsBlankIDs(t *testing.T) {
+	db := pgtest.Open(t)
+	ctx := context.Background()
+	if err := db.Exec(`CREATE TABLE relay_providers (
+		id BIGINT PRIMARY KEY,
+		name TEXT NOT NULL,
+		endpoint TEXT NOT NULL,
+		api_key TEXT NOT NULL,
+		api_format TEXT NOT NULL,
+		config TEXT,
+		models TEXT,
+		enabled BOOLEAN DEFAULT TRUE,
+		created_at TIMESTAMPTZ,
+		updated_at TIMESTAMPTZ
+	)`).Error; err != nil {
+		t.Fatalf("create legacy relay_providers: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO relay_providers (id, name, endpoint, api_key, api_format, models)
+		VALUES (1, 'legacy', 'https://example.com', 'key', 'openai', '[" model-a ", "model-a", "   ", "model-b"]')`).Error; err != nil {
+		t.Fatalf("insert legacy provider: %v", err)
+	}
+	if err := database.Migrate(ctx, db); err != nil {
+		t.Fatalf("migrate whitespace model IDs: %v", err)
+	}
+	var models []string
+	if err := db.Raw("SELECT model_id FROM relay_models WHERE provider_id = 1 ORDER BY model_id").Scan(&models).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(models, []string{"model-a", "model-b"}) {
+		t.Fatalf("normalized models = %#v", models)
 	}
 }
 

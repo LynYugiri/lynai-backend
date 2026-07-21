@@ -160,19 +160,7 @@ func Setup(
 		relayAuth := r.Group("/relay")
 		relayAuth.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()), relayHandler.LoggingMiddleware())
 		{
-			relayAuth.GET("/v2/config", relayHandler.ConfigV2)
-			relayAuth.POST("/v2/chat", relayHandler.ChatV2)
-			relayAuth.POST("/v2/transcribe", relayHandler.Transcribe)
-			relayAuth.POST("/v2/ocr", relayHandler.OCR)
-			relayAuth.POST("/v2/speech/create", relayHandler.SpeechCreate)
-			relayAuth.POST("/v2/speech/:audioId/upload", relayHandler.SpeechUpload)
-			relayAuth.POST("/v2/speech/:audioId/run", relayHandler.SpeechRun)
-			relayAuth.GET("/v2/speech/:audioId/progress", relayHandler.SpeechProgress)
-			relayAuth.GET("/v2/speech/:audioId/result", relayHandler.SpeechResult)
-			relayAuth.POST("/v2/images/generations", relayHandler.ImageGenerations)
 			relayAuth.POST("/chat", relayHandler.Chat)
-			relayAuth.POST("/messages", relayHandler.Messages)
-			relayAuth.POST("/api/chat", relayHandler.OllamaChat)
 			relayAuth.POST("/transcribe", relayHandler.Transcribe)
 			relayAuth.POST("/ocr", relayHandler.OCR)
 			relayAuth.POST("/speech/create", relayHandler.SpeechCreate)
@@ -181,7 +169,6 @@ func Setup(
 			relayAuth.GET("/speech/:audioId/progress", relayHandler.SpeechProgress)
 			relayAuth.GET("/speech/:audioId/result", relayHandler.SpeechResult)
 			relayAuth.POST("/images/generations", relayHandler.ImageGenerations)
-			relayAuth.GET("/models", relayHandler.Models)
 			relayAuth.GET("/config", relayHandler.Config)
 		}
 	}

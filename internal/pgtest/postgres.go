@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/lynai/backend/internal/database"
 	"gorm.io/gorm"
 )
@@ -41,14 +43,13 @@ func Open(t *testing.T) *gorm.DB {
 		t.Fatalf("create PostgreSQL test schema: %v", err)
 	}
 
-	config, err := pgx.ParseConfig(dsn)
+	scopedDSN, err := withSearchPath(dsn, schema)
 	if err != nil {
 		_ = admin.Exec("DROP SCHEMA " + schema + " CASCADE").Error
 		_ = adminSQL.Close()
-		t.Fatalf("parse TEST_POSTGRES_DSN: %v", err)
+		t.Fatalf("scope TEST_POSTGRES_DSN: %v", err)
 	}
-	config.RuntimeParams["search_path"] = schema
-	db, err := database.Connect(config.ConnString())
+	db, err := database.Connect(scopedDSN)
 	if err != nil {
 		_ = admin.Exec("DROP SCHEMA " + schema + " CASCADE").Error
 		_ = adminSQL.Close()
@@ -69,4 +70,18 @@ func Open(t *testing.T) *gorm.DB {
 		_ = adminSQL.Close()
 	})
 	return db
+}
+
+func withSearchPath(dsn, schema string) (string, error) {
+	if strings.Contains(dsn, "://") {
+		parsed, err := url.Parse(dsn)
+		if err != nil {
+			return "", err
+		}
+		query := parsed.Query()
+		query.Set("search_path", schema)
+		parsed.RawQuery = query.Encode()
+		return parsed.String(), nil
+	}
+	return dsn + " search_path=" + fmt.Sprintf("%q", schema), nil
 }

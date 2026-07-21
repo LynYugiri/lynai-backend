@@ -17,8 +17,8 @@ func TestEmbeddedMigrationsAreOrderedAndChecksummed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 7 {
-		t.Fatalf("migration count = %d, want 7", len(migrations))
+	if len(migrations) != 8 {
+		t.Fatalf("migration count = %d, want 8", len(migrations))
 	}
 	for i, migration := range migrations {
 		if migration.version != int64(i+1) {
@@ -72,6 +72,27 @@ func TestCommunityMigrationContract(t *testing.T) {
 	for _, forbidden := range []string{"sha256 VARCHAR(64) NOT NULL UNIQUE", "path TEXT NOT NULL UNIQUE", "pinned_at"} {
 		if strings.Contains(sql, forbidden) {
 			t.Fatalf("migration 0007 contains obsolete fragment %q", forbidden)
+		}
+	}
+}
+
+func TestRelayModelsMigrationValidatesBeforeDroppingLegacyColumn(t *testing.T) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := migrations[7].sql
+	for _, fragment := range []string{
+		"parsed_models := provider.models::jsonb",
+		"must be valid JSON",
+		"jsonb_typeof(parsed_models) <> 'array'",
+		"jsonb_typeof(element) <> 'string'",
+		"BTRIM(model.model_id)",
+		"relay model expansion verification failed",
+		"ALTER TABLE relay_providers DROP COLUMN models",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0008 missing %q", fragment)
 		}
 	}
 }

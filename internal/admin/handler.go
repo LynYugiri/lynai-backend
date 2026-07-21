@@ -3,7 +3,6 @@ package admin
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"html/template"
 	"net/http"
@@ -565,7 +564,6 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 		return
 	}
 	if err := h.db.Transaction(func(tx *gorm.DB) error {
-		provider.Models = ""
 		if err := tx.Save(&provider).Error; err != nil {
 			return err
 		}
@@ -616,61 +614,31 @@ func (h *Handler) loadRelayProvider(c *gin.Context) (database.RelayProvider, boo
 	return provider, true
 }
 
-func relayModelsJSON(text string) (string, error) {
-	lines := strings.Split(text, "\n")
-	models := make([]string, 0, len(lines))
-	seen := map[string]struct{}{}
-	for _, line := range lines {
-		model := strings.TrimSpace(line)
-		if model == "" {
-			continue
-		}
-		if _, ok := seen[model]; ok {
-			continue
-		}
-		seen[model] = struct{}{}
-		models = append(models, model)
-	}
-	raw, err := json.Marshal(models)
-	return string(raw), err
-}
-
 func relayModelRowsFromProvider(provider database.RelayProvider) ([]relayModelFormRow, error) {
-	if len(provider.Entries) > 0 {
-		rows := make([]relayModelFormRow, 0, len(provider.Entries))
-		for i, entry := range provider.Entries {
-			cap := relay.DecodeCapabilities(entry.Capabilities)
-			params := relay.DecodeAdvancedParams(entry.AdvancedParams)
-			rows = append(rows, relayModelFormRow{
-				Index:            i,
-				ModelID:          entry.ModelID,
-				DisplayName:      entry.DisplayName,
-				Description:      entry.Description,
-				Category:         relay.NormalizeCategory(entry.Category),
-				SupportsVision:   cap.Vision,
-				SupportsThinking: cap.Thinking,
-				SupportsTools:    cap.Tools,
-				MaxTokens:        intPtrString(params.MaxTokens),
-				Temperature:      floatPtrString(params.Temperature),
-				TopP:             floatPtrString(params.TopP),
-				PresencePenalty:  floatPtrString(params.PresencePenalty),
-				FrequencyPenalty: floatPtrString(params.FrequencyPenalty),
-				Seed:             intPtrString(params.Seed),
-				Stop:             strings.Join(params.Stop, "\n"),
-				User:             stringPtrString(params.User),
-				DebugSSE:         params.DebugSSE,
-				Enabled:          entry.Enabled,
-			})
-		}
-		return rows, nil
-	}
-	models, err := relay.DecodeModels(provider.Models)
-	if err != nil {
-		return nil, err
-	}
-	rows := make([]relayModelFormRow, 0, len(models))
-	for i, model := range models {
-		rows = append(rows, relayModelFormRow{Index: i, ModelID: model, Category: relay.CategoryChat, Enabled: true})
+	rows := make([]relayModelFormRow, 0, len(provider.Entries))
+	for i, entry := range provider.Entries {
+		cap := relay.DecodeCapabilities(entry.Capabilities)
+		params := relay.DecodeAdvancedParams(entry.AdvancedParams)
+		rows = append(rows, relayModelFormRow{
+			Index:            i,
+			ModelID:          entry.ModelID,
+			DisplayName:      entry.DisplayName,
+			Description:      entry.Description,
+			Category:         relay.NormalizeCategory(entry.Category),
+			SupportsVision:   cap.Vision,
+			SupportsThinking: cap.Thinking,
+			SupportsTools:    cap.Tools,
+			MaxTokens:        intPtrString(params.MaxTokens),
+			Temperature:      floatPtrString(params.Temperature),
+			TopP:             floatPtrString(params.TopP),
+			PresencePenalty:  floatPtrString(params.PresencePenalty),
+			FrequencyPenalty: floatPtrString(params.FrequencyPenalty),
+			Seed:             intPtrString(params.Seed),
+			Stop:             strings.Join(params.Stop, "\n"),
+			User:             stringPtrString(params.User),
+			DebugSSE:         params.DebugSSE,
+			Enabled:          entry.Enabled,
+		})
 	}
 	return rows, nil
 }
@@ -688,17 +656,6 @@ func defaultRelayModelRows(rows []relayModelFormRow) []relayModelFormRow {
 
 func parseRelayModelForm(c *gin.Context) ([]database.RelayModel, error) {
 	ids := c.PostFormArray("modelId")
-	if len(ids) == 0 && strings.TrimSpace(c.PostForm("models")) != "" {
-		legacy, err := relay.DecodeModels(mustRelayModelsJSON(c.PostForm("models")))
-		if err != nil {
-			return nil, err
-		}
-		models := make([]database.RelayModel, 0, len(legacy))
-		for _, model := range legacy {
-			models = append(models, database.RelayModel{ModelID: model, Category: relay.CategoryChat, Capabilities: relay.EncodeCapabilities(relay.ModelCapabilities{}), AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}), Enabled: true})
-		}
-		return models, nil
-	}
 	models := make([]database.RelayModel, 0, len(ids))
 	seen := map[string]struct{}{}
 	for i, id := range ids {
@@ -727,18 +684,7 @@ func parseRelayModelForm(c *gin.Context) ([]database.RelayModel, error) {
 	return models, nil
 }
 
-func mustRelayModelsJSON(text string) string {
-	raw, err := relayModelsJSON(text)
-	if err != nil {
-		return "[]"
-	}
-	return raw
-}
-
 func replaceRelayModelsTx(tx *gorm.DB, providerID int64, models []database.RelayModel) error {
-	if err := tx.Model(&database.RelayProvider{}).Where("id = ?", providerID).Update("models", "").Error; err != nil {
-		return err
-	}
 	if err := tx.Where("provider_id = ?", providerID).Delete(&database.RelayModel{}).Error; err != nil {
 		return err
 	}

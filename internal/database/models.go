@@ -167,14 +167,12 @@ type SyncBlob struct {
 
 // RelayProvider stores an admin-managed upstream provider for LynAI relay.
 type RelayProvider struct {
-	ID        int64  `gorm:"primaryKey" json:"id,string"`
-	Name      string `gorm:"not null" json:"name"`
-	Endpoint  string `gorm:"not null" json:"endpoint"`
-	APIKey    string `gorm:"not null" json:"-"`
-	APIFormat string `gorm:"not null;index" json:"apiFormat"`
-	Config    string `gorm:"type:text" json:"-"`
-	// Models is kept only for migrating legacy newline/JSON model lists into RelayModel rows.
-	Models    string       `gorm:"type:text" json:"-"`
+	ID        int64        `gorm:"primaryKey" json:"id,string"`
+	Name      string       `gorm:"not null" json:"name"`
+	Endpoint  string       `gorm:"not null" json:"endpoint"`
+	APIKey    string       `gorm:"not null" json:"-"`
+	APIFormat string       `gorm:"not null;index" json:"apiFormat"`
+	Config    string       `gorm:"type:text" json:"-"`
 	Enabled   bool         `gorm:"default:true;index" json:"enabled"`
 	Entries   []RelayModel `gorm:"foreignKey:ProviderID;constraint:OnDelete:CASCADE" json:"entries"`
 	CreatedAt time.Time    `json:"createdAt"`
