@@ -147,6 +147,13 @@ func Setup(
 	syncAuth.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()))
 	{
 		syncAuth.GET("/status", syncHandler.Status)
+		syncAuth.GET("/index/status", syncHandler.Status)
+		syncAuth.GET("/index/objects", syncHandler.IndexObjects)
+		syncAuth.GET("/index/objects/:category/:objectId", syncHandler.IndexObject)
+		syncAuth.POST("/manage/purge/preview", syncHandler.PurgePreview)
+		syncAuth.POST("/manage/purge", syncHandler.Purge)
+		syncAuth.GET("/manage/operations", syncHandler.PendingOperations)
+		syncAuth.POST("/manage/operations/:id/ack", syncHandler.AckOperation)
 		syncAuth.POST("/changes", syncHandler.UploadChanges)
 		syncAuth.POST("/v1/changes", syncHandler.UploadChanges)
 		syncAuth.GET("/changes", syncHandler.GetChanges)

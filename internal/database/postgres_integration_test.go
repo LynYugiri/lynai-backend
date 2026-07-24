@@ -29,8 +29,8 @@ func TestPostgresEmbeddedMigrationsAndValidation(t *testing.T) {
 	if err := db.Table("schema_migrations").Count(&count).Error; err != nil {
 		t.Fatalf("count applied migrations: %v", err)
 	}
-	if count != 8 {
-		t.Fatalf("applied migration count = %d, want 8", count)
+	if count != 10 {
+		t.Fatalf("applied migration count = %d, want 10", count)
 	}
 	for _, index := range []string{"idx_user_devices_device_id_global", "idx_user_devices_public_key_global"} {
 		var exists bool
@@ -48,6 +48,43 @@ func TestPostgresEmbeddedMigrationsAndValidation(t *testing.T) {
 		}
 		if !exists {
 			t.Errorf("embedded migrations did not create table %s", table)
+		}
+	}
+	for _, table := range []string{"sync_records", "sync_record_blobs", "sync_management_operations"} {
+		var exists bool
+		if err := db.Raw("SELECT to_regclass(?) IS NOT NULL", table).Scan(&exists).Error; err != nil {
+			t.Fatalf("look up table %s: %v", table, err)
+		}
+		if !exists {
+			t.Errorf("embedded migrations did not create table %s", table)
+		}
+	}
+}
+
+func TestPostgresSyncProjectionMigrationClearsLegacySyncState(t *testing.T) {
+	db := pgtest.Open(t)
+	ctx := context.Background()
+	if err := database.MigrateToForTest(ctx, db, 8); err != nil {
+		t.Fatalf("apply migrations through 0008: %v", err)
+	}
+	if err := db.Exec(`INSERT INTO sync_metadata (user_id, last_seq, updated_at) VALUES (42, 1, NOW());
+		INSERT INTO sync_changes (user_id, seq, table_name, op, record_id, data, created_at, change_id, client_created_at)
+		VALUES (42, 1, 'notes', 'upsert', 'note-1', '{"id":"note-1"}', NOW(), 'legacy-change', NOW());
+		INSERT INTO sync_blobs (user_id, sha256, size, created_at) VALUES (42, repeat('a', 64), 1, NOW());
+		INSERT INTO sync_request_replays (user_id, request_id, operation, body_hash, response_status, response_content_type, response_body, created_at, expires_at)
+		VALUES (42, repeat('A', 32), 'POST /sync/changes', decode(repeat('00', 32), 'hex'), 200, 'application/json', '{}'::bytea, NOW(), NOW() + interval '1 hour')`).Error; err != nil {
+		t.Fatalf("seed legacy sync state: %v", err)
+	}
+	if err := database.Migrate(ctx, db); err != nil {
+		t.Fatalf("apply sync projection migrations: %v", err)
+	}
+	for _, table := range []string{"sync_metadata", "sync_changes", "sync_blobs", "sync_request_replays", "sync_records"} {
+		var count int64
+		if err := db.Table(table).Count(&count).Error; err != nil {
+			t.Fatalf("count %s: %v", table, err)
+		}
+		if count != 0 {
+			t.Fatalf("%s count = %d, want 0", table, count)
 		}
 	}
 }

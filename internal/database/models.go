@@ -122,9 +122,12 @@ type PluginPermission struct {
 
 // SyncMetadata holds the per-user sync sequence counter.
 type SyncMetadata struct {
-	UserID    int64     `gorm:"primaryKey" json:"userId,string"`
-	LastSeq   int64     `gorm:"not null;default:0" json:"lastSeq"`
-	UpdatedAt time.Time `gorm:"not null" json:"updatedAt"`
+	UserID          int64     `gorm:"primaryKey" json:"userId,string"`
+	LastSeq         int64     `gorm:"not null;default:0" json:"lastSeq"`
+	Generation      int64     `gorm:"not null;default:1" json:"generation"`
+	IndexRevision   int64     `gorm:"not null;default:0" json:"indexRevision"`
+	MinAvailableSeq int64     `gorm:"not null;default:0" json:"minAvailableSeq"`
+	UpdatedAt       time.Time `gorm:"not null" json:"updatedAt"`
 }
 
 // SyncChange is a single change record in the incremental sync log.
@@ -142,11 +145,32 @@ type SyncChange struct {
 	CreatedAt       time.Time `gorm:"not null" json:"createdAt"`
 }
 
+// SyncRecord is the current materialized value of one sync record.
+type SyncRecord struct {
+	UserID    int64     `gorm:"primaryKey;autoIncrement:false;index:idx_sync_records_user_seq,priority:1" json:"userId,string"`
+	TableName string    `gorm:"primaryKey" json:"table"`
+	RecordID  string    `gorm:"primaryKey" json:"recordId"`
+	Category  string    `gorm:"not null;index:idx_sync_records_user_category_object,priority:2" json:"category"`
+	ObjectID  string    `gorm:"not null;index:idx_sync_records_user_category_object,priority:3" json:"objectId"`
+	Data      string    `gorm:"not null;type:jsonb" json:"data"`
+	Seq       int64     `gorm:"not null;index:idx_sync_records_user_seq,priority:2" json:"seq"`
+	UpdatedAt time.Time `gorm:"not null" json:"updatedAt"`
+}
+
+// SyncRecordBlob is a blob referenced by a current sync record.
+type SyncRecordBlob struct {
+	UserID    int64  `gorm:"primaryKey;autoIncrement:false;index:idx_sync_record_blobs_user_sha256,priority:1" json:"userId,string"`
+	TableName string `gorm:"primaryKey" json:"table"`
+	RecordID  string `gorm:"primaryKey" json:"recordId"`
+	SHA256    string `gorm:"primaryKey;size:64;index:idx_sync_record_blobs_user_sha256,priority:2" json:"sha256"`
+}
+
 // SyncRequestReplay stores the exact committed response for a sync request ID.
 type SyncRequestReplay struct {
 	ID                  int64     `gorm:"primaryKey;autoIncrement" json:"-"`
 	UserID              int64     `gorm:"not null;uniqueIndex:idx_sync_request_replays_user_request" json:"userId,string"`
 	RequestID           string    `gorm:"not null;size:32;uniqueIndex:idx_sync_request_replays_user_request" json:"requestId"`
+	Generation          int64     `gorm:"not null;default:1" json:"generation"`
 	Operation           string    `gorm:"not null;size:128" json:"operation"`
 	BodyHash            []byte    `gorm:"not null;size:32" json:"-"`
 	ResponseStatus      int       `gorm:"not null" json:"responseStatus"`
@@ -154,6 +178,26 @@ type SyncRequestReplay struct {
 	ResponseBody        []byte    `gorm:"not null" json:"-"`
 	CreatedAt           time.Time `gorm:"not null" json:"createdAt"`
 	ExpiresAt           time.Time `gorm:"not null;index" json:"expiresAt"`
+}
+
+// SyncManagementOperation tells clients which cloud scope must be reseeded.
+type SyncManagementOperation struct {
+	ID                     string     `gorm:"primaryKey;size:32" json:"id"`
+	UserID                 int64      `gorm:"not null;index:idx_sync_management_operations_user_pending,priority:1" json:"userId,string"`
+	Kind                   string     `gorm:"not null;size:16" json:"kind"`
+	SelectorType           string     `gorm:"not null;size:16" json:"selectorType"`
+	Category               *string    `json:"category,omitempty"`
+	ObjectID               *string    `json:"objectId,omitempty"`
+	Generation             int64      `gorm:"not null" json:"generation"`
+	IndexRevision          int64      `gorm:"not null" json:"indexRevision"`
+	ReleasedBlobCandidates int64      `gorm:"not null;default:0" json:"releasedBlobCandidates"`
+	DeletedRecordCount     int64      `gorm:"not null;default:0" json:"deletedRecordCount"`
+	DeletedChangeCount     int64      `gorm:"not null;default:0" json:"deletedChangeCount"`
+	Status                 string     `gorm:"not null;size:16;index:idx_sync_management_operations_user_pending,priority:2" json:"status"`
+	CreatedByDeviceID      string     `gorm:"not null;size:52" json:"createdByDeviceId"`
+	CreatedAt              time.Time  `gorm:"not null;index:idx_sync_management_operations_user_pending,priority:3" json:"createdAt"`
+	AckedByDeviceID        *string    `gorm:"size:52" json:"ackedByDeviceId,omitempty"`
+	AckedAt                *time.Time `json:"ackedAt,omitempty"`
 }
 
 // SyncBlob tracks which binary blobs a user has uploaded.
@@ -323,7 +367,10 @@ func AllModels() []interface{} {
 		&PluginPermission{},
 		&SyncMetadata{},
 		&SyncChange{},
+		&SyncRecord{},
+		&SyncRecordBlob{},
 		&SyncRequestReplay{},
+		&SyncManagementOperation{},
 		&SyncBlob{},
 		&RelayProvider{},
 		&RelayModel{},

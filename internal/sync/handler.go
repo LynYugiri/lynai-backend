@@ -46,8 +46,9 @@ func (h *Handler) Status(c *gin.Context) {
 }
 
 type uploadChangesRequest struct {
-	RequestID string          `json:"requestId,omitempty"`
-	Changes   *[]ChangeRecord `json:"changes"`
+	RequestID          string          `json:"requestId,omitempty"`
+	ExpectedGeneration int64           `json:"expectedGeneration"`
+	Changes            *[]ChangeRecord `json:"changes"`
 }
 
 // UploadChanges handles POST /sync/changes.
@@ -81,19 +82,38 @@ func (h *Handler) UploadChanges(c *gin.Context) {
 	digest := sha256.Sum256(body)
 	signed, err := verifySignedRequest(h.svc.db, syncHeaders(c), userID, c.GetString("sessionID"), c.Request.Method, c.FullPath(), digest[:], h.now(), h.clockSkew)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		writeSigningError(c, err)
 		return
 	}
 	if req.RequestID != signed.RequestID {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body requestId does not match signed request ID"})
 		return
 	}
-	response, err := h.svc.UploadChangesIdempotent(userID, signed.RequestID, signed.BodyHash, c.Request.Method+" "+c.FullPath(), signed.DeviceID, *req.Changes)
+	if req.ExpectedGeneration != signed.ExpectedGeneration {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body expectedGeneration does not match signed header"})
+		return
+	}
+	response, err := h.svc.UploadChangesIdempotent(userID, signed.RequestID, signed.BodyHash, c.Request.Method+" "+c.FullPath(), signed.DeviceID, signed.ExpectedGeneration, *req.Changes)
 	if err != nil {
 		writeUploadError(c, err)
 		return
 	}
 	c.Data(response.Status, response.ContentType, response.Body)
+}
+
+func writeSigningError(c *gin.Context, err error) {
+	code := "invalid_signed_request"
+	switch {
+	case errors.Is(err, ErrSignatureRequired):
+		code = "signature_required"
+	case errors.Is(err, ErrUnknownDevice):
+		code = "unknown_device"
+	case errors.Is(err, ErrRevokedDevice):
+		code = "revoked_device"
+	case errors.Is(err, ErrDeviceSessionMismatch):
+		code = "device_session_mismatch"
+	}
+	c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error(), "code": code})
 }
 
 func rejectTrailingJSON(decoder *json.Decoder) error {
@@ -112,6 +132,7 @@ func syncHeaders(c *gin.Context) map[string]string {
 		"protocol": c.GetHeader("X-LynAI-Protocol"), "deviceID": c.GetHeader("X-LynAI-Device-ID"),
 		"timestamp": c.GetHeader("X-LynAI-Timestamp"), "requestID": c.GetHeader("X-LynAI-Request-ID"),
 		"bodyHash": c.GetHeader("X-LynAI-Body-SHA256"), "signature": c.GetHeader("X-LynAI-Signature"),
+		"expectedGeneration": c.GetHeader("X-LynAI-Expected-Generation"),
 	}
 }
 
@@ -121,6 +142,8 @@ func writeUploadError(c *gin.Context, err error) {
 		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
 	case errors.Is(err, ErrInvalidChange):
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	case errors.Is(err, ErrGenerationConflict):
+		writeGenerationConflict(c, err)
 	case errors.Is(err, ErrChangeConflict), errors.Is(err, ErrReplayConflict):
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 	default:
@@ -131,6 +154,10 @@ func writeUploadError(c *gin.Context, err error) {
 // GetChanges handles GET /sync/changes?since={seq}.
 func (h *Handler) GetChanges(c *gin.Context) {
 	userID := getUserID(c)
+	expectedGeneration, ok := parseExpectedGeneration(c)
+	if !ok {
+		return
+	}
 	sinceStr := c.DefaultQuery("since", "0")
 	since, err := strconv.ParseInt(sinceStr, 10, 64)
 	if err != nil || since < 0 {
@@ -147,27 +174,30 @@ func (h *Handler) GetChanges(c *gin.Context) {
 		limit = value
 	}
 
-	changes, hasMore, err := h.svc.GetChanges(userID, since, limit)
+	page, err := h.svc.GetChangesPage(userID, since, limit)
 	if err != nil {
+		if errors.Is(err, ErrFutureCursor) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "future_cursor", "generation": page.Generation, "currentGeneration": page.Generation, "latestSeq": page.GlobalLatestSeq})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
-
-	globalLatestSeq, err := h.svc.GetLatestSeq(userID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+	if expectedGeneration > 0 && page.Generation != expectedGeneration {
+		writeGenerationConflict(c, generationConflictError{Expected: expectedGeneration, Current: page.Generation})
 		return
 	}
 	nextSince := since
-	if len(changes) > 0 {
-		nextSince = changes[len(changes)-1].Seq
+	if len(page.Changes) > 0 {
+		nextSince = page.Changes[len(page.Changes)-1].Seq
 	}
 	response := gin.H{
-		"changes":         changes,
+		"changes":         page.Changes,
 		"latestSeq":       nextSince,
-		"globalLatestSeq": globalLatestSeq,
+		"globalLatestSeq": page.GlobalLatestSeq,
+		"generation":      page.Generation,
 	}
-	response["hasMore"] = hasMore
+	response["hasMore"] = page.HasMore
 	response["nextSince"] = nextSince
 	c.JSON(http.StatusOK, response)
 }
@@ -175,6 +205,9 @@ func (h *Handler) GetChanges(c *gin.Context) {
 // ListBlobs handles GET /sync/blobs.
 func (h *Handler) ListBlobs(c *gin.Context) {
 	userID := getUserID(c)
+	if !h.requireExpectedGeneration(c, userID) {
+		return
+	}
 	after, err := strconv.ParseUint(c.DefaultQuery("after", "0"), 10, 64)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid after parameter"})
@@ -212,11 +245,15 @@ func (h *Handler) UploadBlob(c *gin.Context) {
 	digest, _ := hex.DecodeString(sha256)
 	signed, err := verifySignedRequest(h.svc.db, syncHeaders(c), userID, c.GetString("sessionID"), c.Request.Method, c.FullPath(), digest, h.now(), h.clockSkew)
 	if err != nil {
-		c.JSON(http.StatusUnauthorized, gin.H{"error": err.Error()})
+		writeSigningError(c, err)
 		return
 	}
 	operation := c.Request.Method + " " + c.FullPath()
-	if replay, found, err := h.svc.CheckReplay(userID, signed.RequestID, signed.BodyHash, operation); err != nil {
+	if replay, found, err := h.svc.CheckReplay(userID, signed.RequestID, signed.BodyHash, operation, signed.ExpectedGeneration); err != nil {
+		if errors.Is(err, ErrGenerationConflict) {
+			writeGenerationConflict(c, err)
+			return
+		}
 		if errors.Is(err, ErrReplayConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
@@ -243,8 +280,12 @@ func (h *Handler) UploadBlob(c *gin.Context) {
 		return
 	}
 	defer prepared.Close()
-	response, err := h.svc.SavePreparedBlobIdempotent(userID, prepared, signed.RequestID, signed.BodyHash, operation)
+	response, err := h.svc.SavePreparedBlobIdempotent(userID, prepared, signed.RequestID, signed.BodyHash, operation, signed.ExpectedGeneration)
 	if err != nil {
+		if errors.Is(err, ErrGenerationConflict) {
+			writeGenerationConflict(c, err)
+			return
+		}
 		if errors.Is(err, ErrReplayConflict) {
 			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
 			return
@@ -258,6 +299,9 @@ func (h *Handler) UploadBlob(c *gin.Context) {
 // DownloadBlob handles GET /sync/blobs/:sha256.
 func (h *Handler) DownloadBlob(c *gin.Context) {
 	userID := getUserID(c)
+	if !h.requireExpectedGeneration(c, userID) {
+		return
+	}
 	sha256 := c.Param("sha256")
 	if !sha256Pattern.MatchString(sha256) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid sha256 parameter"})
@@ -270,6 +314,39 @@ func (h *Handler) DownloadBlob(c *gin.Context) {
 		return
 	}
 	c.Data(http.StatusOK, "application/octet-stream", data)
+}
+
+func parseExpectedGeneration(c *gin.Context) (int64, bool) {
+	raw := c.GetHeader("X-LynAI-Expected-Generation")
+	if raw == "" {
+		return 0, true
+	}
+	generation, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || generation < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid expected generation"})
+		return 0, false
+	}
+	return generation, true
+}
+
+func (h *Handler) requireExpectedGeneration(c *gin.Context, userID int64) bool {
+	expected, ok := parseExpectedGeneration(c)
+	if !ok {
+		return false
+	}
+	if expected == 0 {
+		return true
+	}
+	status, err := h.svc.GetStatus(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
+		return false
+	}
+	if status.Generation != expected {
+		writeGenerationConflict(c, generationConflictError{Expected: expected, Current: status.Generation})
+		return false
+	}
+	return true
 }
 
 // getUserID extracts the user ID from the auth context as int64.

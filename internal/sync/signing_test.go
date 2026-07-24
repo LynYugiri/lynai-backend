@@ -2,9 +2,17 @@ package sync
 
 import (
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/hex"
+	"errors"
+	"strconv"
 	"testing"
+	"time"
+
+	"github.com/lynai/backend/internal/database"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
 func TestSyncRequestFixedVector(t *testing.T) {
@@ -22,5 +30,56 @@ func TestSyncRequestFixedVector(t *testing.T) {
 	}
 	if signature != expectedSignature {
 		t.Fatalf("signature = %s", signature)
+	}
+}
+
+func TestVerifySignedRequestDistinguishesDeviceState(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&database.UserDevice{}); err != nil {
+		t.Fatal(err)
+	}
+	activeKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revokedKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	revokedAt := now
+	for _, device := range []database.UserDevice{
+		{UserID: 42, DeviceID: "active", SessionID: "session-a", Name: "active", Platform: "linux", Protocol: 1, PublicKey: activeKey},
+		{UserID: 42, DeviceID: "revoked", SessionID: "session-a", Name: "revoked", Platform: "linux", Protocol: 1, PublicKey: revokedKey, RevokedAt: &revokedAt},
+	} {
+		if err := db.Create(&device).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	bodyHash := make([]byte, 32)
+	headers := map[string]string{
+		"protocol": "1", "timestamp": strconv.FormatInt(now.UnixMilli(), 10),
+		"requestID": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "bodyHash": hex.EncodeToString(bodyHash),
+		"signature":          base64.RawURLEncoding.EncodeToString(make([]byte, ed25519.SignatureSize)),
+		"expectedGeneration": "1",
+	}
+	for _, tc := range []struct {
+		name, deviceID, sessionID string
+		want                      error
+	}{
+		{name: "unknown", deviceID: "missing", sessionID: "session-a", want: ErrUnknownDevice},
+		{name: "revoked", deviceID: "revoked", sessionID: "session-a", want: ErrRevokedDevice},
+		{name: "session mismatch", deviceID: "active", sessionID: "session-b", want: ErrDeviceSessionMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			headers["deviceID"] = tc.deviceID
+			_, err := verifySignedRequest(db, headers, 42, tc.sessionID, "POST", "/sync/changes", bodyHash, now, time.Minute)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want %v", err, tc.want)
+			}
+		})
 	}
 }

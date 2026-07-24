@@ -50,6 +50,16 @@ func Connect(dsn string) (*gorm.DB, error) {
 
 // Migrate applies every embedded PostgreSQL migration under an advisory lock.
 func Migrate(ctx context.Context, db *gorm.DB) error {
+	return migrateTo(ctx, db, 0)
+}
+
+// MigrateToForTest applies migrations through maxVersion. It is only intended
+// for integration tests that exercise a specific upgrade boundary.
+func MigrateToForTest(ctx context.Context, db *gorm.DB, maxVersion int64) error {
+	return migrateTo(ctx, db, maxVersion)
+}
+
+func migrateTo(ctx context.Context, db *gorm.DB, maxVersion int64) error {
 	migrations, err := loadMigrations()
 	if err != nil {
 		return err
@@ -86,6 +96,9 @@ applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		return err
 	}
 	for _, migration := range migrations {
+		if maxVersion > 0 && migration.version > maxVersion {
+			break
+		}
 		if _, ok := applied[migration.version]; ok {
 			continue
 		}
@@ -136,7 +149,31 @@ func ValidateSchema(ctx context.Context, db *gorm.DB) error {
 	if err := rows.Err(); err != nil {
 		return fmt.Errorf("iterate schema migrations: %w", err)
 	}
-	return checkApplied(migrations, applied, true)
+	if err := checkApplied(migrations, applied, true); err != nil {
+		return err
+	}
+	required := map[string][]string{
+		"sync_metadata":              {"generation", "index_revision", "min_available_seq"},
+		"sync_records":               {"user_id", "table_name", "record_id", "category", "object_id", "data", "seq", "updated_at"},
+		"sync_record_blobs":          {"user_id", "table_name", "record_id", "sha256"},
+		"sync_management_operations": {"id", "user_id", "kind", "selector_type", "category", "object_id", "generation", "index_revision", "status"},
+		"sync_request_replays":       {"generation"},
+	}
+	for table, columns := range required {
+		for _, column := range columns {
+			var exists bool
+			if err := db.WithContext(ctx).Raw(`SELECT EXISTS (
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = current_schema() AND table_name = ? AND column_name = ?
+			)`, table, column).Scan(&exists).Error; err != nil {
+				return fmt.Errorf("validate %s.%s: %w", table, column, err)
+			}
+			if !exists {
+				return fmt.Errorf("database schema is missing %s.%s; run `lynai-backend migrate`", table, column)
+			}
+		}
+	}
+	return nil
 }
 
 func loadMigrations() ([]migration, error) {

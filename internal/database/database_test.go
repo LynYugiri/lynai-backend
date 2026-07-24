@@ -17,8 +17,8 @@ func TestEmbeddedMigrationsAreOrderedAndChecksummed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 8 {
-		t.Fatalf("migration count = %d, want 8", len(migrations))
+	if len(migrations) != 10 {
+		t.Fatalf("migration count = %d, want 10", len(migrations))
 	}
 	for i, migration := range migrations {
 		if migration.version != int64(i+1) {
@@ -93,6 +93,45 @@ func TestRelayModelsMigrationValidatesBeforeDroppingLegacyColumn(t *testing.T) {
 	} {
 		if !strings.Contains(sql, fragment) {
 			t.Fatalf("migration 0008 missing %q", fragment)
+		}
+	}
+}
+
+func TestSyncManagementMigrationContract(t *testing.T) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := migrations[9].sql
+	for _, fragment := range []string{
+		"ADD COLUMN category TEXT",
+		"ADD COLUMN object_id TEXT",
+		"ALTER COLUMN category SET NOT NULL",
+		"idx_sync_records_user_category_object",
+		"ADD COLUMN generation BIGINT NOT NULL DEFAULT 1",
+		"CREATE TABLE sync_management_operations",
+		"released_blob_candidates BIGINT NOT NULL DEFAULT 0",
+		"CHECK (kind IN ('selective', 'full'))",
+		"CHECK (status IN ('pending', 'acked'))",
+		"idx_sync_management_operations_user_pending",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0010 missing %q", fragment)
+		}
+	}
+}
+
+func TestSyncProjectionMigrationClearsLegacySyncState(t *testing.T) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, fragment := range []string{
+		"TRUNCATE TABLE sync_request_replays, sync_changes, sync_blobs, sync_metadata RESTART IDENTITY",
+		"CREATE TABLE sync_records",
+	} {
+		if !strings.Contains(migrations[8].sql, fragment) {
+			t.Fatalf("migration 0009 missing %q", fragment)
 		}
 	}
 }

@@ -92,7 +92,13 @@ curl http://localhost:8080/health
 
 ### 安全同步协议 v1
 
-设备身份、canonical binary encoding、enrollment，以及 `/sync/changes` 和 blob 上传的 Ed25519 签名与幂等语义见 [`../lynai/doc/protocol-v1.md`](../lynai/doc/protocol-v1.md)。所有同步写接口都强制要求当前登录 session 下已登记设备的有效签名，不提供 unsigned fallback。`GET /sync/status` 返回服务端当前执行的 change batch、change data、请求体、分页和 blob 大小 limits；changes/blob 请求体超限返回 HTTP 413，changes JSON 必须只有一个顶层值且不允许尾随 JSON。`GET /sync/changes` 的兼容字段 `latestSeq` 是本页安全游标（等于 `nextSince`），全局高水位另见 `globalLatestSeq`，因此旧客户端即使忽略 `hasMore` 也不会跳过 capped page。`GET /sync/blobs` 始终是有界列表；客户端必须在 `hasMore`/`truncated` 为 true 时使用 `nextAfter` 继续请求，`returnedCount` 和 `pageSize` 可用于检测旧版单页截断。
+设备身份、canonical binary encoding、enrollment，以及 `/sync/changes`、blob 上传、purge 和 operation ACK 的 Ed25519 签名与幂等语义见 [`../lynai/doc/protocol-v1.md`](../lynai/doc/protocol-v1.md)。所有同步写接口都强制要求当前登录 session 下已登记设备的有效签名，不提供 unsigned fallback。`GET /sync/status` 与 `GET /sync/index/status` 返回 `generation`、`indexRevision`、`minAvailableSeq`、基础 usage，以及服务端当前执行的 change batch、change data、请求体、分页和 blob 大小 limits；changes/blob 请求体超限返回 HTTP 413，changes JSON 必须只有一个顶层值且不允许尾随 JSON。`GET /sync/changes` 的兼容字段 `latestSeq` 是本页安全游标（等于 `nextSince`），全局高水位另见 `globalLatestSeq`，因此旧客户端即使忽略 `hasMore` 也不会跳过 capped page。`GET /sync/blobs` 始终是有界列表；客户端必须在 `hasMore`/`truncated` 为 true 时使用 `nextAfter` 继续请求，`returnedCount` 和 `pageSize` 可用于检测旧版单页截断。
+
+云端索引接口为 `GET /sync/index/objects?category=...&expectedIndexRevision=...`（`after` keyset cursor，最大 500 条）和 `GET /sync/index/objects/:category/:objectId`。管理接口为 `POST /sync/manage/purge/preview`、签名 `POST /sync/manage/purge`、`GET /sync/manage/operations` 和签名 `POST /sync/manage/operations/:id/ack`。selector 支持 `object`、`category`、`all`；selective purge 只删除匹配的 projection、change 和 blob refs 并创建 selective reseed operation，full purge 切换 generation、清空用户 projection/change/blob refs 并创建 full reseed operation。两者都不生成同步 tombstone，也不物理删除 blob 或 blob metadata，只返回当前变为无引用的 candidate 数。所有索引分页和 purge 必须携带当前 `expectedIndexRevision`；不匹配返回 HTTP 409。
+
+部署 `0009_sync_projection` 前必须确认云同步数据允许全量重建。该 migration 会在同一事务内清空 `sync_metadata`、`sync_changes`、`sync_blobs` 和 `sync_request_replays`，不会尝试从历史 change log 回填 projection；部署后客户端必须从 generation 1 重新 seed。不要在需要保留现有云同步状态的环境直接执行该 migration。
+
+所有签名写请求必须携带签名覆盖的 `X-LynAI-Expected-Generation`。JSON 写请求还必须在 body 中携带相同的 `expectedGeneration`；blob 上传只使用 header。generation 不匹配返回结构化 HTTP 409，客户端必须停止使用旧 cursor/ACK 并按服务端 `currentGeneration` 重建。
 
 同步 blob 是每用户的 content-addressed 文件。共享同一 POSIX `STORAGE_DIR` 的 PostgreSQL 多实例通过数据库 transaction advisory lock 串行化同一用户/hash 的发布和损坏清理；SQLite 测试使用进程内锁。上传内容通过 SHA-256 验证后才发布，若同路径已有损坏文件会原子替换；下载发现内容 hash 不符会删除损坏文件及其 metadata 并返回 not found。
 

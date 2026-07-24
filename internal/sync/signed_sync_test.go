@@ -102,6 +102,26 @@ func TestSignedSyncReplayConflictRevocationAndCompatibility(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestSignedSyncDistinguishesDeviceSessionMismatch(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	phone := "13100000108"
+	token := testutil.RegisterAndGetToken(t, ts.URL, phone, testPassword)
+	device := enrollSyncDevice(t, ts.URL, token)
+	otherSessionToken := testutil.LoginAndGetToken(t, ts.URL, phone, testPassword)
+	requestID := randomRequestID(t)
+	resp := doSignedSync(t, ts.URL+"/sync/changes", otherSessionToken, device, requestID, signedBody(t, requestID, "session-mismatch", "message-1"))
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusUnauthorized)
+	var result struct {
+		Code string `json:"code"`
+	}
+	testutil.DecodeJSON(t, resp, &result)
+	if result.Code != "device_session_mismatch" {
+		t.Fatalf("session mismatch error code = %q", result.Code)
+	}
+}
+
 func TestRequiredSigningRejectsLegacyUnsignedUpload(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
@@ -256,6 +276,23 @@ func TestSignedBlobUploadReplaysExactResponse(t *testing.T) {
 	}
 }
 
+func TestSignedChangesRejectGenerationMismatchBeforeReplay(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000109", testPassword)
+	device := enrollSyncDevice(t, ts.URL, token)
+	requestID := randomRequestID(t)
+	body := signedBodyForGeneration(t, requestID, "generation-change", "message-1", 2)
+	resp := doSignedSyncGeneration(t, ts.URL+"/sync/changes", token, device, requestID, 2, body)
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusConflict)
+	var result map[string]interface{}
+	testutil.DecodeJSON(t, resp, &result)
+	if result["code"] != "generation_mismatch" || result["expectedGeneration"] != float64(2) || result["currentGeneration"] != float64(1) {
+		t.Fatalf("generation conflict = %#v", result)
+	}
+}
+
 func enrollSyncDevice(t *testing.T, baseURL, token string) syncDevice {
 	t.Helper()
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
@@ -293,6 +330,10 @@ func enrollSyncDeviceIdentity(t *testing.T, baseURL, token string, publicKey ed2
 }
 
 func doSignedSync(t testing.TB, target, token string, device syncDevice, requestID string, body []byte) *http.Response {
+	return doSignedSyncGeneration(t, target, token, device, requestID, 1, body)
+}
+
+func doSignedSyncGeneration(t testing.TB, target, token string, device syncDevice, requestID string, generation int64, body []byte) *http.Response {
 	t.Helper()
 	path := "/sync/changes"
 	if strings.Contains(target, "/sync/v1/changes") {
@@ -300,7 +341,7 @@ func doSignedSync(t testing.TB, target, token string, device syncDevice, request
 	}
 	digest := sha256.Sum256(body)
 	timestamp := time.Now().UnixMilli()
-	message := syncapi.SyncRequestMessage(1, device.userID, device.sessionID, device.deviceID, timestamp, requestID, http.MethodPost, path, digest[:])
+	message := syncapi.SyncRequestMessage(1, device.userID, device.sessionID, device.deviceID, timestamp, requestID, http.MethodPost, path, digest[:], generation)
 	req := testutil.NewRequest(t, http.MethodPost, target, bytes.NewReader(body))
 	testutil.SetBearer(req, token)
 	req.Header.Set("Content-Type", "application/json")
@@ -309,6 +350,7 @@ func doSignedSync(t testing.TB, target, token string, device syncDevice, request
 	req.Header.Set("X-LynAI-Timestamp", strconv.FormatInt(timestamp, 10))
 	req.Header.Set("X-LynAI-Request-ID", requestID)
 	req.Header.Set("X-LynAI-Body-SHA256", hex.EncodeToString(digest[:]))
+	req.Header.Set("X-LynAI-Expected-Generation", strconv.FormatInt(generation, 10))
 	req.Header.Set("X-LynAI-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(device.privateKey, message)))
 	return testutil.Do(t, req)
 }
@@ -322,7 +364,7 @@ func doSignedBlob(t testing.TB, target, token string, device syncDevice, request
 	}
 	path := "/sync/blobs/:sha256"
 	timestamp := time.Now().UnixMilli()
-	message := syncapi.SyncRequestMessage(1, device.userID, device.sessionID, device.deviceID, timestamp, requestID, http.MethodPost, path, digest)
+	message := syncapi.SyncRequestMessage(1, device.userID, device.sessionID, device.deviceID, timestamp, requestID, http.MethodPost, path, digest, 1)
 	req := testutil.NewRequest(t, http.MethodPost, target, bytes.NewReader(body))
 	testutil.SetBearer(req, token)
 	req.Header.Set("Content-Type", "application/octet-stream")
@@ -331,13 +373,18 @@ func doSignedBlob(t testing.TB, target, token string, device syncDevice, request
 	req.Header.Set("X-LynAI-Timestamp", strconv.FormatInt(timestamp, 10))
 	req.Header.Set("X-LynAI-Request-ID", requestID)
 	req.Header.Set("X-LynAI-Body-SHA256", sha)
+	req.Header.Set("X-LynAI-Expected-Generation", "1")
 	req.Header.Set("X-LynAI-Signature", base64.RawURLEncoding.EncodeToString(ed25519.Sign(device.privateKey, message)))
 	return testutil.Do(t, req)
 }
 
 func signedBody(t testing.TB, requestID, changeID, recordID string) []byte {
+	return signedBodyForGeneration(t, requestID, changeID, recordID, 1)
+}
+
+func signedBodyForGeneration(t testing.TB, requestID, changeID, recordID string, generation int64) []byte {
 	t.Helper()
-	body, err := json.Marshal(map[string]any{"requestId": requestID, "changes": []map[string]any{{
+	body, err := json.Marshal(map[string]any{"requestId": requestID, "expectedGeneration": generation, "changes": []map[string]any{{
 		"changeId": changeID, "table": "messages", "op": "delete", "recordId": recordID,
 		"clientCreatedAt": "2026-07-16T12:00:00Z",
 	}}})

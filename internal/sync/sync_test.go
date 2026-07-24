@@ -33,6 +33,13 @@ func TestSyncStatusEmpty(t *testing.T) {
 	if result["lastSeq"] != float64(0) {
 		t.Fatalf("lastSeq = %v, want 0", result["lastSeq"])
 	}
+	if result["generation"] != float64(1) || result["indexRevision"] != float64(0) || result["minAvailableSeq"] != float64(0) {
+		t.Fatalf("sync status metadata = %#v", result)
+	}
+	usage, ok := result["usage"].(map[string]interface{})
+	if !ok || usage["recordCount"] != float64(0) || usage["blobCount"] != float64(0) || usage["blobBytes"] != float64(0) || usage["blobRefCount"] != float64(0) {
+		t.Fatalf("usage = %#v", result["usage"])
+	}
 	limits, ok := result["limits"].(map[string]interface{})
 	if !ok || limits["maxBlobBytes"] != float64(64<<20) || limits["maxChangesRequestBytes"] != float64(2<<20) || limits["maxChangesPerRequest"] != float64(500) || limits["maxChangeDataBytes"] != float64(256<<10) || limits["maxChangesPageSize"] != float64(1000) || limits["maxBlobsPageSize"] != float64(1000) {
 		t.Fatalf("limits = %#v", result["limits"])
@@ -98,6 +105,18 @@ func TestPluginSyncDomainsAreAllowlisted(t *testing.T) {
 	resp := uploadSignedChanges(t, ts.URL, token, device, []map[string]interface{}{change})
 	testutil.RequireStatus(t, resp, http.StatusBadRequest)
 	resp.Body.Close()
+}
+
+func TestCanonicalPlanningTablesAreAllowlisted(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000998", testPassword)
+	device := enrollSyncDevice(t, ts.URL, token)
+	for _, table := range []string{"calendar_events", "anniversaries", "tasks", "task_lists", "task_list_entries"} {
+		resp := uploadSignedChanges(t, ts.URL, token, device, []map[string]interface{}{{"table": table, "op": "delete", "recordId": table + "-1"}})
+		testutil.RequireStatus(t, resp, http.StatusOK)
+		resp.Body.Close()
+	}
 }
 
 func TestGetChanges(t *testing.T) {
@@ -259,6 +278,9 @@ func TestChangesValidationAndLimits(t *testing.T) {
 		{name: "missing record id", changes: []map[string]interface{}{{"table": "messages", "op": "delete"}}},
 		{name: "long record id", changes: []map[string]interface{}{{"table": "messages", "op": "delete", "recordId": strings.Repeat("x", 257)}}},
 		{name: "missing upsert data", changes: []map[string]interface{}{{"table": "messages", "op": "upsert", "recordId": "1"}}},
+		{name: "mismatched data id", changes: []map[string]interface{}{{"table": "messages", "op": "upsert", "recordId": "1", "data": map[string]interface{}{"id": "2"}}}},
+		{name: "legacy planning table", changes: []map[string]interface{}{{"table": "schedules", "op": "delete", "recordId": "1"}}},
+		{name: "shared settings wrong id", changes: []map[string]interface{}{{"table": "shared_settings", "op": "delete", "recordId": "other"}}},
 		{name: "too many changes", changes: makeDeleteChanges(501)},
 		{name: "large data", changes: []map[string]interface{}{{"table": "messages", "op": "upsert", "recordId": "1", "data": map[string]interface{}{"value": strings.Repeat("x", (256<<10)+1)}}}},
 	}
@@ -307,6 +329,25 @@ func TestChangesAllowSharedSettingsAndSyncedModelConfigs(t *testing.T) {
 	resp.Body.Close()
 }
 
+func TestSyncedModelConfigsRejectSecretsRecursively(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000012", testPassword)
+	device := enrollSyncDevice(t, ts.URL, token)
+	for _, data := range []map[string]interface{}{
+		{"id": "model-1", "schemaVersion": 1, "apiKey": "secret"},
+		{"id": "model-1", "schemaVersion": 1, "extraParams": map[string]interface{}{"secret_key": "secret"}},
+		{"id": "model-1", "schemaVersion": 1, "models": []interface{}{map[string]interface{}{"authToken": "secret"}}},
+	} {
+		resp := uploadSignedChanges(t, ts.URL, token, device, []map[string]interface{}{{"table": "synced_model_configs", "op": "upsert", "recordId": "model-1", "data": data}})
+		testutil.RequireStatus(t, resp, http.StatusBadRequest)
+		resp.Body.Close()
+	}
+	resp := uploadSignedChanges(t, ts.URL, token, device, []map[string]interface{}{{"table": "synced_model_configs", "op": "upsert", "recordId": "model-1", "data": map[string]interface{}{"id": "model-1", "schemaVersion": 1, "maxTokens": 4096, "nestedSecret": "metadata"}}})
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+}
+
 func TestGetChangesPaginationAndEmptyUpload(t *testing.T) {
 	_, _, ts, cleanup := testutil.SetupTest()
 	defer cleanup()
@@ -350,6 +391,23 @@ func TestGetChangesPaginationAndEmptyUpload(t *testing.T) {
 		resp = testutil.Do(t, req)
 		testutil.RequireStatus(t, resp, http.StatusBadRequest)
 		resp.Body.Close()
+	}
+}
+
+func TestGetChangesRejectsFutureCursor(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000013", testPassword)
+	req := testutil.NewRequest(t, http.MethodGet, ts.URL+"/sync/changes?since=1", nil)
+	testutil.SetBearer(req, token)
+	req.Header.Set("X-LynAI-Expected-Generation", "1")
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	testutil.RequireStatus(t, resp, http.StatusConflict)
+	var result map[string]interface{}
+	testutil.DecodeJSON(t, resp, &result)
+	if result["code"] != "future_cursor" || result["latestSeq"] != float64(0) || result["currentGeneration"] != float64(1) {
+		t.Fatalf("future cursor response = %#v", result)
 	}
 }
 
@@ -419,7 +477,7 @@ func TestConcurrentUploadChanges(t *testing.T) {
 				"table":    "conversations",
 				"op":       "upsert",
 				"recordId": "conv-concurrent-" + string(rune('a'+i)),
-				"data":     map[string]interface{}{"id": "conv-concurrent"},
+				"data":     map[string]interface{}{"id": "conv-concurrent-" + string(rune('a'+i))},
 			}}
 			resp := uploadSignedChanges(t, ts.URL, token, device, changes)
 			defer resp.Body.Close()
@@ -468,7 +526,7 @@ func uploadSignedChanges(t testing.TB, baseURL, token string, device syncDevice,
 		changes = records
 	}
 	requestID := randomRequestID(t)
-	body, err := json.Marshal(map[string]interface{}{"requestId": requestID, "changes": changes})
+	body, err := json.Marshal(map[string]interface{}{"requestId": requestID, "expectedGeneration": 1, "changes": changes})
 	if err != nil {
 		t.Fatal(err)
 	}

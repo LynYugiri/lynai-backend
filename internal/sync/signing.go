@@ -20,15 +20,18 @@ const syncRequestDomain = "LynAI/v1/sync-request\x00"
 var requestIDPattern = regexp.MustCompile(`^[A-Za-z0-9_-]{32}$`)
 
 var (
-	ErrSignatureRequired    = errors.New("device signature is required")
-	ErrInvalidSignedRequest = errors.New("invalid signed sync request")
-	ErrUnknownDevice        = errors.New("unknown or revoked device")
+	ErrSignatureRequired     = errors.New("device signature is required")
+	ErrInvalidSignedRequest  = errors.New("invalid signed sync request")
+	ErrUnknownDevice         = errors.New("unknown device")
+	ErrRevokedDevice         = errors.New("revoked device")
+	ErrDeviceSessionMismatch = errors.New("device session mismatch")
 )
 
 type signedRequest struct {
-	RequestID string
-	DeviceID  string
-	BodyHash  []byte
+	RequestID          string
+	DeviceID           string
+	BodyHash           []byte
+	ExpectedGeneration int64
 }
 
 func verifySignedRequest(db *gorm.DB, headers map[string]string, userID int64, sessionID, method, target string, bodyHash []byte, now time.Time, clockSkew time.Duration) (signedRequest, error) {
@@ -36,6 +39,10 @@ func verifySignedRequest(db *gorm.DB, headers map[string]string, userID int64, s
 		return signedRequest{}, ErrSignatureRequired
 	}
 	if headers["protocol"] != "1" || !requestIDPattern.MatchString(headers["requestID"]) {
+		return signedRequest{}, ErrInvalidSignedRequest
+	}
+	expectedGeneration, err := strconv.ParseInt(headers["expectedGeneration"], 10, 64)
+	if err != nil || expectedGeneration < 1 {
 		return signedRequest{}, ErrInvalidSignedRequest
 	}
 	timestampMS, err := strconv.ParseInt(headers["timestamp"], 10, 64)
@@ -55,26 +62,37 @@ func verifySignedRequest(db *gorm.DB, headers map[string]string, userID int64, s
 		return signedRequest{}, ErrInvalidSignedRequest
 	}
 	var device database.UserDevice
-	if err := db.Where("user_id = ? AND device_id = ? AND session_id = ? AND revoked_at IS NULL", userID, headers["deviceID"], sessionID).First(&device).Error; err != nil {
+	if err := db.Where("user_id = ? AND device_id = ?", userID, headers["deviceID"]).First(&device).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return signedRequest{}, ErrUnknownDevice
 		}
 		return signedRequest{}, err
 	}
-	message := SyncRequestMessage(1, strconv.FormatInt(userID, 10), sessionID, device.DeviceID, timestampMS, headers["requestID"], method, target, bodyHash)
+	if device.RevokedAt != nil {
+		return signedRequest{}, ErrRevokedDevice
+	}
+	if device.SessionID != sessionID {
+		return signedRequest{}, ErrDeviceSessionMismatch
+	}
+	message := SyncRequestMessage(1, strconv.FormatInt(userID, 10), sessionID, device.DeviceID, timestampMS, headers["requestID"], method, target, bodyHash, expectedGeneration)
 	if !ed25519.Verify(ed25519.PublicKey(device.PublicKey), message, signature) {
 		return signedRequest{}, ErrInvalidSignedRequest
 	}
-	return signedRequest{RequestID: headers["requestID"], DeviceID: device.DeviceID, BodyHash: bodyHash}, nil
+	return signedRequest{RequestID: headers["requestID"], DeviceID: device.DeviceID, BodyHash: bodyHash, ExpectedGeneration: expectedGeneration}, nil
 }
 
 // SyncRequestMessage returns the exact CBE1 bytes signed for a sync request.
-func SyncRequestMessage(protocol uint16, userID, sessionID, deviceID string, timestampMS int64, requestID, method, target string, bodyHash []byte) []byte {
+func SyncRequestMessage(protocol uint16, userID, sessionID, deviceID string, timestampMS int64, requestID, method, target string, bodyHash []byte, expectedGeneration ...int64) []byte {
 	version := make([]byte, 2)
 	binary.BigEndian.PutUint16(version, protocol)
 	timestamp := make([]byte, 8)
 	binary.BigEndian.PutUint64(timestamp, uint64(timestampMS))
 	fields := [][]byte{version, []byte(userID), []byte(sessionID), []byte(deviceID), timestamp, []byte(requestID), []byte(method), []byte(target), bodyHash}
+	if len(expectedGeneration) > 0 {
+		generation := make([]byte, 8)
+		binary.BigEndian.PutUint64(generation, uint64(expectedGeneration[0]))
+		fields = append(fields, generation)
+	}
 	message := []byte(syncRequestDomain)
 	for i, value := range fields {
 		header := make([]byte, 6)
