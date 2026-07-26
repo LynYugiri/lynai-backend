@@ -17,8 +17,8 @@ func TestEmbeddedMigrationsAreOrderedAndChecksummed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(migrations) != 10 {
-		t.Fatalf("migration count = %d, want 10", len(migrations))
+	if len(migrations) != 11 {
+		t.Fatalf("migration count = %d, want 11", len(migrations))
 	}
 	for i, migration := range migrations {
 		if migration.version != int64(i+1) {
@@ -132,6 +132,60 @@ func TestSyncProjectionMigrationClearsLegacySyncState(t *testing.T) {
 	} {
 		if !strings.Contains(migrations[8].sql, fragment) {
 			t.Fatalf("migration 0009 missing %q", fragment)
+		}
+	}
+}
+
+func TestRelayRoutingMigrationContract(t *testing.T) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sql := migrations[10].sql
+	for _, fragment := range []string{
+		"conflicting normalized categories",
+		"ORDER BY model_id, id",
+		"BOOL_OR(enabled) OVER (PARTITION BY model_id)",
+		"ALTER SEQUENCE relay_models_id_seq RENAME TO relay_models_legacy_id_seq",
+		"CREATE TABLE relay_provider_credentials",
+		"SELECT id, 'Default', api_key, 0, '{}', TRUE",
+		"CREATE TABLE relay_model_bindings",
+		"CHECK (weight >= 1)",
+		"UNIQUE (relay_model_id, provider_id)",
+		"upstream_model = binding.upstream_model",
+		"ON DELETE RESTRICT",
+		"DROP COLUMN api_key",
+		"attempt_count >= 1",
+		"failover_count >= 0 AND failover_count < attempt_count",
+		"pg_get_serial_sequence('relay_models', 'id')",
+	} {
+		if !strings.Contains(sql, fragment) {
+			t.Fatalf("migration 0011 missing %q", fragment)
+		}
+	}
+	if strings.Contains(sql, "api_key_snapshot") {
+		t.Fatal("migration 0011 stores an API key snapshot")
+	}
+}
+
+func TestAllModelsAutoMigrateSQLite(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(AllModels()...); err != nil {
+		t.Fatalf("auto-migrate all models: %v", err)
+	}
+	for _, model := range []interface{}{
+		&RelayProvider{},
+		&RelayProviderCredential{},
+		&RelayModel{},
+		&RelayModelBinding{},
+		&RelaySpeechSession{},
+		&RelayRequestLog{},
+	} {
+		if !db.Migrator().HasTable(model) {
+			t.Fatalf("auto-migrate did not create %T", model)
 		}
 	}
 }

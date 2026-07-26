@@ -143,7 +143,7 @@ func run(args []string) error {
 	defer relayHandler.Close()
 
 	// Admin panel
-	adminHandler, err := admin.NewHandlerWithConfig(db, authSvc, marketSvc, endpointPolicy, cfg.AdminSessionTTL)
+	adminHandler, err := admin.NewHandlerWithConfigAndReleaser(db, authSvc, marketSvc, endpointPolicy, cfg.AdminSessionTTL, relaySvc)
 	if err != nil {
 		return fmt.Errorf("admin templates: %w", err)
 	}

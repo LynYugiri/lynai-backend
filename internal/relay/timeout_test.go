@@ -26,7 +26,7 @@ func TestServiceNonStreamingTimeout(t *testing.T) {
 	}
 	svc := NewServiceWithClient(db, upstream.Client())
 	svc.setTimeouts(20*time.Millisecond, 20*time.Millisecond, time.Second)
-	_, err = svc.ForwardChat(t.Context(), &database.RelayProvider{Endpoint: upstream.URL}, []byte(`{"stream":false}`))
+	_, err = svc.ForwardChat(t.Context(), &Candidate{Provider: database.RelayProvider{Endpoint: upstream.URL}}, []byte(`{"stream":false}`))
 	if !errors.Is(err, ErrUpstreamTimeout) {
 		t.Fatalf("timeout error = %v", err)
 	}
@@ -47,7 +47,7 @@ func TestServiceStreamingIdleTimeout(t *testing.T) {
 	}
 	svc := NewServiceWithClient(db, upstream.Client())
 	svc.setTimeouts(time.Second, 20*time.Millisecond, time.Second)
-	resp, err := svc.ForwardChat(t.Context(), &database.RelayProvider{Endpoint: upstream.URL}, []byte(`{"stream":true}`))
+	resp, err := svc.ForwardChat(t.Context(), &Candidate{Provider: database.RelayProvider{Endpoint: upstream.URL}}, []byte(`{"stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}

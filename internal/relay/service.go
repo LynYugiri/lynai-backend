@@ -105,6 +105,29 @@ type ProviderConfig struct {
 	ImageModule      string `json:"imageModule,omitempty"`
 }
 
+// MergeProviderConfig applies non-empty credential fields over provider fields.
+func MergeProviderConfig(provider, credential ProviderConfig) ProviderConfig {
+	if credential.AppID != "" {
+		provider.AppID = credential.AppID
+	}
+	if credential.ClientVersion != "" {
+		provider.ClientVersion = credential.ClientVersion
+	}
+	if credential.Package != "" {
+		provider.Package = credential.Package
+	}
+	if credential.OCRPos != "" {
+		provider.OCRPos = credential.OCRPos
+	}
+	if credential.BusinessIDPrefix != "" {
+		provider.BusinessIDPrefix = credential.BusinessIDPrefix
+	}
+	if credential.ImageModule != "" {
+		provider.ImageModule = credential.ImageModule
+	}
+	return provider
+}
+
 func EncodeProviderConfig(config ProviderConfig) string {
 	raw, err := json.Marshal(config)
 	if err != nil {
@@ -119,12 +142,6 @@ func DecodeProviderConfig(raw string) ProviderConfig {
 	return config
 }
 
-// ResolvedModel is the upstream provider plus the concrete model metadata.
-type ResolvedModel struct {
-	Provider database.RelayProvider
-	Model    database.RelayModel
-}
-
 // Service resolves relay providers and forwards requests to upstream APIs.
 type Service struct {
 	db                *gorm.DB
@@ -133,6 +150,7 @@ type Service struct {
 	nonStreamTimeout  time.Duration
 	streamIdleTimeout time.Duration
 	streamMaxDuration time.Duration
+	router            *Router
 }
 
 // NewService creates a relay service.
@@ -153,7 +171,7 @@ func NewServiceWithEndpointPolicy(db *gorm.DB, policy *EndpointPolicy) *Service 
 			panic(err)
 		}
 	}
-	return &Service{db: db, client: policy.httpClient(), endpoint: policy, nonStreamTimeout: 2 * time.Minute, streamIdleTimeout: 45 * time.Second, streamMaxDuration: 30 * time.Minute}
+	return &Service{db: db, client: policy.httpClient(), endpoint: policy, nonStreamTimeout: 2 * time.Minute, streamIdleTimeout: 45 * time.Second, streamMaxDuration: 30 * time.Minute, router: newRouter(db)}
 }
 
 // NewServiceWithClient 创建 relay service，并允许测试注入自定义 HTTP client。
@@ -162,7 +180,7 @@ func NewServiceWithClient(db *gorm.DB, client *http.Client) *Service {
 		return NewService(db)
 	}
 	return &Service{
-		db: db, client: client, nonStreamTimeout: 2 * time.Minute, streamIdleTimeout: 45 * time.Second, streamMaxDuration: 30 * time.Minute,
+		db: db, client: client, nonStreamTimeout: 2 * time.Minute, streamIdleTimeout: 45 * time.Second, streamMaxDuration: 30 * time.Minute, router: newRouter(db),
 	}
 }
 
@@ -247,44 +265,40 @@ func (s *Service) validateEndpoint(endpoint string) error {
 	return s.endpoint.ValidateEndpoint(endpoint)
 }
 
-// ListEnabled returns all enabled relay providers.
-func (s *Service) ListEnabled() ([]database.RelayProvider, error) {
-	var providers []database.RelayProvider
-	err := s.db.Preload("Entries", "enabled = ?", true).Where("enabled = ?", true).Order("created_at ASC").Find(&providers).Error
-	return providers, err
-}
-
-// ListConfig returns every enabled provider and enabled model entry for client configuration.
-func (s *Service) ListConfig() ([]database.RelayProvider, error) {
-	return s.ListEnabled()
-}
-
-// Resolve finds an enabled model under the explicitly selected provider.
-func (s *Service) Resolve(providerID, model string) (*ResolvedModel, error) {
-	providerID = strings.TrimSpace(providerID)
-	model = strings.TrimSpace(model)
-	if providerID == "" || model == "" {
-		return nil, ErrProviderNotFound
+func (s *Service) ListConfig() ([]database.RelayModel, error) {
+	var models []database.RelayModel
+	if err := s.db.Where("enabled = ?", true).Order("created_at ASC, id ASC").Find(&models).Error; err != nil {
+		return nil, err
 	}
-	var entry database.RelayModel
-	if err := s.db.Joins("JOIN relay_providers ON relay_providers.id = relay_models.provider_id").
-		Where("relay_models.enabled = ? AND relay_models.model_id = ? AND relay_providers.enabled = ? AND relay_providers.id = ?", true, model, true, providerID).
-		First(&entry).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, ErrProviderNotFound
+	result := models[:0]
+	for _, model := range models {
+		var formats []string
+		if err := s.db.Table("relay_model_bindings b").Select("DISTINCT p.api_format").
+			Joins("JOIN relay_providers p ON p.id = b.provider_id").
+			Joins("JOIN relay_provider_credentials c ON c.provider_id = p.id").
+			Where("b.relay_model_id = ? AND b.enabled = ? AND p.enabled = ? AND c.enabled = ?", model.ID, true, true, true).
+			Pluck("p.api_format", &formats).Error; err != nil {
+			return nil, err
 		}
-		return nil, err
+		for _, format := range formats {
+			if SupportsCategory(format, model.Category) {
+				result = append(result, model)
+				break
+			}
+		}
 	}
-	var provider database.RelayProvider
-	if err := s.db.First(&provider, "id = ? AND enabled = ?", entry.ProviderID, true).Error; err != nil {
-		return nil, err
-	}
-	return &ResolvedModel{Provider: provider, Model: entry}, nil
+	return result, nil
 }
+
+func (s *Service) Candidates(model string) (database.RelayModel, []Candidate, error) {
+	return s.router.Candidates(model)
+}
+
+func (s *Service) ReleaseCredential(id int64) { s.router.ReleaseCredential(id) }
 
 // ForwardChat sends an OpenAI-compatible chat request to the given upstream.
-func (s *Service) ForwardChat(ctx context.Context, provider *database.RelayProvider, body []byte) (*http.Response, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+func (s *Service) ForwardChat(ctx context.Context, candidate *Candidate, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(candidate.Provider.Endpoint), "/")
 	if err := s.validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
@@ -293,13 +307,13 @@ func (s *Service) ForwardChat(ctx context.Context, provider *database.RelayProvi
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+candidate.Credential.APIKey)
 	return s.do(req, requestStreams(body))
 }
 
 // ForwardAnthropicMessages sends an Anthropic Messages request to upstream.
-func (s *Service) ForwardAnthropicMessages(ctx context.Context, provider *database.RelayProvider, body []byte) (*http.Response, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+func (s *Service) ForwardAnthropicMessages(ctx context.Context, candidate *Candidate, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(candidate.Provider.Endpoint), "/")
 	if err := s.validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
@@ -308,14 +322,14 @@ func (s *Service) ForwardAnthropicMessages(ctx context.Context, provider *databa
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", provider.APIKey)
+	req.Header.Set("x-api-key", candidate.Credential.APIKey)
 	req.Header.Set("anthropic-version", "2023-06-01")
 	return s.do(req, requestStreams(body))
 }
 
 // ForwardOllamaChat sends an Ollama chat request to upstream.
-func (s *Service) ForwardOllamaChat(ctx context.Context, provider *database.RelayProvider, body []byte) (*http.Response, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+func (s *Service) ForwardOllamaChat(ctx context.Context, candidate *Candidate, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(candidate.Provider.Endpoint), "/")
 	if err := s.validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
@@ -328,8 +342,8 @@ func (s *Service) ForwardOllamaChat(ctx context.Context, provider *database.Rela
 }
 
 // ForwardVivoImage sends a vivo image-generation request to upstream.
-func (s *Service) ForwardVivoImage(ctx context.Context, provider *database.RelayProvider, body []byte) (*http.Response, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+func (s *Service) ForwardVivoImage(ctx context.Context, candidate *Candidate, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(candidate.Provider.Endpoint), "/")
 	if err := s.validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
@@ -338,7 +352,7 @@ func (s *Service) ForwardVivoImage(ctx context.Context, provider *database.Relay
 		return nil, err
 	}
 	query := u.Query()
-	config := DecodeProviderConfig(provider.Config)
+	config := candidate.Config
 	module := strings.TrimSpace(config.ImageModule)
 	if module == "" {
 		module = "aigc"
@@ -353,16 +367,16 @@ func (s *Service) ForwardVivoImage(ctx context.Context, provider *database.Relay
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+candidate.Credential.APIKey)
 	return s.do(req, false)
 }
 
 // ForwardVivoJSON sends a JSON request to a vivo-style upstream path with query parameters.
-func (s *Service) ForwardVivoJSON(ctx context.Context, provider *database.RelayProvider, path string, query url.Values, body []byte) (*http.Response, error) {
-	if err := s.validateEndpoint(provider.Endpoint); err != nil {
+func (s *Service) ForwardVivoJSON(ctx context.Context, candidate *Candidate, path string, query url.Values, body []byte) (*http.Response, error) {
+	if err := s.validateEndpoint(candidate.Provider.Endpoint); err != nil {
 		return nil, err
 	}
-	u, err := vivoURL(provider.Endpoint, path, query)
+	u, err := vivoURL(candidate.Provider.Endpoint, path, query)
 	if err != nil {
 		return nil, err
 	}
@@ -371,16 +385,16 @@ func (s *Service) ForwardVivoJSON(ctx context.Context, provider *database.RelayP
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json; charset=UTF-8")
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+candidate.Credential.APIKey)
 	return s.do(req, false)
 }
 
 // ForwardVivoMultipart sends multipart data to a vivo-style upstream path.
-func (s *Service) ForwardVivoMultipart(ctx context.Context, provider *database.RelayProvider, path string, query url.Values, body io.Reader, contentType string) (*http.Response, error) {
-	if err := s.validateEndpoint(provider.Endpoint); err != nil {
+func (s *Service) ForwardVivoMultipart(ctx context.Context, candidate *Candidate, path string, query url.Values, body io.Reader, contentType string) (*http.Response, error) {
+	if err := s.validateEndpoint(candidate.Provider.Endpoint); err != nil {
 		return nil, err
 	}
-	u, err := vivoURL(provider.Endpoint, path, query)
+	u, err := vivoURL(candidate.Provider.Endpoint, path, query)
 	if err != nil {
 		return nil, err
 	}
@@ -389,16 +403,16 @@ func (s *Service) ForwardVivoMultipart(ctx context.Context, provider *database.R
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+candidate.Credential.APIKey)
 	return s.do(req, false)
 }
 
 // ForwardVivoForm sends form data to a vivo-style upstream path.
-func (s *Service) ForwardVivoForm(ctx context.Context, provider *database.RelayProvider, path string, query url.Values, form url.Values) (*http.Response, error) {
-	if err := s.validateEndpoint(provider.Endpoint); err != nil {
+func (s *Service) ForwardVivoForm(ctx context.Context, candidate *Candidate, path string, query url.Values, form url.Values) (*http.Response, error) {
+	if err := s.validateEndpoint(candidate.Provider.Endpoint); err != nil {
 		return nil, err
 	}
-	u, err := vivoURL(provider.Endpoint, path, query)
+	u, err := vivoURL(candidate.Provider.Endpoint, path, query)
 	if err != nil {
 		return nil, err
 	}
@@ -407,7 +421,7 @@ func (s *Service) ForwardVivoForm(ctx context.Context, provider *database.RelayP
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+candidate.Credential.APIKey)
 	return s.do(req, false)
 }
 
@@ -428,8 +442,8 @@ func vivoURL(endpoint, path string, query url.Values) (string, error) {
 }
 
 // ForwardJSON sends a JSON request to an OpenAI-compatible upstream path.
-func (s *Service) ForwardJSON(ctx context.Context, provider *database.RelayProvider, path string, body []byte) (*http.Response, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+func (s *Service) ForwardJSON(ctx context.Context, candidate *Candidate, path string, body []byte) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(candidate.Provider.Endpoint), "/")
 	if err := s.validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
@@ -438,13 +452,13 @@ func (s *Service) ForwardJSON(ctx context.Context, provider *database.RelayProvi
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+candidate.Credential.APIKey)
 	return s.do(req, false)
 }
 
 // ForwardMultipart sends multipart data to an OpenAI-compatible upstream path.
-func (s *Service) ForwardMultipart(ctx context.Context, provider *database.RelayProvider, path string, body io.Reader, contentType string) (*http.Response, error) {
-	endpoint := strings.TrimRight(strings.TrimSpace(provider.Endpoint), "/")
+func (s *Service) ForwardMultipart(ctx context.Context, candidate *Candidate, path string, body io.Reader, contentType string) (*http.Response, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(candidate.Provider.Endpoint), "/")
 	if err := s.validateEndpoint(endpoint); err != nil {
 		return nil, err
 	}
@@ -453,7 +467,7 @@ func (s *Service) ForwardMultipart(ctx context.Context, provider *database.Relay
 		return nil, err
 	}
 	req.Header.Set("Content-Type", contentType)
-	req.Header.Set("Authorization", "Bearer "+provider.APIKey)
+	req.Header.Set("Authorization", "Bearer "+candidate.Credential.APIKey)
 	return s.do(req, false)
 }
 

@@ -211,31 +211,56 @@ type SyncBlob struct {
 
 // RelayProvider stores an admin-managed upstream provider for LynAI relay.
 type RelayProvider struct {
-	ID        int64        `gorm:"primaryKey" json:"id,string"`
-	Name      string       `gorm:"not null" json:"name"`
-	Endpoint  string       `gorm:"not null" json:"endpoint"`
-	APIKey    string       `gorm:"not null" json:"-"`
-	APIFormat string       `gorm:"not null;index" json:"apiFormat"`
-	Config    string       `gorm:"type:text" json:"-"`
-	Enabled   bool         `gorm:"default:true;index" json:"enabled"`
-	Entries   []RelayModel `gorm:"foreignKey:ProviderID;constraint:OnDelete:CASCADE" json:"entries"`
-	CreatedAt time.Time    `json:"createdAt"`
-	UpdatedAt time.Time    `json:"updatedAt"`
+	ID          int64                     `gorm:"primaryKey" json:"id,string"`
+	Name        string                    `gorm:"not null" json:"name"`
+	Endpoint    string                    `gorm:"not null" json:"endpoint"`
+	APIFormat   string                    `gorm:"not null;index" json:"apiFormat"`
+	Config      string                    `gorm:"type:text" json:"-"`
+	Enabled     bool                      `gorm:"default:true;index" json:"enabled"`
+	Credentials []RelayProviderCredential `gorm:"foreignKey:ProviderID;constraint:OnDelete:CASCADE" json:"credentials,omitempty"`
+	Bindings    []RelayModelBinding       `gorm:"foreignKey:ProviderID;constraint:OnDelete:CASCADE" json:"bindings,omitempty"`
+	CreatedAt   time.Time                 `json:"createdAt"`
+	UpdatedAt   time.Time                 `json:"updatedAt"`
 }
 
-// RelayModel is one admin-managed model exposed to clients by the relay.
+// RelayProviderCredential stores one independently selectable provider secret.
+type RelayProviderCredential struct {
+	ID         int64     `gorm:"primaryKey;autoIncrement" json:"id,string"`
+	ProviderID int64     `gorm:"not null;index" json:"providerId,string"`
+	Name       string    `gorm:"not null" json:"name"`
+	APIKey     string    `gorm:"not null" json:"-"`
+	Priority   int       `gorm:"not null;default:0;index" json:"priority"`
+	Config     string    `gorm:"not null;default:{};type:text" json:"-"`
+	Enabled    bool      `gorm:"not null;default:true;index" json:"enabled"`
+	CreatedAt  time.Time `json:"createdAt"`
+	UpdatedAt  time.Time `json:"updatedAt"`
+}
+
+// RelayModel is one global model definition exposed to clients by the relay.
 type RelayModel struct {
-	ID             int64     `gorm:"primaryKey;autoIncrement" json:"id,string"`
-	ProviderID     int64     `gorm:"not null;index:idx_relay_model_provider_name,unique" json:"providerId,string"`
-	ModelID        string    `gorm:"not null;index:idx_relay_model_provider_name,unique" json:"modelId"`
-	DisplayName    string    `json:"displayName"`
-	Description    string    `gorm:"type:text" json:"description"`
-	Category       string    `gorm:"not null;default:chat;index" json:"category"`
-	Capabilities   string    `gorm:"type:text" json:"capabilities"`
-	AdvancedParams string    `gorm:"type:text" json:"advancedParams"`
-	Enabled        bool      `gorm:"default:true;index" json:"enabled"`
-	CreatedAt      time.Time `json:"createdAt"`
-	UpdatedAt      time.Time `json:"updatedAt"`
+	ID             int64               `gorm:"primaryKey;autoIncrement" json:"id,string"`
+	ModelID        string              `gorm:"not null;uniqueIndex" json:"modelId"`
+	DisplayName    string              `json:"displayName"`
+	Description    string              `gorm:"type:text" json:"description"`
+	Category       string              `gorm:"not null;default:chat;index" json:"category"`
+	Capabilities   string              `gorm:"type:text" json:"capabilities"`
+	AdvancedParams string              `gorm:"type:text" json:"advancedParams"`
+	Enabled        bool                `gorm:"default:true;index" json:"enabled"`
+	Bindings       []RelayModelBinding `gorm:"foreignKey:RelayModelID;constraint:OnDelete:CASCADE" json:"bindings,omitempty"`
+	CreatedAt      time.Time           `json:"createdAt"`
+	UpdatedAt      time.Time           `json:"updatedAt"`
+}
+
+// RelayModelBinding maps a global model to one provider-specific upstream model.
+type RelayModelBinding struct {
+	ID            int64     `gorm:"primaryKey;autoIncrement" json:"id,string"`
+	RelayModelID  int64     `gorm:"not null;uniqueIndex:idx_relay_model_binding_provider;index" json:"relayModelId,string"`
+	ProviderID    int64     `gorm:"not null;uniqueIndex:idx_relay_model_binding_provider;index" json:"providerId,string"`
+	UpstreamModel string    `gorm:"not null" json:"upstreamModel"`
+	Weight        int       `gorm:"not null;default:1;check:weight >= 1" json:"weight"`
+	Enabled       bool      `gorm:"not null;default:true;index" json:"enabled"`
+	CreatedAt     time.Time `json:"createdAt"`
+	UpdatedAt     time.Time `json:"updatedAt"`
 }
 
 // RelayRequestLog stores privacy-safe metadata for one authenticated relay call.
@@ -245,6 +270,9 @@ type RelayRequestLog struct {
 	Username       string    `gorm:"not null" json:"username"`
 	ProviderID     int64     `gorm:"index" json:"providerId,string"`
 	ProviderName   string    `json:"providerName"`
+	BindingID      *int64    `gorm:"index" json:"bindingId,omitempty,string"`
+	CredentialID   *int64    `gorm:"index" json:"credentialId,omitempty,string"`
+	CredentialName *string   `json:"credentialName,omitempty"`
 	APIType        string    `gorm:"index" json:"apiType"`
 	ModelID        string    `gorm:"index" json:"modelId"`
 	Category       string    `json:"category"`
@@ -257,22 +285,33 @@ type RelayRequestLog struct {
 	RequestBytes   int64     `gorm:"not null" json:"requestBytes"`
 	ResponseBytes  int64     `gorm:"not null" json:"responseBytes"`
 	ErrorType      string    `gorm:"index" json:"errorType"`
+	AttemptCount   int       `gorm:"not null;default:1;check:attempt_count >= 1" json:"attemptCount"`
+	FailoverCount  int       `gorm:"not null;default:0;check:failover_count >= 0 AND failover_count < attempt_count" json:"failoverCount"`
 	CreatedAt      time.Time `gorm:"not null;index" json:"createdAt"`
 }
 
 // RelaySpeechSession is the shared state for one long-running speech relay.
 // A row with an empty UpstreamAudioID is a capacity reservation in progress.
 type RelaySpeechSession struct {
-	ID              string    `gorm:"primaryKey;size:32" json:"id"`
-	UserID          int64     `gorm:"not null;index:idx_relay_speech_user_expires,priority:1" json:"userId,string"`
-	ProviderID      int64     `gorm:"not null" json:"providerId,string"`
-	ModelID         string    `gorm:"not null" json:"modelId"`
-	AppID           string    `gorm:"not null" json:"-"`
-	UpstreamAudioID string    `gorm:"not null" json:"-"`
-	TaskID          string    `gorm:"not null" json:"-"`
-	ExpiresAt       time.Time `gorm:"not null;index;index:idx_relay_speech_user_expires,priority:2" json:"expiresAt"`
-	CreatedAt       time.Time `gorm:"not null" json:"createdAt"`
-	UpdatedAt       time.Time `gorm:"not null" json:"updatedAt"`
+	ID              string                  `gorm:"primaryKey;size:32" json:"id"`
+	UserID          int64                   `gorm:"not null;index:idx_relay_speech_user_expires,priority:1" json:"userId,string"`
+	ProviderID      int64                   `gorm:"not null" json:"providerId,string"`
+	BindingID       int64                   `gorm:"not null;index" json:"bindingId,string"`
+	CredentialID    int64                   `gorm:"not null;index" json:"credentialId,string"`
+	ModelID         string                  `gorm:"not null" json:"modelId"`
+	UpstreamModel   string                  `gorm:"not null" json:"upstreamModel"`
+	Endpoint        string                  `gorm:"not null" json:"-"`
+	APIFormat       string                  `gorm:"not null" json:"-"`
+	ConfigSnapshot  string                  `gorm:"not null;type:text" json:"-"`
+	AppID           string                  `gorm:"not null" json:"-"`
+	UpstreamAudioID string                  `gorm:"not null" json:"-"`
+	TaskID          string                  `gorm:"not null" json:"-"`
+	ExpiresAt       time.Time               `gorm:"not null;index;index:idx_relay_speech_user_expires,priority:2" json:"expiresAt"`
+	CreatedAt       time.Time               `gorm:"not null" json:"createdAt"`
+	UpdatedAt       time.Time               `gorm:"not null" json:"updatedAt"`
+	Provider        RelayProvider           `gorm:"foreignKey:ProviderID;constraint:OnDelete:RESTRICT" json:"-"`
+	Binding         RelayModelBinding       `gorm:"foreignKey:BindingID;constraint:OnDelete:RESTRICT" json:"-"`
+	Credential      RelayProviderCredential `gorm:"foreignKey:CredentialID;constraint:OnDelete:RESTRICT" json:"-"`
 }
 
 // CommunityProfile stores public community-only profile data.
@@ -373,7 +412,9 @@ func AllModels() []interface{} {
 		&SyncManagementOperation{},
 		&SyncBlob{},
 		&RelayProvider{},
+		&RelayProviderCredential{},
 		&RelayModel{},
+		&RelayModelBinding{},
 		&RelayRequestLog{},
 		&RelaySpeechSession{},
 		&CommunityProfile{},

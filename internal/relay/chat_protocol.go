@@ -18,7 +18,6 @@ import (
 )
 
 type ChatRequest struct {
-	ProviderID       string          `json:"providerId"`
 	Model            string          `json:"model"`
 	Messages         []ChatMessage   `json:"messages"`
 	Stream           bool            `json:"stream"`
@@ -125,10 +124,9 @@ func parseCanonicalChat(raw []byte) (ChatRequest, error) {
 	if decoder.Decode(&struct{}{}) != io.EOF {
 		return request, errors.New("invalid canonical chat JSON")
 	}
-	request.ProviderID = strings.TrimSpace(request.ProviderID)
 	request.Model = strings.TrimSpace(request.Model)
-	if request.ProviderID == "" || request.Model == "" {
-		return request, errors.New("providerId and model are required")
+	if request.Model == "" {
+		return request, errors.New("model is required")
 	}
 	if len(request.Messages) == 0 {
 		return request, errors.New("messages are required")
@@ -966,7 +964,7 @@ func scanSSE(reader io.Reader, consume func(string) error) error {
 	return flush()
 }
 
-func writeCanonicalSSE(c *gin.Context, adapter chatAdapter, body io.Reader) {
+func writeCanonicalSSE(c *gin.Context, adapter chatAdapter, body io.Reader) error {
 	c.Header("Content-Type", "text/event-stream")
 	c.Header("Cache-Control", "no-cache")
 	c.Header("Connection", "keep-alive")
@@ -993,5 +991,7 @@ func writeCanonicalSSE(c *gin.Context, adapter chatAdapter, body io.Reader) {
 		}
 		c.Set("relayErrorType", errorType)
 		_ = emit(canonicalDelta{Error: err.Error(), Done: true})
+		return err
 	}
+	return nil
 }

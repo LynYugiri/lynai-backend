@@ -42,19 +42,26 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServ
 		ID:        1,
 		Name:      "test upstream",
 		Endpoint:  upstreamServer.URL,
-		APIKey:    "upstream-secret",
 		APIFormat: relay.APIFormatOpenAI,
 		Enabled:   true,
 	}
 	if err := db.Create(&provider).Error; err != nil {
 		t.Fatalf("create provider: %v", err)
 	}
+	credential := database.RelayProviderCredential{ID: 1, ProviderID: 1, Name: "test key", APIKey: "upstream-secret", Enabled: true}
+	if err := db.Create(&credential).Error; err != nil {
+		t.Fatalf("create credential: %v", err)
+	}
 	entries := []database.RelayModel{
-		{ProviderID: 1, ModelID: "gpt-test", Category: relay.CategoryChat, Capabilities: relay.EncodeCapabilities(relay.ModelCapabilities{Thinking: true, Tools: true}), AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}), Enabled: true},
-		{ProviderID: 1, ModelID: "gpt-stream", Category: relay.CategoryChat, Capabilities: relay.EncodeCapabilities(relay.ModelCapabilities{Thinking: true, Tools: true}), AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}), Enabled: true},
+		{ModelID: "gpt-test", Category: relay.CategoryChat, Capabilities: relay.EncodeCapabilities(relay.ModelCapabilities{Thinking: true, Tools: true}), AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}), Enabled: true},
+		{ModelID: "gpt-stream", Category: relay.CategoryChat, Capabilities: relay.EncodeCapabilities(relay.ModelCapabilities{Thinking: true, Tools: true}), AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{}), Enabled: true},
 	}
 	if err := db.Create(&entries).Error; err != nil {
 		t.Fatalf("create relay models: %v", err)
+	}
+	bindings := []database.RelayModelBinding{{RelayModelID: entries[0].ID, ProviderID: 1, UpstreamModel: "gpt-test", Weight: 1, Enabled: true}, {RelayModelID: entries[1].ID, ProviderID: 1, UpstreamModel: "gpt-stream", Weight: 1, Enabled: true}}
+	if err := db.Create(&bindings).Error; err != nil {
+		t.Fatalf("create bindings: %v", err)
 	}
 
 	jwtMgr := auth.NewJWTManager("test-secret")
@@ -89,14 +96,13 @@ func setupRelayTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServ
 func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*testutil.TestServer, string, *gorm.DB) {
 	t.Helper()
 	server, token, db := setupRelayTest(t, upstream)
-	if err := db.Where("provider_id = ?", 1).Delete(&database.RelayModel{}).Error; err != nil {
+	if err := db.Where("1 = 1").Delete(&database.RelayModel{}).Error; err != nil {
 		t.Fatalf("clear models: %v", err)
 	}
 	maxTokens := 2048
 	temperature := 0.3
 	entries := []database.RelayModel{
 		{
-			ProviderID:     1,
 			ModelID:        "gpt-rich",
 			DisplayName:    "Rich Chat",
 			Description:    "chat model",
@@ -106,7 +112,6 @@ func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*testutil.Tes
 			Enabled:        true,
 		},
 		{
-			ProviderID:     1,
 			ModelID:        "whisper-test",
 			DisplayName:    "Whisper Test",
 			Category:       relay.CategorySpeech,
@@ -115,7 +120,6 @@ func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*testutil.Tes
 			Enabled:        true,
 		},
 		{
-			ProviderID:     1,
 			ModelID:        "image-test",
 			DisplayName:    "Image Test",
 			Category:       relay.CategoryImageGeneration,
@@ -126,6 +130,38 @@ func setupRelayEntryTest(t *testing.T, upstream http.HandlerFunc) (*testutil.Tes
 	}
 	if err := db.Create(&entries).Error; err != nil {
 		t.Fatalf("create relay models: %v", err)
+	}
+	var baseProvider database.RelayProvider
+	if err := db.First(&baseProvider, "id = ?", 1).Error; err != nil {
+		t.Fatalf("load base provider: %v", err)
+	}
+	providers := []database.RelayProvider{
+		{ID: 2, Name: "speech upstream", Endpoint: baseProvider.Endpoint, APIFormat: relay.APIFormatOpenAISpeech, Enabled: true},
+		{ID: 3, Name: "image upstream", Endpoint: baseProvider.Endpoint, APIFormat: relay.APIFormatOpenAIImage, Enabled: true},
+	}
+	if err := db.Create(&providers).Error; err != nil {
+		t.Fatalf("create category providers: %v", err)
+	}
+	credentials := []database.RelayProviderCredential{
+		{ID: 2, ProviderID: 2, Name: "speech key", APIKey: "upstream-secret", Enabled: true},
+		{ID: 3, ProviderID: 3, Name: "image key", APIKey: "upstream-secret", Enabled: true},
+	}
+	if err := db.Create(&credentials).Error; err != nil {
+		t.Fatalf("create category credentials: %v", err)
+	}
+	bindings := make([]database.RelayModelBinding, 0, len(entries))
+	for _, entry := range entries {
+		providerID := int64(1)
+		switch entry.Category {
+		case relay.CategorySpeech:
+			providerID = 2
+		case relay.CategoryImageGeneration:
+			providerID = 3
+		}
+		bindings = append(bindings, database.RelayModelBinding{RelayModelID: entry.ID, ProviderID: providerID, UpstreamModel: entry.ModelID, Weight: 1, Enabled: true})
+	}
+	if err := db.Create(&bindings).Error; err != nil {
+		t.Fatalf("create relay bindings: %v", err)
 	}
 	return server, token, db
 }
@@ -168,7 +204,7 @@ func TestChatCanonicalOpenAIForwardsAndNormalizes(t *testing.T) {
 		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"stop","message":{"content":"pong","reasoning_content":"think"}}]}`))
 	})
 
-	body := []byte(`{"providerId":"1","model":"gpt-test","messages":[{"role":"system","content":[{"type":"text","text":"rules"}]},{"role":"user","content":[{"type":"text","text":"ping"}]}],"stream":false,"reasoning":{"enabled":true}}`)
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"system","content":[{"type":"text","text":"rules"}]},{"role":"user","content":[{"type":"text","text":"ping"}]}],"stream":false,"reasoning":{"enabled":true}}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -190,6 +226,72 @@ func TestChatCanonicalOpenAIForwardsAndNormalizes(t *testing.T) {
 	}
 }
 
+func TestChatFailsOverCredentialAndMapsUpstreamModel(t *testing.T) {
+	var auths []string
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		var body map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatal(err)
+		}
+		if body["model"] != "upstream-chat" {
+			t.Fatalf("upstream model = %v", body["model"])
+		}
+		if len(auths) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"stop","message":{"content":"pong"}}]}`))
+	})
+	if err := db.Model(&database.RelayModelBinding{}).Where("relay_model_id = (SELECT id FROM relay_models WHERE model_id = ?)", "gpt-test").Update("upstream_model", "upstream-chat").Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&database.RelayProviderCredential{ProviderID: 1, Name: "second", APIKey: "second-secret", Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
+	resp := testutil.Do(t, authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body)))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(auths) != 2 || auths[0] != "Bearer upstream-secret" || auths[1] != "Bearer second-secret" {
+		t.Fatalf("status/auths = %d/%v", resp.StatusCode, auths)
+	}
+}
+
+func TestChatFailsOverProvider(t *testing.T) {
+	calls := 0
+	upstream := func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"stop","message":{"content":"second"}}]}`))
+	}
+	server, token, db := setupRelayTest(t, upstream)
+	second := testutil.NewTestServerFunc(upstream)
+	t.Cleanup(second.Close)
+	provider := database.RelayProvider{ID: 2, Name: "second", Endpoint: second.URL, APIFormat: relay.APIFormatOpenAI, Enabled: true}
+	credential := database.RelayProviderCredential{ProviderID: 2, Name: "second", APIKey: "second", Enabled: true}
+	var model database.RelayModel
+	if err := db.Where("model_id = ?", "gpt-test").First(&model).Error; err != nil {
+		t.Fatal(err)
+	}
+	binding := database.RelayModelBinding{RelayModelID: model.ID, ProviderID: 2, UpstreamModel: "second-model", Weight: 1, Enabled: true}
+	for _, value := range []interface{}{&provider, &credential, &binding} {
+		if err := db.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
+	resp := testutil.Do(t, authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body)))
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || calls != 2 {
+		t.Fatalf("status/calls = %d/%d", resp.StatusCode, calls)
+	}
+}
+
 func TestChatCanonicalSSE(t *testing.T) {
 	server, token, _ := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -200,7 +302,7 @@ func TestChatCanonicalSSE(t *testing.T) {
 		flusher.Flush()
 	})
 
-	body := []byte(`{"providerId":"1","model":"gpt-stream","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
+	body := []byte(`{"model":"gpt-stream","stream":true,"messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -223,7 +325,6 @@ func TestChatCanonicalOpenAITools(t *testing.T) {
 		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"tool_calls","message":{"content":"","tool_calls":[{"id":"call-1","type":"function","function":{"name":"weather","arguments":"{\"city\":\"Shanghai\"}"}}]}}]}`))
 	})
 	body := []byte(`{
-		"providerId":"1",
 		"model":"gpt-test",
 		"messages":[{"role":"user","content":[{"type":"text","text":"weather?"}]}],
 		"tools":[{"name":"weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}],
@@ -292,7 +393,7 @@ func TestChatCanonicalAnthropic(t *testing.T) {
 		t.Fatalf("update provider: %v", err)
 	}
 
-	body := []byte(`{"providerId":"1","model":"gpt-rich","messages":[{"role":"system","content":[{"type":"text","text":"rules"}]},{"role":"user","content":[{"type":"text","text":"ping"}]}],"tools":[{"name":"weather","parameters":{"type":"object"}}]}`)
+	body := []byte(`{"model":"gpt-rich","messages":[{"role":"system","content":[{"type":"text","text":"rules"}]},{"role":"user","content":[{"type":"text","text":"ping"}]}],"tools":[{"name":"weather","parameters":{"type":"object"}}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -325,7 +426,7 @@ func TestChatCanonicalOllama(t *testing.T) {
 		t.Fatalf("update provider: %v", err)
 	}
 
-	body := []byte(`{"providerId":"1","model":"gpt-rich","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}],"tools":[{"name":"weather","parameters":{"type":"object"}}],"stream":false}`)
+	body := []byte(`{"model":"gpt-rich","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}],"tools":[{"name":"weather","parameters":{"type":"object"}}],"stream":false}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -347,7 +448,7 @@ func TestChatRejectsImageWhenModelDoesNotSupportVision(t *testing.T) {
 	server, token, _ := setupRelayTest(t, func(http.ResponseWriter, *http.Request) {
 		t.Fatal("upstream should not be called")
 	})
-	body := []byte(`{"providerId":"1","model":"gpt-test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"pixel.png","mimeType":"image/png","dataBase64":"aW1hZ2U="}}]}]}`)
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"pixel.png","mimeType":"image/png","dataBase64":"aW1hZ2U="}}]}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -376,22 +477,20 @@ func TestConfigReturnsRelayConfig(t *testing.T) {
 	if payload["object"] != "relay_config" {
 		t.Fatalf("object = %v, want relay_config", payload["object"])
 	}
-	providers := payload["data"].([]interface{})
-	provider := providers[0].(map[string]interface{})
-	if payload["schemaVersion"] != float64(3) || provider["providerId"] != "1" {
+	models := payload["data"].([]interface{})
+	if payload["schemaVersion"] != float64(4) {
 		t.Fatalf("config envelope = %#v", payload)
 	}
-	if _, ok := provider["endpoint"]; ok {
-		t.Fatal("config leaked endpoint")
-	}
-	if _, ok := provider["apiType"]; ok {
-		t.Fatal("config leaked apiType")
-	}
-	models := provider["models"].([]interface{})
 	if len(models) != 3 {
 		t.Fatalf("model count = %d, want 3", len(models))
 	}
 	first := models[0].(map[string]interface{})
+	if _, ok := first["providerId"]; ok {
+		t.Fatal("config leaked providerId")
+	}
+	if _, ok := first["appId"]; ok {
+		t.Fatal("config leaked AppID")
+	}
 	if first["id"] != "gpt-rich" || first["category"] != relay.CategoryChat {
 		t.Fatalf("unexpected first model payload: %#v", first)
 	}
@@ -409,26 +508,28 @@ func TestConfigReturnsRelayConfig(t *testing.T) {
 	}
 }
 
-func TestConfigReturnsVivoAppID(t *testing.T) {
+func TestConfigHidesVivoAppID(t *testing.T) {
 	appID := "vivo-app-id"
 	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {})
-	if err := db.Where("provider_id = ?", 1).Delete(&database.RelayModel{}).Error; err != nil {
+	if err := db.Where("1 = 1").Delete(&database.RelayModel{}).Error; err != nil {
 		t.Fatalf("delete models: %v", err)
 	}
 	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("api_format", relay.APIFormatVivoOCR).Error; err != nil {
 		t.Fatalf("update provider: %v", err)
 	}
 	entry := database.RelayModel{
-		ProviderID:     1,
 		ModelID:        "general_recognition",
 		DisplayName:    "VIVO OCR",
 		Category:       relay.CategoryOCR,
 		Capabilities:   relay.EncodeCapabilities(relay.ModelCapabilities{}),
-		AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{User: &appID}),
+		AdvancedParams: relay.EncodeAdvancedParams(relay.ModelAdvancedParams{AppID: &appID}),
 		Enabled:        true,
 	}
 	if err := db.Create(&entry).Error; err != nil {
 		t.Fatalf("create relay model: %v", err)
+	}
+	if err := db.Create(&database.RelayModelBinding{RelayModelID: entry.ID, ProviderID: 1, UpstreamModel: entry.ModelID, Weight: 1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
 	}
 
 	req := authedRequest(t, http.MethodGet, server.URL+"/relay/config", token, "", nil)
@@ -440,29 +541,23 @@ func TestConfigReturnsVivoAppID(t *testing.T) {
 	}
 	var payload map[string]interface{}
 	testutil.DecodeJSON(t, resp, &payload)
-	providers := payload["data"].([]interface{})
-	provider := providers[0].(map[string]interface{})
-	models := provider["models"].([]interface{})
+	models := payload["data"].([]interface{})
 	model := models[0].(map[string]interface{})
 	params := model["advancedParams"].(map[string]interface{})
-	if params["appId"] != appID {
-		t.Fatalf("advancedParams.appId = %v, want %s", params["appId"], appID)
-	}
-	if _, ok := params["user"]; ok {
-		t.Fatalf("advancedParams leaked user for AppID: %#v", params)
+	if _, ok := params["appId"]; ok {
+		t.Fatalf("advancedParams leaked appId: %#v", params)
 	}
 }
 
 func TestConfigReturnsVivoLASRWorkflow(t *testing.T) {
 	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {})
-	if err := db.Where("provider_id = ?", 1).Delete(&database.RelayModel{}).Error; err != nil {
+	if err := db.Where("1 = 1").Delete(&database.RelayModel{}).Error; err != nil {
 		t.Fatalf("delete models: %v", err)
 	}
 	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Update("api_format", relay.APIFormatVivoLASR).Error; err != nil {
 		t.Fatalf("update provider: %v", err)
 	}
 	entry := database.RelayModel{
-		ProviderID:     1,
 		ModelID:        "vivo-lasr",
 		DisplayName:    "VIVO LASR",
 		Category:       relay.CategorySpeech,
@@ -473,6 +568,9 @@ func TestConfigReturnsVivoLASRWorkflow(t *testing.T) {
 	if err := db.Create(&entry).Error; err != nil {
 		t.Fatalf("create relay model: %v", err)
 	}
+	if err := db.Create(&database.RelayModelBinding{RelayModelID: entry.ID, ProviderID: 1, UpstreamModel: entry.ModelID, Weight: 1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
 
 	req := authedRequest(t, http.MethodGet, server.URL+"/relay/config", token, "", nil)
 	resp := testutil.Do(t, req)
@@ -483,9 +581,7 @@ func TestConfigReturnsVivoLASRWorkflow(t *testing.T) {
 	}
 	var payload map[string]interface{}
 	testutil.DecodeJSON(t, resp, &payload)
-	providers := payload["data"].([]interface{})
-	provider := providers[0].(map[string]interface{})
-	models := provider["models"].([]interface{})
+	models := payload["data"].([]interface{})
 	model := models[0].(map[string]interface{})
 	if model["workflow"] != relay.APIFormatVivoLASR {
 		t.Fatalf("workflow = %v, want %s", model["workflow"], relay.APIFormatVivoLASR)
@@ -541,7 +637,7 @@ func TestRelayLoggingRecordsUserAndSkipsConfig(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"choices":[{"finish_reason":"stop","message":{"content":"pong"}}]}`))
 	})
-	body := []byte(`{"providerId":"1","model":"gpt-test","messages":[{"role":"user","content":[{"type":"text","text":"private prompt"}]}]}`)
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":[{"type":"text","text":"private prompt"}]}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	resp.Body.Close()
@@ -574,6 +670,44 @@ func TestRelayLoggingRecordsUserAndSkipsConfig(t *testing.T) {
 	}
 	if entry.RequestBytes != int64(len(body)) {
 		t.Fatalf("request bytes = %d, want %d", entry.RequestBytes, len(body))
+	}
+}
+
+func TestChatLoggingCountsActualAttemptsAndUsesTerminalTransportFailure(t *testing.T) {
+	var calls int
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("temporary failure"))
+			return
+		}
+		w.Header().Set("Content-Length", "100")
+		_, _ = w.Write([]byte("short"))
+	})
+	credentials := []database.RelayProviderCredential{
+		{ProviderID: 1, Name: "first fallback", APIKey: "first-fallback", Priority: -1, Enabled: true},
+	}
+	if err := db.Create(&credentials).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusBadGateway || calls != 2 {
+		t.Fatalf("status/calls = %d/%d", resp.StatusCode, calls)
+	}
+	var entry database.RelayRequestLog
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := db.Order("id DESC").First(&entry).Error; err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if entry.AttemptCount != 2 || entry.FailoverCount != 1 || entry.UpstreamStatus != 0 || entry.HTTPStatus != http.StatusBadGateway {
+		t.Fatalf("terminal log = %#v", entry)
 	}
 }
 
@@ -616,8 +750,7 @@ func TestConfigReturnsRichPayloadFromRelayModels(t *testing.T) {
 	defer resp.Body.Close()
 	var payload map[string]interface{}
 	testutil.DecodeJSON(t, resp, &payload)
-	provider := payload["data"].([]interface{})[0].(map[string]interface{})
-	models := provider["models"].([]interface{})
+	models := payload["data"].([]interface{})
 	first := models[0].(map[string]interface{})
 	if first["displayName"] != "Rich Chat" {
 		t.Fatalf("unexpected model payload: %#v", first)
@@ -628,7 +761,7 @@ func TestChatRejectsSpeechModel(t *testing.T) {
 	server, token, _ := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Fatal("upstream should not be called")
 	})
-	body := []byte(`{"providerId":"1","model":"whisper-test","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
+	body := []byte(`{"model":"whisper-test","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -657,7 +790,7 @@ func TestTranscribeForwardsSpeechModel(t *testing.T) {
 		t.Fatalf("update provider: %v", err)
 	}
 
-	body, contentType := multipartBody(t, map[string]string{"providerId": "1", "model": "whisper-test", "response_format": "json"})
+	body, contentType := multipartBody(t, map[string]string{"model": "whisper-test", "response_format": "json"})
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/transcribe", token, contentType, body)
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -678,7 +811,7 @@ func TestMultipartRequestRejectsTotalSizeOverLimit(t *testing.T) {
 		t.Fatalf("update provider: %v", err)
 	}
 
-	body, contentType := multipartBodyWithFile(t, map[string]string{"providerId": "1", "model": "whisper-test"}, bytes.Repeat([]byte("a"), (8<<20)+1))
+	body, contentType := multipartBodyWithFile(t, map[string]string{"model": "whisper-test"}, bytes.Repeat([]byte("a"), (8<<20)+1))
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/transcribe", token, contentType, body)
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -693,7 +826,7 @@ func TestNonStreamingUpstreamResponseRejectsOversize(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write(bytes.Repeat([]byte("a"), (16<<20)+1))
 	})
-	body := []byte(`{"providerId":"1","model":"gpt-test","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
+	body := []byte(`{"model":"gpt-test","messages":[{"role":"user","content":[{"type":"text","text":"ping"}]}]}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/chat", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -741,12 +874,15 @@ func TestSpeechSessionIsUserScopedAndMalformedResultCanRetry(t *testing.T) {
 	if err := db.Model(&database.RelayModel{}).Where("model_id = ?", "whisper-test").Update("enabled", false).Error; err != nil {
 		t.Fatalf("disable old speech model: %v", err)
 	}
-	model := database.RelayModel{ProviderID: 1, ModelID: "vivo-speech", Category: relay.CategorySpeech, Enabled: true}
+	model := database.RelayModel{ModelID: "vivo-speech", Category: relay.CategorySpeech, Enabled: true}
 	if err := db.Create(&model).Error; err != nil {
 		t.Fatalf("create speech model: %v", err)
 	}
+	if err := db.Create(&database.RelayModelBinding{RelayModelID: model.ID, ProviderID: 1, UpstreamModel: "vivo-engine", Weight: 1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
 
-	createBody := bytes.NewBufferString(`{"providerId":"1","model":"vivo-speech","audio_type":"wav","slice_num":1}`)
+	createBody := bytes.NewBufferString(`{"model":"vivo-speech","audio_type":"wav","slice_num":1}`)
 	createReq := authedRequest(t, http.MethodPost, server.URL+"/relay/speech/create", token, "application/json", createBody)
 	createResp := testutil.Do(t, createReq)
 	defer createResp.Body.Close()
@@ -823,7 +959,7 @@ func TestImageGenerationsForwardsImageModel(t *testing.T) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"url":"https://example.com/a.png"}]}`))
 	})
-	body := []byte(`{"providerId":"1","model":"image-test","prompt":"cat"}`)
+	body := []byte(`{"model":"image-test","prompt":"cat"}`)
 	req := authedRequest(t, http.MethodPost, server.URL+"/relay/images/generations", token, "application/json", bytes.NewReader(body))
 	resp := testutil.Do(t, req)
 	defer resp.Body.Close()
@@ -836,6 +972,111 @@ func TestImageGenerationsForwardsImageModel(t *testing.T) {
 	}
 	if seenBody["model"] != "image-test" || seenBody["prompt"] != "cat" {
 		t.Fatalf("upstream body = %#v", seenBody)
+	}
+}
+
+func TestImageGenerationsFailsOverOnUnauthorized(t *testing.T) {
+	var auths []string
+	server, token, db := setupRelayEntryTest(t, func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		if len(auths) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("unauthorized"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":[{"url":"https://example.com/a.png"}]}`))
+	})
+	if err := db.Create(&database.RelayProviderCredential{ProviderID: 3, Name: "fallback", APIKey: "fallback-secret", Priority: -1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"model":"image-test","prompt":"cat"}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/images/generations", token, "application/json", bytes.NewReader(body))
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(auths) != 2 || auths[1] != "Bearer fallback-secret" {
+		t.Fatalf("status/auths = %d/%v", resp.StatusCode, auths)
+	}
+}
+
+func TestOCRFailsOverOnNonJSONUnauthorized(t *testing.T) {
+	var auths []string
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		if len(auths) == 1 {
+			w.Header().Set("Content-Type", "text/plain")
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("expired credential"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"words":[{"words":"hello"}]}}`))
+	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Updates(map[string]interface{}{
+		"api_format": relay.APIFormatVivoOCR,
+		"config":     relay.EncodeProviderConfig(relay.ProviderConfig{AppID: "test-app"}),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&database.RelayProviderCredential{ProviderID: 1, Name: "fallback", APIKey: "fallback-secret", Priority: -1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	model := database.RelayModel{ModelID: "ocr-test", Category: relay.CategoryOCR, Enabled: true}
+	if err := db.Create(&model).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&database.RelayModelBinding{RelayModelID: model.ID, ProviderID: 1, UpstreamModel: "ocr-upstream", Weight: 1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body, contentType := multipartBodyWithFile(t, map[string]string{"model": "ocr-test"}, []byte("image"))
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/ocr", token, contentType, body)
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(auths) != 2 || auths[1] != "Bearer fallback-secret" {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status/auths = %d/%v: %s", resp.StatusCode, auths, raw)
+	}
+}
+
+func TestSpeechCreateFailsOverOnUnauthorized(t *testing.T) {
+	var auths []string
+	server, token, db := setupRelayTest(t, func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Header.Get("Authorization"))
+		if len(auths) == 1 {
+			w.WriteHeader(http.StatusUnauthorized)
+			_, _ = w.Write([]byte("unauthorized"))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"audio_id":"upstream-audio"}}`))
+	})
+	if err := db.Model(&database.RelayProvider{}).Where("id = ?", 1).Updates(map[string]interface{}{
+		"api_format": relay.APIFormatVivoLASR,
+		"config":     relay.EncodeProviderConfig(relay.ProviderConfig{AppID: "test-app"}),
+	}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&database.RelayProviderCredential{ProviderID: 1, Name: "fallback", APIKey: "fallback-secret", Priority: -1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	model := database.RelayModel{ModelID: "speech-failover", Category: relay.CategorySpeech, Enabled: true}
+	if err := db.Create(&model).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&database.RelayModelBinding{RelayModelID: model.ID, ProviderID: 1, UpstreamModel: "vivo-engine", Weight: 1, Enabled: true}).Error; err != nil {
+		t.Fatal(err)
+	}
+	body := bytes.NewBufferString(`{"model":"speech-failover","audio_type":"wav","slice_num":1}`)
+	req := authedRequest(t, http.MethodPost, server.URL+"/relay/speech/create", token, "application/json", body)
+	resp := testutil.Do(t, req)
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || len(auths) != 2 || auths[1] != "Bearer fallback-secret" {
+		raw := testutil.ReadAll(t, resp.Body)
+		t.Fatalf("status/auths = %d/%v: %s", resp.StatusCode, auths, raw)
+	}
+	var reservations int64
+	if err := db.Model(&database.RelaySpeechSession{}).Count(&reservations).Error; err != nil || reservations != 1 {
+		t.Fatalf("reservations = %d, err = %v", reservations, err)
 	}
 }
 

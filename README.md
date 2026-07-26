@@ -176,18 +176,17 @@ Relay API 已完成一次不兼容升级，只提供无版本 canonical 路径�
 
 | 方法 | 路径 | 鉴权 | 说明 |
 |------|------|------|------|
-| GET | `/relay/config` | Bearer | 返回 `schemaVersion: 3` 的 provider → models 配置；不返回上游 endpoint、API 类型或密钥。 |
+| GET | `/relay/config` | Bearer | 返回 `schemaVersion: 4` 的全局 model-only 配置；不返回 provider、credential、binding、上游 endpoint、API 类型或密钥。 |
 | POST | `/relay/chat` | Bearer | LynAI canonical Chat JSON/SSE；后端转换 OpenAI、Anthropic、Ollama。 |
-| POST | `/relay/ocr` | Bearer | OCR；multipart 使用 `providerId`、`model`、`file`。 |
-| POST | `/relay/transcribe` | Bearer | 短语音转写；multipart 使用 `providerId`、`model`、`file`。 |
+| POST | `/relay/ocr` | Bearer | OCR；multipart 使用 `model`、`file`。 |
+| POST | `/relay/transcribe` | Bearer | 短语音转写；multipart 使用 `model`、`file`。 |
 | POST/GET | `/relay/speech/*` | Bearer | 长语音 create/upload/run/progress/result 会话。 |
-| POST | `/relay/images/generations` | Bearer | 图片生成；JSON 使用 `providerId`、`model`、`prompt`。 |
+| POST | `/relay/images/generations` | Bearer | 图片生成；JSON 使用 `model`、`prompt`。 |
 
-Chat 请求是严格 typed canonical JSON，未知字段会被拒绝。路由只使用 `providerId + model`，客户端不得发送 `api_type`：
+Chat 请求是严格 typed canonical JSON，未知字段会被拒绝。所有 relay 入口只允许客户端用全局 `model` 选择能力；客户端不得发送 `providerId`、`provider_id` 或 `api_type`：
 
 ```json
 {
-  "providerId": "1",
   "model": "claude-sonnet",
   "messages": [
     {"role": "system", "content": [{"type": "text", "text": "Answer concisely."}]},
@@ -202,11 +201,11 @@ Canonical generation 参数使用 camelCase：`maxTokens`、`temperature`、`top
 
 非流式响应固定为 `{"message":{"role":"assistant","content":"...","reasoning":"...","toolCalls":[]},"finishReason":"stop"}`。流式响应使用 SSE，事件名为 `chunk`，`data` 是 canonical delta：`content`、`reasoning`、`toolCalls`、`finishReason`、`done` 或 `error`。OpenAI tools 完整支持请求、历史 tool call/result、非流式和流式返回；Anthropic 与 Ollama tools 在其原生协议可表达的范围内转换，不能表达的 `toolChoice` 或畸形工具参数会明确报错。
 
-上游 Provider 由管理员在 `/admin/relay` 配置，包含名称、Endpoint、API Type、API Key、模型行和启用状态。客户端 config 中的 `capabilities.vision/thinking/tools` 缺失时均按 `false` 处理。Chat 只允许 `chat` 和 `ocr` 分类模型；语音和图片入口只允许对应分类。
+Relay 管理拆分为四层：Provider 保存名称、Endpoint、API Type 和非秘密默认配置；Credential 保存可轮转的 API Key、优先级和可覆盖的 API 配置；全局 Model 保存客户端可见的 model ID、分类、能力和默认参数；Binding 把全局 Model 映射到某个 Provider 的 upstream model，并设置权重和启用状态。一个 Provider 可有多个 Credential，一个全局 Model 可绑定多个 Provider。客户端 config 中的 `capabilities.vision/thinking/tools` 缺失时均按 `false` 处理。Chat 只允许 `chat` 和 `ocr` 分类模型；语音和图片入口只允许对应分类。
 
 Relay 上游默认必须使用 HTTPS。解析后的 loopback、private、link-local、multicast 和 unspecified IP 会在建立连接前被拒绝，且上游重定向被禁止。仅本机 Ollama 等明确可信的私网上游可加入 `RELAY_PRIVATE_HOST_ALLOWLIST`；配置 `localhost:11434` 后可使用 `http://localhost:11434`，配置 `localhost` 则允许该 host 的任意端口。不要把不受信任或宽泛的内部域名加入 allowlist。
 
-`/relay/config` 中每个 provider 包含 `providerId`、`name`、`models` 和 `updatedAt`。模型条目包含 `id`、`category`、`displayName`、`description`、`capabilities`、`advancedParams` 和 `enabled`。
+`/relay/config` 的 `data` 是全局模型平铺数组。模型条目包含 `id`、`category`、`displayName`、`description`、`capabilities`、`advancedParams` 和 `enabled`；VIVO LASR 模型还可包含 `workflow: "vivo_lasr"`。Provider、Credential 和 Binding 完全由服务端路由管理，不进入客户端 contract。
 
 **中转请求示例：**
 
@@ -214,7 +213,7 @@ Relay 上游默认必须使用 HTTPS。解析后的 loopback、private、link-lo
 curl -X POST http://localhost:8080/relay/chat \
   -H "Authorization: Bearer <accessToken>" \
   -H "Content-Type: application/json" \
-  -d '{"providerId":"1","model":"gpt-4o-mini","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"stream":true}'
+  -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"stream":true}'
 ```
 
 ### 社区
@@ -318,12 +317,15 @@ curl -X POST http://localhost:8080/market/updates \
 - 概览页：待审核数、已上架数、注册用户数
 - 待审核页：查看插件详情、批准上架、驳回（可填理由）
 - 全部插件页：查看所有插件，进入详情页后可编辑元数据、下架、删除
-- 中转上游页：配置 LynAI 中转使用的上游 Endpoint、API Type、API Key 和模型列表
+- 中转 Provider 页：配置上游 Endpoint、API Type、启用状态和 API 默认参数
+- Provider Credential 页：管理多组 API Key、优先级、启用状态、凭据级参数覆盖和冷却释放
+- 全局模型页：管理 schema v4 暴露给客户端的 model ID、分类、能力和默认参数
+- 模型 Binding 页：把全局模型映射到 Provider 的 upstream model，并配置权重和启用状态
 - 用户页：查看用户列表、提升/取消管理员、创建新管理员账号
 
 管理面板使用独立的 opaque cookie；数据库只保存 token 的 SHA-256 摘要，不复用 App refresh JWT。会话默认 30 天有效，活跃时原位滑动续期，因此并发请求不会因 token 轮换互相登出。面板 POST 表单使用双层 CSRF token 校验；HTTPS 请求下 cookie 自动启用 Secure 属性。
 
-长语音 session 保存在 PostgreSQL，可由多实例共享。创建上游任务前会先写入容量 reservation，reservation 与已创建 session 一起计入 per-user/global 上限；上游创建失败会释放 reservation，过期记录由后台清理。
+长语音 session 保存在 PostgreSQL，可由多实例共享。创建上游任务前会先写入容量 reservation，reservation 与已创建 session 一起计入 per-user/global 上限；上游创建失败会释放 reservation，过期记录由后台清理。Credential key 替换与 speech reservation 使用同一 credential 行锁串行化，活跃 session 存在时管理员不能替换其 key。
 
 Relay 非流式调用采用总超时，流式调用采用 idle timeout 和 max duration。响应尚未开始时超时返回 OpenAI 风格 `504 upstream_timeout`；流已经发送后只能终止连接，调用日志会记录 `upstream_timeout`。
 
@@ -501,7 +503,7 @@ LynAI Flutter app 通过设置页「后端连接」输入后端地址，app 会�
 
 - `RemoteAccountService` — 调用 `/auth/*` 端点
 - `RemoteMarketService` — 调用 `/market/*` 端点
-- `ModelConfigProvider.syncLynaiManagedProvider` — 调用 schemaVersion 3 的 `/relay/config` 同步托管 LynAI 中转模型
+- `ModelConfigProvider.syncLynaiManagedProvider` — 调用 schemaVersion 4 的 `/relay/config` 同步 model-only 托管模型；客户端不保存或选择后端 Provider/Credential/Binding
 
 access token 过期时 `BackendClient` 自动刷新并重试，用户无感知。
 

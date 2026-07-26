@@ -18,6 +18,7 @@ import (
 	"github.com/lynai/backend/internal/relay"
 	"github.com/lynai/backend/internal/requestbody"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // CookieName is the HTTP cookie used for admin panel session.
@@ -30,14 +31,20 @@ const adminLoginBodyLimit = 16 << 10
 
 // Handler serves the HTML admin panel.
 type Handler struct {
-	db             *gorm.DB
-	relayLogs      *relay.LogService
-	authSvc        *auth.Service
-	marketSvc      *market.Service
-	templates      *template.Template
-	endpointPolicy *relay.EndpointPolicy
-	sessions       *sessionService
-	sessionTTL     time.Duration
+	db                 *gorm.DB
+	relayLogs          *relay.LogService
+	authSvc            *auth.Service
+	marketSvc          *market.Service
+	templates          *template.Template
+	endpointPolicy     *relay.EndpointPolicy
+	sessions           *sessionService
+	sessionTTL         time.Duration
+	credentialReleaser CredentialReleaser
+}
+
+// CredentialReleaser clears relay runtime cooldown state for a credential.
+type CredentialReleaser interface {
+	ReleaseCredential(id int64)
 }
 
 // NewHandler creates an admin handler using templates embedded in the binary.
@@ -54,21 +61,32 @@ func NewHandlerWithEndpointPolicy(db *gorm.DB, authSvc *auth.Service, marketSvc 
 	return NewHandlerWithConfig(db, authSvc, marketSvc, policy, auth.RefreshTokenExpiry)
 }
 
+// NewHandlerWithEndpointPolicyAndReleaser creates an admin handler with relay runtime access.
+func NewHandlerWithEndpointPolicyAndReleaser(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, jwtMgr *auth.JWTManager, policy *relay.EndpointPolicy, releaser CredentialReleaser) (*Handler, error) {
+	return NewHandlerWithConfigAndReleaser(db, authSvc, marketSvc, policy, auth.RefreshTokenExpiry, releaser)
+}
+
 // NewHandlerWithConfig creates an admin handler with opaque server-side sessions.
 func NewHandlerWithConfig(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, policy *relay.EndpointPolicy, sessionTTL time.Duration) (*Handler, error) {
+	return NewHandlerWithConfigAndReleaser(db, authSvc, marketSvc, policy, sessionTTL, nil)
+}
+
+// NewHandlerWithConfigAndReleaser creates an admin handler with relay runtime access.
+func NewHandlerWithConfigAndReleaser(db *gorm.DB, authSvc *auth.Service, marketSvc *market.Service, policy *relay.EndpointPolicy, sessionTTL time.Duration, releaser CredentialReleaser) (*Handler, error) {
 	tmpl, err := parseAdminTemplates()
 	if err != nil {
 		return nil, err
 	}
 	return &Handler{
-		db:             db,
-		relayLogs:      relay.NewLogService(db),
-		authSvc:        authSvc,
-		marketSvc:      marketSvc,
-		templates:      tmpl,
-		endpointPolicy: policy,
-		sessions:       newSessionService(db, sessionTTL),
-		sessionTTL:     sessionTTL,
+		db:                 db,
+		relayLogs:          relay.NewLogService(db),
+		authSvc:            authSvc,
+		marketSvc:          marketSvc,
+		templates:          tmpl,
+		endpointPolicy:     policy,
+		sessions:           newSessionService(db, sessionTTL),
+		sessionTTL:         sessionTTL,
+		credentialReleaser: releaser,
 	}, nil
 }
 
@@ -109,6 +127,26 @@ func (h *Handler) RegisterRoutes(r *gin.Engine, jwtMgr *auth.JWTManager) {
 		protected.POST("/relay/:id/edit", h.UpdateRelayProvider)
 		protected.POST("/relay/:id/toggle", h.ToggleRelayProvider)
 		protected.POST("/relay/:id/delete", h.DeleteRelayProvider)
+		protected.GET("/relay/:id/credentials", h.RelayCredentials)
+		protected.GET("/relay/:id/credentials/new", h.NewRelayCredentialForm)
+		protected.POST("/relay/:id/credentials/new", h.CreateRelayCredential)
+		protected.GET("/relay/credentials/:id/edit", h.EditRelayCredentialForm)
+		protected.POST("/relay/credentials/:id/edit", h.UpdateRelayCredential)
+		protected.POST("/relay/credentials/:id/toggle", h.ToggleRelayCredential)
+		protected.POST("/relay/credentials/:id/delete", h.DeleteRelayCredential)
+		protected.POST("/relay/credentials/:id/release", h.ReleaseRelayCredential)
+		protected.GET("/relay/models", h.RelayModels)
+		protected.GET("/relay/models/new", h.NewRelayModelForm)
+		protected.POST("/relay/models/new", h.CreateRelayModel)
+		protected.GET("/relay/models/:id/edit", h.EditRelayModelForm)
+		protected.POST("/relay/models/:id/edit", h.UpdateRelayModel)
+		protected.POST("/relay/models/:id/toggle", h.ToggleRelayModel)
+		protected.POST("/relay/models/:id/delete", h.DeleteRelayModel)
+		protected.POST("/relay/models/:id/bindings", h.CreateRelayBinding)
+		protected.GET("/relay/bindings/:id/edit", h.EditRelayBindingForm)
+		protected.POST("/relay/bindings/:id/edit", h.UpdateRelayBinding)
+		protected.POST("/relay/bindings/:id/toggle", h.ToggleRelayBinding)
+		protected.POST("/relay/bindings/:id/delete", h.DeleteRelayBinding)
 	}
 }
 
@@ -401,47 +439,29 @@ func (h *Handler) DeletePlugin(c *gin.Context) {
 // --- Relay providers ---
 
 type relayProviderView struct {
-	Provider   database.RelayProvider
-	ModelsText string
-	ModelCount int
-	Categories string
-	MaskedKey  string
+	Provider               database.RelayProvider
+	CredentialCount        int
+	EnabledCredentialCount int
+	BindingCount           int
 }
 
-type relayModelFormRow struct {
-	Index            int
-	ModelID          string
-	DisplayName      string
-	Description      string
-	Category         string
-	SupportsVision   bool
-	SupportsThinking bool
-	SupportsTools    bool
-	MaxTokens        string
-	Temperature      string
-	TopP             string
-	PresencePenalty  string
-	FrequencyPenalty string
-	Seed             string
-	Stop             string
-	User             string
-	DebugSSE         bool
-	Enabled          bool
+type relayModelView struct {
+	Model        database.RelayModel
+	BindingCount int
 }
 
 func (h *Handler) RelayProviders(c *gin.Context) {
 	var providers []database.RelayProvider
-	h.db.Preload("Entries").Order("updated_at DESC").Find(&providers)
+	h.db.Preload("Credentials").Preload("Bindings").Order("updated_at DESC").Find(&providers)
 	views := make([]relayProviderView, 0, len(providers))
 	for _, provider := range providers {
-		models, _ := relayModelRowsFromProvider(provider)
-		views = append(views, relayProviderView{
-			Provider:   provider,
-			ModelsText: relayModelSummary(models),
-			ModelCount: len(models),
-			Categories: relayCategorySummary(models),
-			MaskedKey:  maskAPIKey(provider.APIKey),
-		})
+		enabled := 0
+		for _, credential := range provider.Credentials {
+			if credential.Enabled {
+				enabled++
+			}
+		}
+		views = append(views, relayProviderView{Provider: provider, CredentialCount: len(provider.Credentials), EnabledCredentialCount: enabled, BindingCount: len(provider.Bindings)})
 	}
 	h.render(c, "relay.html", h.pageData(c, "relay", map[string]interface{}{"Providers": views, "Error": c.Query("error")}))
 }
@@ -457,7 +477,6 @@ func (h *Handler) NewRelayProviderForm(c *gin.Context) {
 		"OCRPos":           "2",
 		"BusinessIDPrefix": "aigc",
 		"ImageModule":      "aigc",
-		"ModelRows":        defaultRelayModelRows(nil),
 		"Error":            c.Query("error"),
 	}))
 }
@@ -468,20 +487,14 @@ func (h *Handler) CreateRelayProvider(c *gin.Context) {
 		h.redirectRelayNewWithError(c, err.Error())
 		return
 	}
-	models, err := parseRelayModelForm(c)
-	if err != nil {
-		h.redirectRelayNewWithError(c, "模型列表格式错误")
-		return
-	}
 	config := parseRelayProviderConfig(c)
-	if err := h.validateRelayProviderForm(apiFormat, strings.TrimSpace(c.PostForm("endpoint")), strings.TrimSpace(c.PostForm("apiKey")), config, models); err != nil {
+	if err := h.validateRelayProviderForm(apiFormat, strings.TrimSpace(c.PostForm("endpoint")), config); err != nil {
 		h.redirectRelayNewWithError(c, err.Error())
 		return
 	}
 	provider := database.RelayProvider{
 		Name:      strings.TrimSpace(c.PostForm("name")),
 		Endpoint:  strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/"),
-		APIKey:    strings.TrimSpace(c.PostForm("apiKey")),
 		APIFormat: apiFormat,
 		Config:    relay.EncodeProviderConfig(config),
 		Enabled:   c.PostForm("enabled") == "on",
@@ -490,12 +503,7 @@ func (h *Handler) CreateRelayProvider(c *gin.Context) {
 		h.redirectRelayNewWithError(c, "名称必填")
 		return
 	}
-	if err := h.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Create(&provider).Error; err != nil {
-			return err
-		}
-		return replaceRelayModelsTx(tx, provider.ID, models)
-	}); err != nil {
+	if err := h.db.Create(&provider).Error; err != nil {
 		h.redirectRelayNewWithError(c, "创建中转上游失败")
 		return
 	}
@@ -507,11 +515,7 @@ func (h *Handler) EditRelayProviderForm(c *gin.Context) {
 	if !ok {
 		return
 	}
-	models, _ := relayModelRowsFromProvider(provider)
 	config := relay.DecodeProviderConfig(provider.Config)
-	if config.AppID == "" {
-		config.AppID = legacyProviderAppID(provider)
-	}
 	h.render(c, "relay_edit.html", h.pageData(c, "relay", map[string]interface{}{
 		"Title":            "编辑中转上游",
 		"Action":           "/admin/relay/" + c.Param("id") + "/edit",
@@ -519,7 +523,6 @@ func (h *Handler) EditRelayProviderForm(c *gin.Context) {
 		"Name":             provider.Name,
 		"Endpoint":         provider.Endpoint,
 		"APIFormat":        provider.APIFormat,
-		"ModelRows":        defaultRelayModelRows(models),
 		"Enabled":          provider.Enabled,
 		"AppID":            config.AppID,
 		"ClientVersion":    defaultString(config.ClientVersion, "1.0.0"),
@@ -541,34 +544,25 @@ func (h *Handler) UpdateRelayProvider(c *gin.Context) {
 		h.redirectRelayEditWithError(c, err.Error())
 		return
 	}
-	models, err := parseRelayModelForm(c)
-	if err != nil {
-		h.redirectRelayEditWithError(c, "模型列表格式错误")
-		return
-	}
 	config := parseRelayProviderConfig(c)
 	provider.Name = strings.TrimSpace(c.PostForm("name"))
 	provider.Endpoint = strings.TrimRight(strings.TrimSpace(c.PostForm("endpoint")), "/")
 	provider.APIFormat = apiFormat
 	provider.Enabled = c.PostForm("enabled") == "on"
-	if key := strings.TrimSpace(c.PostForm("apiKey")); key != "" {
-		provider.APIKey = key
-	}
 	provider.Config = relay.EncodeProviderConfig(config)
 	if provider.Name == "" {
 		h.redirectRelayEditWithError(c, "名称必填")
 		return
 	}
-	if err := h.validateRelayProviderForm(apiFormat, provider.Endpoint, provider.APIKey, config, models); err != nil {
+	if err := h.validateRelayProviderForm(apiFormat, provider.Endpoint, config); err != nil {
 		h.redirectRelayEditWithError(c, err.Error())
 		return
 	}
-	if err := h.db.Transaction(func(tx *gorm.DB) error {
-		if err := tx.Save(&provider).Error; err != nil {
-			return err
-		}
-		return replaceRelayModelsTx(tx, provider.ID, models)
-	}); err != nil {
+	if err := h.validateProviderBindings(provider.ID, apiFormat); err != nil {
+		h.redirectRelayEditWithError(c, err.Error())
+		return
+	}
+	if err := h.db.Save(&provider).Error; err != nil {
 		h.redirectRelayEditWithError(c, "保存中转上游失败")
 		return
 	}
@@ -593,6 +587,10 @@ func (h *Handler) DeleteRelayProvider(c *gin.Context) {
 	if !ok {
 		return
 	}
+	if h.hasActiveSpeechSession("provider_id = ?", provider.ID) {
+		h.redirectRelayWithError(c, "该上游仍被有效语音会话使用，暂不能删除")
+		return
+	}
 	if err := h.db.Delete(&provider).Error; err != nil {
 		h.redirectRelayWithError(c, "删除中转上游失败")
 		return
@@ -607,158 +605,70 @@ func (h *Handler) loadRelayProvider(c *gin.Context) (database.RelayProvider, boo
 		return database.RelayProvider{}, false
 	}
 	var provider database.RelayProvider
-	if err := h.db.Preload("Entries").First(&provider, "id = ?", id).Error; err != nil {
+	if err := h.db.First(&provider, "id = ?", id).Error; err != nil {
 		c.Status(http.StatusNotFound)
 		return database.RelayProvider{}, false
 	}
 	return provider, true
 }
 
-func relayModelRowsFromProvider(provider database.RelayProvider) ([]relayModelFormRow, error) {
-	rows := make([]relayModelFormRow, 0, len(provider.Entries))
-	for i, entry := range provider.Entries {
-		cap := relay.DecodeCapabilities(entry.Capabilities)
-		params := relay.DecodeAdvancedParams(entry.AdvancedParams)
-		rows = append(rows, relayModelFormRow{
-			Index:            i,
-			ModelID:          entry.ModelID,
-			DisplayName:      entry.DisplayName,
-			Description:      entry.Description,
-			Category:         relay.NormalizeCategory(entry.Category),
-			SupportsVision:   cap.Vision,
-			SupportsThinking: cap.Thinking,
-			SupportsTools:    cap.Tools,
-			MaxTokens:        intPtrString(params.MaxTokens),
-			Temperature:      floatPtrString(params.Temperature),
-			TopP:             floatPtrString(params.TopP),
-			PresencePenalty:  floatPtrString(params.PresencePenalty),
-			FrequencyPenalty: floatPtrString(params.FrequencyPenalty),
-			Seed:             intPtrString(params.Seed),
-			Stop:             strings.Join(params.Stop, "\n"),
-			User:             stringPtrString(params.User),
-			DebugSSE:         params.DebugSSE,
-			Enabled:          entry.Enabled,
-		})
-	}
-	return rows, nil
-}
-
-func defaultRelayModelRows(rows []relayModelFormRow) []relayModelFormRow {
-	rows = append(rows, relayModelFormRow{Index: len(rows), Category: relay.CategoryChat, Enabled: true})
-	for i := range rows {
-		rows[i].Index = i
-		if rows[i].Category == "" {
-			rows[i].Category = relay.CategoryChat
-		}
-	}
-	return rows
-}
-
-func parseRelayModelForm(c *gin.Context) ([]database.RelayModel, error) {
-	ids := c.PostFormArray("modelId")
-	models := make([]database.RelayModel, 0, len(ids))
-	seen := map[string]struct{}{}
-	for i, id := range ids {
-		modelID := strings.TrimSpace(id)
-		if modelID == "" {
-			continue
-		}
-		if _, ok := seen[modelID]; ok {
-			return nil, errors.New("模型 ID 不能重复")
-		}
-		seen[modelID] = struct{}{}
-		params, err := parseAdvancedParams(c, i)
-		if err != nil {
-			return nil, err
-		}
-		models = append(models, database.RelayModel{
-			ModelID:        modelID,
-			DisplayName:    indexedPostForm(c, "displayName", i),
-			Description:    indexedPostForm(c, "description", i),
-			Category:       relay.NormalizeCategory(indexedPostForm(c, "category", i)),
-			Capabilities:   relay.EncodeCapabilities(relay.ModelCapabilities{Vision: c.PostForm("supportsVision_"+strconv.Itoa(i)) == "on", Thinking: c.PostForm("supportsThinking_"+strconv.Itoa(i)) == "on", Tools: c.PostForm("supportsTools_"+strconv.Itoa(i)) == "on"}),
-			AdvancedParams: relay.EncodeAdvancedParams(params),
-			Enabled:        c.PostForm("modelEnabled_"+strconv.Itoa(i)) == "on",
-		})
-	}
-	return models, nil
-}
-
-func replaceRelayModelsTx(tx *gorm.DB, providerID int64, models []database.RelayModel) error {
-	if err := tx.Where("provider_id = ?", providerID).Delete(&database.RelayModel{}).Error; err != nil {
-		return err
-	}
-	for i := range models {
-		models[i].ProviderID = providerID
-		if err := tx.Create(&models[i]).Error; err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func parseAdvancedParams(c *gin.Context, i int) (relay.ModelAdvancedParams, error) {
+func parseAdvancedParams(c *gin.Context) (relay.ModelAdvancedParams, error) {
 	var params relay.ModelAdvancedParams
-	if v := strings.TrimSpace(indexedPostForm(c, "maxTokens", i)); v != "" {
+	if v := strings.TrimSpace(c.PostForm("maxTokens")); v != "" {
 		parsed, err := strconv.Atoi(v)
 		if err != nil {
 			return params, err
 		}
 		params.MaxTokens = &parsed
 	}
-	if v, err := parseOptionalFloat(indexedPostForm(c, "temperature", i)); err != nil {
+	if v, err := parseOptionalFloat(c.PostForm("temperature")); err != nil {
 		return params, err
 	} else {
 		params.Temperature = v
 	}
-	if v, err := parseOptionalFloat(indexedPostForm(c, "topP", i)); err != nil {
+	if v, err := parseOptionalFloat(c.PostForm("topP")); err != nil {
 		return params, err
 	} else {
 		params.TopP = v
 	}
-	if v, err := parseOptionalFloat(indexedPostForm(c, "presencePenalty", i)); err != nil {
+	if v, err := parseOptionalFloat(c.PostForm("presencePenalty")); err != nil {
 		return params, err
 	} else {
 		params.PresencePenalty = v
 	}
-	if v, err := parseOptionalFloat(indexedPostForm(c, "frequencyPenalty", i)); err != nil {
+	if v, err := parseOptionalFloat(c.PostForm("frequencyPenalty")); err != nil {
 		return params, err
 	} else {
 		params.FrequencyPenalty = v
 	}
-	if v := strings.TrimSpace(indexedPostForm(c, "seed", i)); v != "" {
+	if v := strings.TrimSpace(c.PostForm("seed")); v != "" {
 		parsed, err := strconv.Atoi(v)
 		if err != nil {
 			return params, err
 		}
 		params.Seed = &parsed
 	}
-	if v := strings.TrimSpace(indexedPostForm(c, "stop", i)); v != "" {
+	if v := strings.TrimSpace(c.PostForm("stop")); v != "" {
 		for _, stop := range strings.Split(v, "\n") {
 			if stop = strings.TrimSpace(stop); stop != "" {
 				params.Stop = append(params.Stop, stop)
 			}
 		}
 	}
-	if v := strings.TrimSpace(indexedPostForm(c, "user", i)); v != "" {
+	if v := strings.TrimSpace(c.PostForm("user")); v != "" {
 		params.User = &v
 	}
-	params.DebugSSE = c.PostForm("debugSse_"+strconv.Itoa(i)) == "on"
+	params.DebugSSE = c.PostForm("debugSse") == "on"
 	return params, nil
 }
 
-func validateRelayModelForm(apiFormat string, models []database.RelayModel) error {
-	for _, model := range models {
-		if !relay.SupportsCategory(apiFormat, model.Category) {
-			return errors.New("API Type 与模型分类不匹配")
-		}
-		params := relay.DecodeAdvancedParams(model.AdvancedParams)
-		if params.MaxTokens != nil && *params.MaxTokens <= 0 {
-			return adminFormError("Max Tokens 必须大于 0")
-		}
-		if params.TopP != nil && (*params.TopP < 0 || *params.TopP > 1) {
-			return adminFormError("Top P 必须在 0 到 1 之间")
-		}
+func validateRelayModel(model database.RelayModel) error {
+	params := relay.DecodeAdvancedParams(model.AdvancedParams)
+	if params.MaxTokens != nil && *params.MaxTokens <= 0 {
+		return adminFormError("Max Tokens 必须大于 0")
+	}
+	if params.TopP != nil && (*params.TopP < 0 || *params.TopP > 1) {
+		return adminFormError("Top P 必须在 0 到 1 之间")
 	}
 	return nil
 }
@@ -774,37 +684,21 @@ func parseRelayProviderConfig(c *gin.Context) relay.ProviderConfig {
 	}
 }
 
-func (h *Handler) validateRelayProviderForm(apiFormat, endpoint, apiKey string, config relay.ProviderConfig, models []database.RelayModel) error {
+func (h *Handler) validateRelayProviderForm(apiFormat, endpoint string, config relay.ProviderConfig) error {
 	if h.endpointPolicy == nil {
 		return adminFormError("Endpoint 安全策略未配置")
 	}
 	if err := h.endpointPolicy.ValidateEndpoint(endpoint); err != nil {
 		return adminFormError("Endpoint 不安全: " + err.Error())
 	}
-	if apiFormat != relay.APIFormatOllama && strings.TrimSpace(apiKey) == "" {
-		return errors.New("API Key 必填")
-	}
 	if isVivoAppIDAPI(apiFormat) && strings.TrimSpace(config.AppID) == "" {
 		return errors.New("VIVO OCR/LASR 必须填写 AppID")
 	}
-	return validateRelayModelForm(apiFormat, models)
+	return nil
 }
 
 func adminFormError(message string) error {
 	return errors.New(message)
-}
-
-func legacyProviderAppID(provider database.RelayProvider) string {
-	for _, model := range provider.Entries {
-		params := relay.DecodeAdvancedParams(model.AdvancedParams)
-		if params.AppID != nil && strings.TrimSpace(*params.AppID) != "" {
-			return strings.TrimSpace(*params.AppID)
-		}
-		if params.User != nil && strings.TrimSpace(*params.User) != "" {
-			return strings.TrimSpace(*params.User)
-		}
-	}
-	return ""
 }
 
 func defaultString(value, fallback string) string {
@@ -821,14 +715,6 @@ func isVivoAppIDAPI(apiFormat string) bool {
 	default:
 		return false
 	}
-}
-
-func indexedPostForm(c *gin.Context, key string, i int) string {
-	values := c.PostFormArray(key)
-	if i < 0 || i >= len(values) {
-		return ""
-	}
-	return strings.TrimSpace(values[i])
 }
 
 func parseOptionalFloat(raw string) (*float64, error) {
@@ -864,30 +750,6 @@ func stringPtrString(v *string) string {
 	return *v
 }
 
-func relayModelSummary(rows []relayModelFormRow) string {
-	parts := make([]string, 0, len(rows))
-	for _, row := range rows {
-		if row.ModelID != "" {
-			parts = append(parts, row.ModelID+" ("+row.Category+")")
-		}
-	}
-	return strings.Join(parts, "\n")
-}
-
-func relayCategorySummary(rows []relayModelFormRow) string {
-	seen := map[string]struct{}{}
-	categories := make([]string, 0, 4)
-	for _, row := range rows {
-		category := relay.NormalizeCategory(row.Category)
-		if _, ok := seen[category]; ok {
-			continue
-		}
-		seen[category] = struct{}{}
-		categories = append(categories, category)
-	}
-	return strings.Join(categories, ", ")
-}
-
 func parseRelayAPIFormat(value string) (string, error) {
 	value = strings.ToLower(strings.TrimSpace(value))
 	if value == "" {
@@ -899,14 +761,577 @@ func parseRelayAPIFormat(value string) (string, error) {
 	return value, nil
 }
 
-func maskAPIKey(key string) string {
-	if key == "" {
-		return ""
+// --- Relay credentials ---
+
+func (h *Handler) RelayCredentials(c *gin.Context) {
+	provider, ok := h.loadRelayProviderParam(c, "id")
+	if !ok {
+		return
 	}
-	if len(key) <= 8 {
-		return "••••"
+	var credentials []database.RelayProviderCredential
+	h.db.Where("provider_id = ?", provider.ID).Order("priority DESC, id ASC").Find(&credentials)
+	h.render(c, "relay_credentials.html", h.pageData(c, "relay", map[string]interface{}{
+		"Provider": provider, "Credentials": credentials, "Error": c.Query("error"), "Message": c.Query("message"),
+	}))
+}
+
+func (h *Handler) NewRelayCredentialForm(c *gin.Context) {
+	provider, ok := h.loadRelayProviderParam(c, "id")
+	if !ok {
+		return
 	}
-	return key[:4] + "••••" + key[len(key)-4:]
+	h.renderRelayCredentialForm(c, provider, database.RelayProviderCredential{Enabled: true}, "新增凭据", "/admin/relay/"+strconv.FormatInt(provider.ID, 10)+"/credentials/new", false)
+}
+
+func (h *Handler) CreateRelayCredential(c *gin.Context) {
+	provider, ok := h.loadRelayProviderParam(c, "id")
+	if !ok {
+		return
+	}
+	credential, err := h.relayCredentialFromForm(c, provider, database.RelayProviderCredential{})
+	if err != nil {
+		h.redirectCredentialsWithError(c, provider.ID, "new", err.Error())
+		return
+	}
+	credential.ProviderID = provider.ID
+	if err := h.db.Create(&credential).Error; err != nil {
+		h.redirectCredentialsWithError(c, provider.ID, "new", "创建凭据失败")
+		return
+	}
+	c.Redirect(http.StatusFound, h.credentialsURL(provider.ID))
+}
+
+func (h *Handler) EditRelayCredentialForm(c *gin.Context) {
+	credential, provider, ok := h.loadRelayCredential(c)
+	if !ok {
+		return
+	}
+	h.renderRelayCredentialForm(c, provider, credential, "编辑凭据", "/admin/relay/credentials/"+strconv.FormatInt(credential.ID, 10)+"/edit", true)
+}
+
+func (h *Handler) UpdateRelayCredential(c *gin.Context) {
+	credential, provider, ok := h.loadRelayCredential(c)
+	if !ok {
+		return
+	}
+	var validationErr error
+	activeSession := false
+	err := h.db.Transaction(func(tx *gorm.DB) error {
+		query := tx
+		if tx.Dialector.Name() == "postgres" {
+			query = query.Clauses(clause.Locking{Strength: "UPDATE"})
+		}
+		var locked database.RelayProviderCredential
+		if err := query.First(&locked, "id = ?", credential.ID).Error; err != nil {
+			return err
+		}
+		updated, err := h.relayCredentialFromForm(c, provider, locked)
+		if err != nil {
+			validationErr = err
+			return nil
+		}
+		if updated.APIKey != locked.APIKey {
+			var count int64
+			if err := tx.Model(&database.RelaySpeechSession{}).
+				Where("credential_id = ? AND expires_at > ?", locked.ID, time.Now()).Count(&count).Error; err != nil {
+				return err
+			}
+			if count > 0 {
+				activeSession = true
+				return nil
+			}
+		}
+		return tx.Save(&updated).Error
+	})
+	if validationErr != nil {
+		h.redirectCredentialEditWithError(c, credential.ID, validationErr.Error())
+		return
+	}
+	if activeSession {
+		h.redirectCredentialEditWithError(c, credential.ID, "该凭据仍被有效语音会话使用，暂不能替换 API Key")
+		return
+	}
+	if err != nil {
+		h.redirectCredentialEditWithError(c, credential.ID, "保存凭据失败")
+		return
+	}
+	c.Redirect(http.StatusFound, h.credentialsURL(provider.ID))
+}
+
+func (h *Handler) ToggleRelayCredential(c *gin.Context) {
+	credential, provider, ok := h.loadRelayCredential(c)
+	if !ok {
+		return
+	}
+	credential.Enabled = !credential.Enabled
+	if err := h.db.Save(&credential).Error; err != nil {
+		h.redirectCredentialListWithError(c, provider.ID, "切换凭据失败")
+		return
+	}
+	c.Redirect(http.StatusFound, h.credentialsURL(provider.ID))
+}
+
+func (h *Handler) DeleteRelayCredential(c *gin.Context) {
+	credential, provider, ok := h.loadRelayCredential(c)
+	if !ok {
+		return
+	}
+	if h.hasActiveSpeechSession("credential_id = ?", credential.ID) {
+		h.redirectCredentialListWithError(c, provider.ID, "该凭据仍被有效语音会话使用，暂不能删除")
+		return
+	}
+	if err := h.db.Delete(&credential).Error; err != nil {
+		h.redirectCredentialListWithError(c, provider.ID, "删除凭据失败")
+		return
+	}
+	c.Redirect(http.StatusFound, h.credentialsURL(provider.ID))
+}
+
+func (h *Handler) ReleaseRelayCredential(c *gin.Context) {
+	credential, provider, ok := h.loadRelayCredential(c)
+	if !ok {
+		return
+	}
+	if h.credentialReleaser != nil {
+		h.credentialReleaser.ReleaseCredential(credential.ID)
+	}
+	c.Redirect(http.StatusFound, h.credentialsURL(provider.ID)+"?message="+url.QueryEscape("凭据冷却状态已释放"))
+}
+
+func (h *Handler) renderRelayCredentialForm(c *gin.Context, provider database.RelayProvider, credential database.RelayProviderCredential, title, action string, editing bool) {
+	config := relay.DecodeProviderConfig(credential.Config)
+	h.render(c, "relay_credentials_edit.html", h.pageData(c, "relay", map[string]interface{}{
+		"Provider": provider, "Credential": credential, "Title": title, "Action": action, "Editing": editing,
+		"Name": credential.Name, "Priority": credential.Priority, "Enabled": credential.Enabled, "AppID": config.AppID,
+		"ClientVersion": config.ClientVersion, "Package": config.Package, "OCRPos": config.OCRPos,
+		"BusinessIDPrefix": config.BusinessIDPrefix, "ImageModule": config.ImageModule, "Error": c.Query("error"),
+	}))
+}
+
+func (h *Handler) relayCredentialFromForm(c *gin.Context, provider database.RelayProvider, credential database.RelayProviderCredential) (database.RelayProviderCredential, error) {
+	credential.Name = strings.TrimSpace(c.PostForm("name"))
+	if credential.Name == "" {
+		return credential, errors.New("名称必填")
+	}
+	priority, err := strconv.Atoi(strings.TrimSpace(c.PostForm("priority")))
+	if err != nil {
+		return credential, errors.New("优先级必须是整数")
+	}
+	credential.Priority = priority
+	credential.Enabled = c.PostForm("enabled") == "on"
+	credential.Config = relay.EncodeProviderConfig(parseRelayProviderConfig(c))
+	if key := strings.TrimSpace(c.PostForm("apiKey")); key != "" {
+		credential.APIKey = key
+	}
+	if provider.APIFormat != relay.APIFormatOllama && credential.APIKey == "" {
+		return credential, errors.New("API Key 必填")
+	}
+	merged := relay.MergeProviderConfig(relay.DecodeProviderConfig(provider.Config), relay.DecodeProviderConfig(credential.Config))
+	if isVivoAppIDAPI(provider.APIFormat) && merged.AppID == "" {
+		return credential, errors.New("VIVO OCR/LASR 必须填写 AppID")
+	}
+	return credential, nil
+}
+
+func (h *Handler) loadRelayCredential(c *gin.Context) (database.RelayProviderCredential, database.RelayProvider, bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return database.RelayProviderCredential{}, database.RelayProvider{}, false
+	}
+	var credential database.RelayProviderCredential
+	if err := h.db.First(&credential, "id = ?", id).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return credential, database.RelayProvider{}, false
+	}
+	var provider database.RelayProvider
+	if err := h.db.First(&provider, "id = ?", credential.ProviderID).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return credential, provider, false
+	}
+	return credential, provider, true
+}
+
+// --- Global relay models and bindings ---
+
+func (h *Handler) RelayModels(c *gin.Context) {
+	var models []database.RelayModel
+	h.db.Preload("Bindings").Order("updated_at DESC").Find(&models)
+	views := make([]relayModelView, 0, len(models))
+	for _, model := range models {
+		views = append(views, relayModelView{Model: model, BindingCount: len(model.Bindings)})
+	}
+	h.render(c, "relay_models.html", h.pageData(c, "relay_models", map[string]interface{}{"Models": views, "Error": c.Query("error")}))
+}
+
+func (h *Handler) NewRelayModelForm(c *gin.Context) {
+	h.renderRelayModelForm(c, database.RelayModel{Category: relay.CategoryChat, Enabled: true}, "新增全局模型", "/admin/relay/models/new")
+}
+
+func (h *Handler) CreateRelayModel(c *gin.Context) {
+	model, err := relayModelFromForm(c, database.RelayModel{})
+	if err != nil {
+		h.redirectRelayModelNewWithError(c, err.Error())
+		return
+	}
+	if err := h.db.Create(&model).Error; err != nil {
+		h.redirectRelayModelNewWithError(c, "模型 ID 已存在或保存失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models/"+strconv.FormatInt(model.ID, 10)+"/edit")
+}
+
+func (h *Handler) EditRelayModelForm(c *gin.Context) {
+	model, ok := h.loadRelayModel(c)
+	if !ok {
+		return
+	}
+	h.renderRelayModelForm(c, model, "编辑全局模型", "/admin/relay/models/"+strconv.FormatInt(model.ID, 10)+"/edit")
+}
+
+func (h *Handler) UpdateRelayModel(c *gin.Context) {
+	model, ok := h.loadRelayModel(c)
+	if !ok {
+		return
+	}
+	updated, err := relayModelFromForm(c, model)
+	if err != nil {
+		h.redirectRelayModelEditWithError(c, model.ID, err.Error())
+		return
+	}
+	if err := h.validateExistingBindings(updated); err != nil {
+		h.redirectRelayModelEditWithError(c, model.ID, err.Error())
+		return
+	}
+	if err := h.db.Save(&updated).Error; err != nil {
+		h.redirectRelayModelEditWithError(c, model.ID, "模型 ID 已存在或保存失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models/"+strconv.FormatInt(model.ID, 10)+"/edit")
+}
+
+func (h *Handler) ToggleRelayModel(c *gin.Context) {
+	model, ok := h.loadRelayModel(c)
+	if !ok {
+		return
+	}
+	model.Enabled = !model.Enabled
+	if err := h.db.Save(&model).Error; err != nil {
+		h.redirectRelayModelsWithError(c, "切换模型失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models")
+}
+
+func (h *Handler) DeleteRelayModel(c *gin.Context) {
+	model, ok := h.loadRelayModel(c)
+	if !ok {
+		return
+	}
+	if h.hasActiveSpeechSession("model_id = ?", model.ModelID) {
+		h.redirectRelayModelsWithError(c, "该模型仍被有效语音会话使用，暂不能删除")
+		return
+	}
+	if err := h.db.Delete(&model).Error; err != nil {
+		h.redirectRelayModelsWithError(c, "删除模型失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models")
+}
+
+func (h *Handler) CreateRelayBinding(c *gin.Context) {
+	model, ok := h.loadRelayModel(c)
+	if !ok {
+		return
+	}
+	binding, err := h.relayBindingFromForm(c, model, database.RelayModelBinding{})
+	if err != nil {
+		h.redirectRelayModelEditWithError(c, model.ID, err.Error())
+		return
+	}
+	binding.RelayModelID = model.ID
+	if err := h.db.Create(&binding).Error; err != nil {
+		h.redirectRelayModelEditWithError(c, model.ID, "该模型已绑定此上游或保存失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models/"+strconv.FormatInt(model.ID, 10)+"/edit")
+}
+
+func (h *Handler) EditRelayBindingForm(c *gin.Context) {
+	binding, model, ok := h.loadRelayBinding(c)
+	if !ok {
+		return
+	}
+	var providers []database.RelayProvider
+	h.db.Order("name ASC").Find(&providers)
+	h.render(c, "relay_binding_edit.html", h.pageData(c, "relay_models", map[string]interface{}{
+		"Binding": binding, "Model": model, "Providers": providers, "Error": c.Query("error"),
+	}))
+}
+
+func (h *Handler) UpdateRelayBinding(c *gin.Context) {
+	binding, model, ok := h.loadRelayBinding(c)
+	if !ok {
+		return
+	}
+	updated, err := h.relayBindingFromForm(c, model, binding)
+	if err != nil {
+		h.redirectRelayBindingEditWithError(c, binding.ID, err.Error())
+		return
+	}
+	if err := h.db.Save(&updated).Error; err != nil {
+		h.redirectRelayBindingEditWithError(c, binding.ID, "该模型已绑定此上游或保存失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models/"+strconv.FormatInt(model.ID, 10)+"/edit")
+}
+
+func (h *Handler) ToggleRelayBinding(c *gin.Context) {
+	binding, model, ok := h.loadRelayBinding(c)
+	if !ok {
+		return
+	}
+	binding.Enabled = !binding.Enabled
+	if err := h.db.Save(&binding).Error; err != nil {
+		h.redirectRelayModelEditWithError(c, model.ID, "切换绑定失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models/"+strconv.FormatInt(model.ID, 10)+"/edit")
+}
+
+func (h *Handler) DeleteRelayBinding(c *gin.Context) {
+	binding, model, ok := h.loadRelayBinding(c)
+	if !ok {
+		return
+	}
+	if h.hasActiveSpeechSession("binding_id = ?", binding.ID) {
+		h.redirectRelayModelEditWithError(c, model.ID, "该绑定仍被有效语音会话使用，暂不能删除")
+		return
+	}
+	if err := h.db.Delete(&binding).Error; err != nil {
+		h.redirectRelayModelEditWithError(c, model.ID, "删除绑定失败")
+		return
+	}
+	c.Redirect(http.StatusFound, "/admin/relay/models/"+strconv.FormatInt(model.ID, 10)+"/edit")
+}
+
+func (h *Handler) renderRelayModelForm(c *gin.Context, model database.RelayModel, title, action string) {
+	capabilities := relay.DecodeCapabilities(model.Capabilities)
+	params := relay.DecodeAdvancedParams(model.AdvancedParams)
+	var bindings []database.RelayModelBinding
+	if model.ID != 0 {
+		h.db.Where("relay_model_id = ?", model.ID).Order("id ASC").Find(&bindings)
+	}
+	type bindingView struct {
+		Binding  database.RelayModelBinding
+		Provider database.RelayProvider
+	}
+	views := make([]bindingView, 0, len(bindings))
+	for _, binding := range bindings {
+		var provider database.RelayProvider
+		h.db.First(&provider, "id = ?", binding.ProviderID)
+		views = append(views, bindingView{Binding: binding, Provider: provider})
+	}
+	var providers []database.RelayProvider
+	h.db.Order("name ASC").Find(&providers)
+	h.render(c, "relay_models_edit.html", h.pageData(c, "relay_models", map[string]interface{}{
+		"Title": title, "Action": action, "Model": model, "Bindings": views, "Providers": providers, "Error": c.Query("error"),
+		"SupportsVision": capabilities.Vision, "SupportsThinking": capabilities.Thinking, "SupportsTools": capabilities.Tools,
+		"MaxTokens": intPtrString(params.MaxTokens), "Temperature": floatPtrString(params.Temperature), "TopP": floatPtrString(params.TopP),
+		"PresencePenalty": floatPtrString(params.PresencePenalty), "FrequencyPenalty": floatPtrString(params.FrequencyPenalty),
+		"Seed": intPtrString(params.Seed), "Stop": strings.Join(params.Stop, "\n"), "User": stringPtrString(params.User), "DebugSSE": params.DebugSSE,
+	}))
+}
+
+func relayModelFromForm(c *gin.Context, model database.RelayModel) (database.RelayModel, error) {
+	model.ModelID = strings.TrimSpace(c.PostForm("modelId"))
+	if model.ModelID == "" {
+		return model, errors.New("模型 ID 必填")
+	}
+	model.DisplayName = strings.TrimSpace(c.PostForm("displayName"))
+	model.Description = strings.TrimSpace(c.PostForm("description"))
+	model.Category = relay.NormalizeCategory(c.PostForm("category"))
+	model.Capabilities = relay.EncodeCapabilities(relay.ModelCapabilities{Vision: c.PostForm("supportsVision") == "on", Thinking: c.PostForm("supportsThinking") == "on", Tools: c.PostForm("supportsTools") == "on"})
+	params, err := parseAdvancedParams(c)
+	if err != nil {
+		return model, errors.New("高级参数格式错误")
+	}
+	model.AdvancedParams = relay.EncodeAdvancedParams(params)
+	model.Enabled = c.PostForm("enabled") == "on"
+	if err := validateRelayModel(model); err != nil {
+		return model, err
+	}
+	return model, nil
+}
+
+func (h *Handler) relayBindingFromForm(c *gin.Context, model database.RelayModel, binding database.RelayModelBinding) (database.RelayModelBinding, error) {
+	providerID, err := strconv.ParseInt(strings.TrimSpace(c.PostForm("providerId")), 10, 64)
+	if err != nil {
+		return binding, errors.New("请选择上游")
+	}
+	var provider database.RelayProvider
+	if err := h.db.First(&provider, "id = ?", providerID).Error; err != nil {
+		return binding, errors.New("上游不存在")
+	}
+	if !relay.SupportsCategory(provider.APIFormat, model.Category) {
+		return binding, errors.New("API Type 与模型分类不匹配")
+	}
+	weight, err := strconv.Atoi(strings.TrimSpace(c.PostForm("weight")))
+	if err != nil || weight < 1 {
+		return binding, errors.New("权重必须是大于 0 的整数")
+	}
+	binding.ProviderID = provider.ID
+	binding.UpstreamModel = strings.TrimSpace(c.PostForm("upstreamModel"))
+	if binding.UpstreamModel == "" {
+		return binding, errors.New("上游模型必填")
+	}
+	binding.Weight = weight
+	binding.Enabled = c.PostForm("enabled") == "on"
+	if err := h.validateSpeechBindingMix(model.ID, binding.ID, provider.APIFormat); err != nil {
+		return binding, err
+	}
+	return binding, nil
+}
+
+func (h *Handler) validateSpeechBindingMix(modelID, excludeBindingID int64, apiFormat string) error {
+	if apiFormat != relay.APIFormatOpenAISpeech && apiFormat != relay.APIFormatVivoLASR {
+		return nil
+	}
+	var formats []string
+	query := h.db.Table("relay_model_bindings b").Select("p.api_format").Joins("JOIN relay_providers p ON p.id = b.provider_id").Where("b.relay_model_id = ?", modelID)
+	if excludeBindingID != 0 {
+		query = query.Where("b.id <> ?", excludeBindingID)
+	}
+	if err := query.Pluck("p.api_format", &formats).Error; err != nil {
+		return errors.New("检查语音绑定失败")
+	}
+	for _, existing := range formats {
+		if (apiFormat == relay.APIFormatOpenAISpeech && existing == relay.APIFormatVivoLASR) || (apiFormat == relay.APIFormatVivoLASR && existing == relay.APIFormatOpenAISpeech) {
+			return errors.New("同一语音模型不能混用 openai_speech 与 vivo_lasr")
+		}
+	}
+	return nil
+}
+
+func (h *Handler) validateExistingBindings(model database.RelayModel) error {
+	var providers []database.RelayProvider
+	if err := h.db.Table("relay_providers p").Joins("JOIN relay_model_bindings b ON b.provider_id = p.id").Where("b.relay_model_id = ?", model.ID).Find(&providers).Error; err != nil {
+		return errors.New("检查模型绑定失败")
+	}
+	for _, provider := range providers {
+		if !relay.SupportsCategory(provider.APIFormat, model.Category) {
+			return errors.New("现有绑定的 API Type 与新模型分类不匹配")
+		}
+	}
+	return nil
+}
+
+func (h *Handler) validateProviderBindings(providerID int64, apiFormat string) error {
+	var models []database.RelayModel
+	if err := h.db.Table("relay_models m").Joins("JOIN relay_model_bindings b ON b.relay_model_id = m.id").Where("b.provider_id = ?", providerID).Find(&models).Error; err != nil {
+		return errors.New("检查上游绑定失败")
+	}
+	for _, model := range models {
+		if !relay.SupportsCategory(apiFormat, model.Category) {
+			return errors.New("现有绑定的模型分类与新 API Type 不匹配")
+		}
+		if apiFormat == relay.APIFormatOpenAISpeech || apiFormat == relay.APIFormatVivoLASR {
+			var formats []string
+			if err := h.db.Table("relay_model_bindings b").Select("p.api_format").Joins("JOIN relay_providers p ON p.id = b.provider_id").Where("b.relay_model_id = ? AND p.id <> ?", model.ID, providerID).Pluck("p.api_format", &formats).Error; err != nil {
+				return errors.New("检查语音绑定失败")
+			}
+			for _, existing := range formats {
+				if (apiFormat == relay.APIFormatOpenAISpeech && existing == relay.APIFormatVivoLASR) || (apiFormat == relay.APIFormatVivoLASR && existing == relay.APIFormatOpenAISpeech) {
+					return errors.New("同一语音模型不能混用 openai_speech 与 vivo_lasr")
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func (h *Handler) loadRelayModel(c *gin.Context) (database.RelayModel, bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return database.RelayModel{}, false
+	}
+	var model database.RelayModel
+	if err := h.db.First(&model, "id = ?", id).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return model, false
+	}
+	return model, true
+}
+
+func (h *Handler) loadRelayBinding(c *gin.Context) (database.RelayModelBinding, database.RelayModel, bool) {
+	id, err := strconv.ParseInt(c.Param("id"), 10, 64)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return database.RelayModelBinding{}, database.RelayModel{}, false
+	}
+	var binding database.RelayModelBinding
+	if err := h.db.First(&binding, "id = ?", id).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return binding, database.RelayModel{}, false
+	}
+	var model database.RelayModel
+	if err := h.db.First(&model, "id = ?", binding.RelayModelID).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return binding, model, false
+	}
+	return binding, model, true
+}
+
+func (h *Handler) loadRelayProviderParam(c *gin.Context, name string) (database.RelayProvider, bool) {
+	id, err := strconv.ParseInt(c.Param(name), 10, 64)
+	if err != nil {
+		c.Status(http.StatusNotFound)
+		return database.RelayProvider{}, false
+	}
+	var provider database.RelayProvider
+	if err := h.db.First(&provider, "id = ?", id).Error; err != nil {
+		c.Status(http.StatusNotFound)
+		return provider, false
+	}
+	return provider, true
+}
+
+func (h *Handler) hasActiveSpeechSession(where string, value interface{}) bool {
+	var count int64
+	return h.db.Model(&database.RelaySpeechSession{}).Where(where, value).Where("expires_at > ?", time.Now()).Count(&count).Error == nil && count > 0
+}
+
+func (h *Handler) credentialsURL(providerID int64) string {
+	return "/admin/relay/" + strconv.FormatInt(providerID, 10) + "/credentials"
+}
+
+func (h *Handler) redirectCredentialsWithError(c *gin.Context, providerID int64, page, message string) {
+	c.Redirect(http.StatusFound, h.credentialsURL(providerID)+"/"+page+"?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectCredentialEditWithError(c *gin.Context, credentialID int64, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay/credentials/"+strconv.FormatInt(credentialID, 10)+"/edit?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectCredentialListWithError(c *gin.Context, providerID int64, message string) {
+	c.Redirect(http.StatusFound, h.credentialsURL(providerID)+"?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectRelayModelsWithError(c *gin.Context, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay/models?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectRelayModelNewWithError(c *gin.Context, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay/models/new?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectRelayModelEditWithError(c *gin.Context, modelID int64, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay/models/"+strconv.FormatInt(modelID, 10)+"/edit?error="+url.QueryEscape(message))
+}
+
+func (h *Handler) redirectRelayBindingEditWithError(c *gin.Context, bindingID int64, message string) {
+	c.Redirect(http.StatusFound, "/admin/relay/bindings/"+strconv.FormatInt(bindingID, 10)+"/edit?error="+url.QueryEscape(message))
 }
 
 // --- Approve ---

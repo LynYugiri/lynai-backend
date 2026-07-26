@@ -46,6 +46,7 @@ textarea { width: 100%; padding: 8px 12px; border: 1px solid #ddd; border-radius
   <a href="/admin/pending" class="{{if eq .Active "pending"}}active{{end}}">待审核</a>
   <a href="/admin/plugins" class="{{if eq .Active "plugins"}}active{{end}}">全部插件</a>
   <a href="/admin/relay" class="{{if eq .Active "relay"}}active{{end}}">中转上游</a>
+  <a href="/admin/relay/models" class="{{if eq .Active "relay_models"}}active{{end}}">全局模型</a>
   <a href="/admin/relay/dashboard" class="{{if eq .Active "relay_dashboard"}}active{{end}}">调用概览</a>
   <a href="/admin/relay/logs" class="{{if eq .Active "relay_logs"}}active{{end}}">调用日志</a>
   <a href="/admin/users" class="{{if eq .Active "users"}}active{{end}}">用户</a>

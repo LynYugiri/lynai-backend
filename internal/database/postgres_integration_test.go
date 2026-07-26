@@ -29,8 +29,8 @@ func TestPostgresEmbeddedMigrationsAndValidation(t *testing.T) {
 	if err := db.Table("schema_migrations").Count(&count).Error; err != nil {
 		t.Fatalf("count applied migrations: %v", err)
 	}
-	if count != 10 {
-		t.Fatalf("applied migration count = %d, want 10", count)
+	if count != 11 {
+		t.Fatalf("applied migration count = %d, want 11", count)
 	}
 	for _, index := range []string{"idx_user_devices_device_id_global", "idx_user_devices_public_key_global"} {
 		var exists bool
@@ -114,14 +114,17 @@ func TestPostgresRelayProviderSequenceAdvancesPastExistingRows(t *testing.T) {
 		t.Fatalf("migrate legacy relay providers: %v", err)
 	}
 	var id int64
-	if err := db.Raw("INSERT INTO relay_providers (name, endpoint, api_key, api_format) VALUES ('new', 'https://example.com', 'key', 'openai') RETURNING id").Scan(&id).Error; err != nil {
+	if err := db.Raw("INSERT INTO relay_providers (name, endpoint, api_format) VALUES ('new', 'https://example.com', 'openai') RETURNING id").Scan(&id).Error; err != nil {
 		t.Fatalf("insert provider using default ID: %v", err)
 	}
 	if id != 42 {
 		t.Fatalf("generated relay provider ID = %d, want 42", id)
 	}
 	var models []string
-	if err := db.Raw("SELECT model_id FROM relay_models WHERE provider_id = 41 ORDER BY model_id").Scan(&models).Error; err != nil {
+	if err := db.Raw(`SELECT model.model_id
+		FROM relay_models AS model
+		JOIN relay_model_bindings AS binding ON binding.relay_model_id = model.id
+		WHERE binding.provider_id = 41 ORDER BY model.model_id`).Scan(&models).Error; err != nil {
 		t.Fatalf("list expanded relay models: %v", err)
 	}
 	if len(models) != 2 || models[0] != "legacy-a" || models[1] != "legacy-b" {
@@ -207,7 +210,10 @@ func TestPostgresRelayModelsMigrationTrimsDeduplicatesAndSkipsBlankIDs(t *testin
 		t.Fatalf("migrate whitespace model IDs: %v", err)
 	}
 	var models []string
-	if err := db.Raw("SELECT model_id FROM relay_models WHERE provider_id = 1 ORDER BY model_id").Scan(&models).Error; err != nil {
+	if err := db.Raw(`SELECT model.model_id
+		FROM relay_models AS model
+		JOIN relay_model_bindings AS binding ON binding.relay_model_id = model.id
+		WHERE binding.provider_id = 1 ORDER BY model.model_id`).Scan(&models).Error; err != nil {
 		t.Fatal(err)
 	}
 	if !reflect.DeepEqual(models, []string{"model-a", "model-b"}) {
@@ -269,11 +275,167 @@ func TestPostgresRelayProviderSequenceUsesAllHighWatermarks(t *testing.T) {
 		t.Fatalf("migrate legacy high watermarks: %v", err)
 	}
 	var id int64
-	if err := db.Raw("INSERT INTO relay_providers (name, endpoint, api_key, api_format) VALUES ('new', 'https://example.com', 'key', 'openai') RETURNING id").Scan(&id).Error; err != nil {
+	if err := db.Raw("INSERT INTO relay_providers (name, endpoint, api_format) VALUES ('new', 'https://example.com', 'openai') RETURNING id").Scan(&id).Error; err != nil {
 		t.Fatalf("insert provider using preserved sequence: %v", err)
 	}
 	if id != 100 {
 		t.Fatalf("generated relay provider ID = %d, want 100", id)
+	}
+}
+
+func TestPostgresRelayRoutingUpgrade(t *testing.T) {
+	db := pgtest.Open(t)
+	ctx := context.Background()
+	if err := database.MigrateToForTest(ctx, db, 10); err != nil {
+		t.Fatalf("apply migrations through 0010: %v", err)
+	}
+	if err := db.Exec(`
+		INSERT INTO users (id, phone, password_hash, display_name, is_admin, disabled, created_at, updated_at)
+		VALUES (1, '100', 'hash', 'user', FALSE, FALSE, NOW(), NOW());
+		INSERT INTO relay_providers (id, name, endpoint, api_key, api_format, config, enabled, created_at, updated_at)
+		VALUES
+			(11, 'first', 'https://first.example', 'first-secret', 'openai', '{"region":"a"}', TRUE, NOW() - interval '2 days', NOW() - interval '1 day'),
+			(12, 'second', 'https://second.example', '', 'ollama', '{}', FALSE, NOW(), NOW());
+		INSERT INTO relay_models (id, provider_id, model_id, display_name, description, category, capabilities, advanced_params, enabled, created_at, updated_at)
+		VALUES
+			(101, 11, 'shared', 'Earliest', 'first metadata', '', '{"vision":true}', '{}', FALSE, NOW() - interval '2 days', NOW() - interval '1 day'),
+			(102, 12, 'shared', 'Later', 'later metadata', 'chat', '{}', '{}', TRUE, NOW(), NOW()),
+			(150, 12, 'local', 'Local', '', 'chat', '{}', '{}', TRUE, NOW(), NOW());
+		INSERT INTO relay_speech_sessions (id, user_id, provider_id, model_id, app_id, upstream_audio_id, task_id, expires_at, created_at, updated_at)
+		VALUES ('AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', 1, 11, 'shared', 'app', 'audio', 'task', NOW() + interval '1 hour', NOW(), NOW());
+		INSERT INTO relay_request_logs (user_id, username, provider_id, provider_name, operation, route, protocol, http_status, duration_ms, request_bytes, response_bytes, created_at)
+		VALUES (1, 'user', 11, 'first', 'chat', '/relay/chat', 'openai', 200, 1, 2, 3, NOW())`).Error; err != nil {
+		t.Fatalf("seed relay routing upgrade: %v", err)
+	}
+
+	if err := database.Migrate(ctx, db); err != nil {
+		t.Fatalf("apply relay routing migration: %v", err)
+	}
+	if err := database.ValidateSchema(ctx, db); err != nil {
+		t.Fatalf("validate relay routing schema: %v", err)
+	}
+
+	var apiKeyColumn bool
+	if err := db.Raw(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'relay_providers' AND column_name = 'api_key'
+	)`).Scan(&apiKeyColumn).Error; err != nil {
+		t.Fatal(err)
+	}
+	if apiKeyColumn {
+		t.Fatal("relay_providers.api_key still exists")
+	}
+
+	type modelRow struct {
+		ID          int64
+		DisplayName string
+		Category    string
+		Enabled     bool
+	}
+	var shared modelRow
+	if err := db.Raw("SELECT id, display_name, category, enabled FROM relay_models WHERE model_id = 'shared'").Scan(&shared).Error; err != nil {
+		t.Fatal(err)
+	}
+	if shared.ID != 101 || shared.DisplayName != "Earliest" || shared.Category != "chat" || !shared.Enabled {
+		t.Fatalf("global shared model = %+v", shared)
+	}
+
+	var bindingCount, credentialCount int64
+	if err := db.Table("relay_model_bindings").Count(&bindingCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Table("relay_provider_credentials").Count(&credentialCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if bindingCount != 3 || credentialCount != 2 {
+		t.Fatalf("binding count = %d, credential count = %d", bindingCount, credentialCount)
+	}
+
+	type sessionRow struct {
+		BindingID      int64
+		CredentialID   int64
+		UpstreamModel  string
+		Endpoint       string
+		APIFormat      string
+		ConfigSnapshot string
+	}
+	var session sessionRow
+	if err := db.Raw(`SELECT binding_id, credential_id, upstream_model, endpoint, api_format, config_snapshot
+		FROM relay_speech_sessions WHERE id = 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'`).Scan(&session).Error; err != nil {
+		t.Fatal(err)
+	}
+	if session.BindingID == 0 || session.CredentialID == 0 || session.UpstreamModel != "shared" ||
+		session.Endpoint != "https://first.example" || session.APIFormat != "openai" || session.ConfigSnapshot != `{"region":"a"}` {
+		t.Fatalf("migrated speech session = %+v", session)
+	}
+
+	var credential database.RelayProviderCredential
+	if err := db.Where("provider_id = ?", 12).First(&credential).Error; err != nil {
+		t.Fatal(err)
+	}
+	if credential.Name != "Default" || credential.APIKey != "" || !credential.Enabled || credential.Config != "{}" {
+		t.Fatalf("Ollama default credential = %+v", credential)
+	}
+
+	var nextModelID int64
+	if err := db.Raw("INSERT INTO relay_models (model_id) VALUES ('next') RETURNING id").Scan(&nextModelID).Error; err != nil {
+		t.Fatal(err)
+	}
+	if nextModelID <= 150 {
+		t.Fatalf("next relay model ID = %d, want > 150", nextModelID)
+	}
+
+	if err := db.Exec("DELETE FROM relay_providers WHERE id = 11").Error; err == nil {
+		t.Fatal("provider deletion ignored existing speech session")
+	}
+	if err := db.Exec("DELETE FROM relay_model_bindings WHERE id = ?", session.BindingID).Error; err == nil {
+		t.Fatal("binding deletion ignored existing speech session")
+	}
+	if err := db.Exec("DELETE FROM relay_provider_credentials WHERE id = ?", session.CredentialID).Error; err == nil {
+		t.Fatal("credential deletion ignored existing speech session")
+	}
+}
+
+func TestPostgresRelayRoutingRejectsCategoryConflictsAndRollsBack(t *testing.T) {
+	db := pgtest.Open(t)
+	ctx := context.Background()
+	if err := database.MigrateToForTest(ctx, db, 10); err != nil {
+		t.Fatalf("apply migrations through 0010: %v", err)
+	}
+	if err := db.Exec(`
+		INSERT INTO relay_providers (id, name, endpoint, api_key, api_format, enabled)
+		VALUES (1, 'one', 'https://one.example', 'secret', 'openai', TRUE),
+		       (2, 'two', 'https://two.example', 'secret', 'openai', TRUE);
+		INSERT INTO relay_models (provider_id, model_id, category)
+		VALUES (1, 'conflict', ''), (2, 'conflict', 'embedding')`).Error; err != nil {
+		t.Fatalf("seed conflicting relay models: %v", err)
+	}
+
+	if err := database.Migrate(ctx, db); err == nil {
+		t.Fatal("migration accepted conflicting normalized categories")
+	}
+	var apiKeyColumn, providerIDColumn bool
+	if err := db.Raw(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'relay_providers' AND column_name = 'api_key'
+	)`).Scan(&apiKeyColumn).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Raw(`SELECT EXISTS (
+		SELECT 1 FROM information_schema.columns
+		WHERE table_schema = current_schema() AND table_name = 'relay_models' AND column_name = 'provider_id'
+	)`).Scan(&providerIDColumn).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !apiKeyColumn || !providerIDColumn {
+		t.Fatalf("failed migration did not roll back: api_key=%t provider_id=%t", apiKeyColumn, providerIDColumn)
+	}
+	var migrationCount int64
+	if err := db.Table("schema_migrations").Where("version = ?", 11).Count(&migrationCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if migrationCount != 0 {
+		t.Fatalf("migration 0011 record count = %d, want 0", migrationCount)
 	}
 }
 

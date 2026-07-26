@@ -53,7 +53,7 @@ func TestCanonicalChatFixture(t *testing.T) {
 
 func TestOpenAIRequestConvertsCanonicalNamedToolChoice(t *testing.T) {
 	request, err := parseCanonicalChat([]byte(`{
-		"providerId":"1","model":"test","messages":[{"role":"user","content":[{"type":"text","text":"weather?"}]}],
+		"model":"test","messages":[{"role":"user","content":[{"type":"text","text":"weather?"}]}],
 		"reasoning":{"enabled":true},
 		"tools":[{"name":"weather","description":"Get weather","parameters":{"type":"object"}}],
 		"toolChoice":{"name":"weather"}
@@ -77,7 +77,7 @@ func TestOpenAIRequestConvertsCanonicalNamedToolChoice(t *testing.T) {
 
 func TestCanonicalToolChoiceRejectsUnsupportedShapes(t *testing.T) {
 	for _, choice := range []string{`"invalid"`, `{"type":"function"}`, `[]`, `1`} {
-		raw := `{"providerId":"1","model":"test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"toolChoice":` + choice + `}`
+		raw := `{"model":"test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"toolChoice":` + choice + `}`
 		if _, err := parseCanonicalChat([]byte(raw)); err == nil {
 			t.Fatalf("accepted toolChoice %s", choice)
 		}
@@ -86,14 +86,14 @@ func TestCanonicalToolChoiceRejectsUnsupportedShapes(t *testing.T) {
 
 func TestCanonicalChatRejectsStringContentAndInvalidFiles(t *testing.T) {
 	tests := []string{
-		`{"providerId":"1","model":"test","messages":[{"role":"user","content":"legacy"}]}`,
-		`{"providerId":"1","model":"test","messages":[{"role":"user"}]}`,
-		`{"providerId":"1","model":"test","messages":[{"role":"user","content":null}]}`,
-		`{"providerId":"1","model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"","mimeType":"image/png","dataBase64":"aQ=="}}]}]}`,
-		`{"providerId":"1","model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.png","mimeType":"image/png; charset=binary","dataBase64":"aQ=="}}]}]}`,
-		`{"providerId":"1","model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.svg","mimeType":"image/svg+xml","dataBase64":"aQ=="}}]}]}`,
-		`{"providerId":"1","model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.png","mimeType":"image/png","dataBase64":"%%%"}}]}]}`,
-		`{"providerId":"1","model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.png","mimeType":"image/png","dataBase64":"aQ==\n"}}]}]}`,
+		`{"model":"test","messages":[{"role":"user","content":"legacy"}]}`,
+		`{"model":"test","messages":[{"role":"user"}]}`,
+		`{"model":"test","messages":[{"role":"user","content":null}]}`,
+		`{"model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"","mimeType":"image/png","dataBase64":"aQ=="}}]}]}`,
+		`{"model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.png","mimeType":"image/png; charset=binary","dataBase64":"aQ=="}}]}]}`,
+		`{"model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.svg","mimeType":"image/svg+xml","dataBase64":"aQ=="}}]}]}`,
+		`{"model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.png","mimeType":"image/png","dataBase64":"%%%"}}]}]}`,
+		`{"model":"test","messages":[{"role":"user","content":[{"type":"inputFile","file":{"name":"x.png","mimeType":"image/png","dataBase64":"aQ==\n"}}]}]}`,
 	}
 	for _, raw := range tests {
 		if _, err := parseCanonicalChat([]byte(raw)); err == nil {
@@ -104,7 +104,7 @@ func TestCanonicalChatRejectsStringContentAndInvalidFiles(t *testing.T) {
 
 func TestAdaptersMapCanonicalMultimodalContent(t *testing.T) {
 	request, err := parseCanonicalChat([]byte(`{
-		"providerId":"1","model":"test","messages":[{"role":"user","content":[
+		"model":"test","messages":[{"role":"user","content":[
 			{"type":"text","text":"inspect"},
 			{"type":"inputFile","file":{"name":"pixel.png","mimeType":"image/png","dataBase64":"aW1hZ2U="}},
 			{"type":"inputFile","file":{"name":"notes.txt","mimeType":"text/plain","dataBase64":"aGVsbG8="}}
@@ -349,8 +349,7 @@ func TestAnthropicReasoningBudgetStaysBelowMaxTokens(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			request := ChatRequest{
-				ProviderID: "1",
-				Model:      "claude",
+				Model: "claude",
 				Messages: []ChatMessage{{
 					Role:    "user",
 					Content: []ChatContentPart{{Type: "text", Text: "hello"}},
@@ -377,8 +376,7 @@ func TestAnthropicReasoningBudgetStaysBelowMaxTokens(t *testing.T) {
 func TestAnthropicReasoningRejectsMaxTokensWithoutBudgetRoom(t *testing.T) {
 	maxTokens := 1
 	request := ChatRequest{
-		ProviderID: "1",
-		Model:      "claude",
+		Model: "claude",
 		Messages: []ChatMessage{{
 			Role:    "user",
 			Content: []ChatContentPart{{Type: "text", Text: "hello"}},
@@ -412,7 +410,9 @@ func TestWriteCanonicalSSEClassifiesTimeout(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			recorder := httptest.NewRecorder()
 			ctx, _ := gin.CreateTestContext(recorder)
-			writeCanonicalSSE(ctx, errorStreamAdapter{err: test.err}, strings.NewReader(""))
+			if err := writeCanonicalSSE(ctx, errorStreamAdapter{err: test.err}, strings.NewReader("")); !errors.Is(err, test.err) {
+				t.Fatalf("writeCanonicalSSE error = %v, want %v", err, test.err)
+			}
 			if got := ctx.GetString("relayErrorType"); got != test.want {
 				t.Fatalf("relayErrorType = %q, want %q", got, test.want)
 			}

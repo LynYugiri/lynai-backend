@@ -153,6 +153,12 @@ func ValidateSchema(ctx context.Context, db *gorm.DB) error {
 		return err
 	}
 	required := map[string][]string{
+		"relay_providers":            {"id", "name", "endpoint", "api_format", "config", "enabled"},
+		"relay_provider_credentials": {"id", "provider_id", "name", "api_key", "priority", "config", "enabled"},
+		"relay_models":               {"id", "model_id", "display_name", "description", "category", "capabilities", "advanced_params", "enabled"},
+		"relay_model_bindings":       {"id", "relay_model_id", "provider_id", "upstream_model", "weight", "enabled"},
+		"relay_speech_sessions":      {"provider_id", "binding_id", "credential_id", "model_id", "upstream_model", "endpoint", "api_format", "config_snapshot"},
+		"relay_request_logs":         {"binding_id", "credential_id", "credential_name", "attempt_count", "failover_count"},
 		"sync_metadata":              {"generation", "index_revision", "min_available_seq"},
 		"sync_records":               {"user_id", "table_name", "record_id", "category", "object_id", "data", "seq", "updated_at"},
 		"sync_record_blobs":          {"user_id", "table_name", "record_id", "sha256"},

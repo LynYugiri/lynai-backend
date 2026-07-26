@@ -101,7 +101,10 @@ func (h *Handler) LoggingMiddleware() gin.HandlerFunc {
 			ProviderName: c.GetString("relayProviderName"), APIType: c.GetString("relayAPIType"),
 			ModelID: c.GetString("relayModelID"), Category: c.GetString("relayCategory"),
 			UpstreamStatus: upstreamStatus, ErrorType: errorType,
-			CreatedAt: time.Now(),
+			BindingID: contextInt64Ptr(c, "relayBindingID"), CredentialID: contextInt64Ptr(c, "relayCredentialID"),
+			CredentialName: contextStringPtr(c, "relayCredentialName"), AttemptCount: maxInt(contextInt(c, "relayAttemptCount"), 1),
+			FailoverCount: maxInt(contextInt(c, "relayFailoverCount"), 0),
+			CreatedAt:     time.Now(),
 		}
 		h.logs.Enqueue(entry)
 	}
@@ -132,15 +135,32 @@ func relayOperation(path string) string {
 	}
 }
 
-func (h *Handler) setLogModel(c *gin.Context, resolved *ResolvedModel) {
-	c.Set("relayProviderID", resolved.Provider.ID)
-	c.Set("relayProviderName", resolved.Provider.Name)
-	c.Set("relayAPIType", normalizeAPIType(resolved.Provider.APIFormat))
-	c.Set("relayModelID", resolved.Model.ModelID)
-	c.Set("relayCategory", NormalizeCategory(resolved.Model.Category))
+func (h *Handler) setLogCandidate(c *gin.Context, candidate Candidate, attempts int) {
+	c.Set("relayProviderID", candidate.Provider.ID)
+	c.Set("relayProviderName", candidate.Provider.Name)
+	c.Set("relayBindingID", candidate.Binding.ID)
+	c.Set("relayCredentialID", candidate.Credential.ID)
+	c.Set("relayCredentialName", candidate.Credential.Name)
+	c.Set("relayAPIType", normalizeAPIType(candidate.Provider.APIFormat))
+	c.Set("relayModelID", candidate.Model.ModelID)
+	c.Set("relayCategory", NormalizeCategory(candidate.Model.Category))
+	c.Set("relayAttemptCount", attempts)
+	c.Set("relayFailoverCount", attempts-1)
 }
 
 func setUpstreamStatus(c *gin.Context, status int) { c.Set("relayUpstreamStatus", status) }
+
+func retryableStatus(status int) bool {
+	return status == http.StatusRequestTimeout || status == http.StatusTooEarly || status == http.StatusTooManyRequests || status >= 500
+}
+
+func skipProviderCandidates(candidates []Candidate, index int) int {
+	providerID := candidates[index].Provider.ID
+	for index+1 < len(candidates) && candidates[index+1].Provider.ID == providerID {
+		index++
+	}
+	return index
+}
 
 func contextInt64(c *gin.Context, key string) int64 {
 	value, _ := c.Get(key)
@@ -151,6 +171,26 @@ func contextInt(c *gin.Context, key string) int {
 	value, _ := c.Get(key)
 	result, _ := value.(int)
 	return result
+}
+func contextInt64Ptr(c *gin.Context, key string) *int64 {
+	value := contextInt64(c, key)
+	if value == 0 {
+		return nil
+	}
+	return &value
+}
+func contextStringPtr(c *gin.Context, key string) *string {
+	value := c.GetString(key)
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+func maxInt(value, minimum int) int {
+	if value < minimum {
+		return minimum
+	}
+	return value
 }
 func maxInt64(value, minimum int64) int64 {
 	if value < minimum {
@@ -172,18 +212,21 @@ func (h *Handler) Chat(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	resolved, err := h.svc.Resolve(request.ProviderID, request.Model)
+	model, candidates, err := h.svc.Candidates(request.Model)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
 	}
-	h.setLogModel(c, resolved)
 
-	if resolved.Model.Category != "" && resolved.Model.Category != CategoryChat && resolved.Model.Category != CategoryOCR {
+	if model.Category != "" && model.Category != CategoryChat && model.Category != CategoryOCR {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a chat or OCR model")
 		return
 	}
-	capabilities := DecodeCapabilities(resolved.Model.Capabilities)
+	if len(candidates) == 0 {
+		h.writeResolveError(c, ErrModelNotFound)
+		return
+	}
+	capabilities := DecodeCapabilities(model.Capabilities)
 	if requestUsesTools(request) && !capabilities.Tools {
 		writeOpenAIError(c, http.StatusBadRequest, "unsupported_feature", "requested model does not support tools")
 		return
@@ -196,56 +239,98 @@ func (h *Handler) Chat(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "unsupported_feature", "requested model does not support image input")
 		return
 	}
-	applyCanonicalDefaults(&request, resolved.Model)
-	adapter, err := adapterFor(resolved.Provider.APIFormat)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "unsupported_feature", err.Error())
-		return
-	}
-	forwardBody, err := adapter.Request(request)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
-		return
-	}
-	var resp *http.Response
-	switch normalizeAPIType(resolved.Provider.APIFormat) {
-	case APIFormatOpenAI:
-		resp, err = h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, forwardBody)
-	case APIFormatAnthropic:
-		resp, err = h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, forwardBody)
-	case APIFormatOllama:
-		resp, err = h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, forwardBody)
-	}
-	if err != nil {
-		writeForwardError(c, err)
-		return
-	}
-	setUpstreamStatus(c, resp.StatusCode)
-	defer resp.Body.Close()
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		if _, err := readBoundedUpstreamBody(resp.Body); err != nil {
-			writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "upstream error response is too large or unreadable")
+	applyCanonicalDefaults(&request, model)
+	var terminalErr error
+	var terminalStatus int
+	attempts := 0
+	for i := range candidates {
+		candidate := candidates[i]
+		adapter, adapterErr := adapterFor(candidate.Provider.APIFormat)
+		if adapterErr != nil {
+			continue
+		}
+		attempt := request
+		attempt.Model = candidate.Binding.UpstreamModel
+		forwardBody, requestErr := adapter.Request(attempt)
+		if requestErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", requestErr.Error())
 			return
 		}
-		writeOpenAIError(c, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream provider returned HTTP %d", resp.StatusCode))
+		attempts++
+		h.setLogCandidate(c, candidate, attempts)
+		var resp *http.Response
+		switch normalizeAPIType(candidate.Provider.APIFormat) {
+		case APIFormatOpenAI:
+			resp, err = h.svc.ForwardChat(c.Request.Context(), &candidate, forwardBody)
+		case APIFormatAnthropic:
+			resp, err = h.svc.ForwardAnthropicMessages(c.Request.Context(), &candidate, forwardBody)
+		case APIFormatOllama:
+			resp, err = h.svc.ForwardOllamaChat(c.Request.Context(), &candidate, forwardBody)
+		}
+		if err != nil {
+			terminalErr = err
+			terminalStatus = 0
+			setUpstreamStatus(c, 0)
+			h.svc.router.Cooldown(candidate, 0, "", true)
+			continue
+		}
+		setUpstreamStatus(c, resp.StatusCode)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			terminalStatus = resp.StatusCode
+			terminalErr = nil
+			retry := retryableStatus(resp.StatusCode)
+			h.svc.router.Cooldown(candidate, resp.StatusCode, resp.Header.Get("Retry-After"), false)
+			_, readErr := readBoundedUpstreamBody(resp.Body)
+			_ = resp.Body.Close()
+			if retry || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+				if readErr != nil {
+					terminalErr = readErr
+					terminalStatus = 0
+					setUpstreamStatus(c, 0)
+				}
+				if resp.StatusCode == http.StatusNotFound {
+					i = skipProviderCandidates(candidates, i)
+				}
+				continue
+			}
+			writeOpenAIError(c, resp.StatusCode, "upstream_error", fmt.Sprintf("upstream provider returned HTTP %d", resp.StatusCode))
+			return
+		}
+		if request.Stream {
+			defer resp.Body.Close()
+			if streamErr := writeCanonicalSSE(c, adapter, resp.Body); streamErr != nil {
+				h.svc.router.Cooldown(candidate, 0, "", true)
+				return
+			}
+			h.svc.router.Success(candidate)
+			return
+		}
+		raw, readErr := readBoundedUpstreamBody(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			terminalErr = readErr
+			terminalStatus = 0
+			setUpstreamStatus(c, 0)
+			h.svc.router.Cooldown(candidate, 0, "", true)
+			continue
+		}
+		response, responseErr := adapter.Response(raw)
+		if responseErr != nil {
+			terminalErr = responseErr
+			terminalStatus = 0
+			setUpstreamStatus(c, 0)
+			h.svc.router.Cooldown(candidate, http.StatusBadGateway, "", false)
+			continue
+		}
+		h.svc.router.Success(candidate)
+		c.JSON(http.StatusOK, response)
 		return
 	}
-	if request.Stream {
-		writeCanonicalSSE(c, adapter, resp.Body)
+	if terminalStatus != 0 {
+		writeOpenAIError(c, terminalStatus, "upstream_error", fmt.Sprintf("upstream provider returned HTTP %d", terminalStatus))
 		return
 	}
-	raw, err := readBoundedUpstreamBody(resp.Body)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_protocol_error", "upstream response is too large or unreadable")
-		return
-	}
-	response, err := adapter.Response(raw)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_protocol_error", err.Error())
-		return
-	}
-	c.JSON(http.StatusOK, response)
+	writeForwardError(c, terminalErr)
 }
 
 // Transcribe forwards an OpenAI-compatible audio transcription request.
@@ -254,44 +339,53 @@ func (h *Handler) Transcribe(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
 		return
 	}
-	if hasLegacyFormRoute(c.Request) {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "api_type and provider_id are not supported; use providerId")
+	model := strings.TrimSpace(c.Request.FormValue("model"))
+	if strings.TrimSpace(c.Request.FormValue("providerId")) != "" || strings.TrimSpace(c.Request.FormValue("provider_id")) != "" || strings.TrimSpace(c.Request.FormValue("api_type")) != "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "only model may select a relay route")
 		return
 	}
-	model := strings.TrimSpace(c.Request.FormValue("model"))
-	providerID := relayProviderIDFromForm(c.Request)
 	if model == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
-	resolved, err := h.svc.Resolve(providerID, model)
+	globalModel, candidates, err := h.svc.Candidates(model)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
 	}
-	h.setLogModel(c, resolved)
-	if resolved.Model.Category != CategorySpeech {
+	if globalModel.Category != CategorySpeech {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a speech-to-text model")
 		return
 	}
-	if normalizeAPIType(resolved.Provider.APIFormat) != APIFormatOpenAISpeech {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested provider does not support OpenAI transcription")
+	for i := range candidates {
+		candidate := candidates[i]
+		if normalizeAPIType(candidate.Provider.APIFormat) != APIFormatOpenAISpeech {
+			continue
+		}
+		h.setLogCandidate(c, candidate, i+1)
+		c.Request.MultipartForm.Value["model"] = []string{candidate.Binding.UpstreamModel}
+		body, contentType, cloneErr := CloneMultipartForm(c.Request.MultipartForm)
+		if cloneErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to prepare multipart request")
+			return
+		}
+		resp, forwardErr := h.svc.ForwardMultipart(c.Request.Context(), &candidate, "/audio/transcriptions", body, contentType)
+		if forwardErr != nil {
+			h.svc.router.Cooldown(candidate, 0, "", true)
+			continue
+		}
+		setUpstreamStatus(c, resp.StatusCode)
+		if retryableStatus(resp.StatusCode) || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
+			h.svc.router.Cooldown(candidate, resp.StatusCode, resp.Header.Get("Retry-After"), false)
+			_ = resp.Body.Close()
+			continue
+		}
+		h.svc.router.Success(candidate)
+		defer resp.Body.Close()
+		writeBoundedUpstreamResponse(c, resp)
 		return
 	}
-	delete(c.Request.MultipartForm.Value, "providerId")
-	body, contentType, err := CloneMultipartForm(c.Request.MultipartForm)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to prepare multipart request")
-		return
-	}
-	resp, err := h.svc.ForwardMultipart(c.Request.Context(), &resolved.Provider, "/audio/transcriptions", body, contentType)
-	if err != nil {
-		writeForwardError(c, err)
-		return
-	}
-	setUpstreamStatus(c, resp.StatusCode)
-	defer resp.Body.Close()
-	writeBoundedUpstreamResponse(c, resp)
+	writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "no routable transcription provider succeeded")
 }
 
 // OCR forwards an image OCR request to a managed OCR or vision-chat upstream.
@@ -300,22 +394,24 @@ func (h *Handler) OCR(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid multipart request")
 		return
 	}
-	if hasLegacyFormRoute(c.Request) {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "api_type and provider_id are not supported; use providerId")
+	model := strings.TrimSpace(c.Request.FormValue("model"))
+	if strings.TrimSpace(c.Request.FormValue("providerId")) != "" || strings.TrimSpace(c.Request.FormValue("provider_id")) != "" || strings.TrimSpace(c.Request.FormValue("api_type")) != "" {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "only model may select a relay route")
 		return
 	}
-	model := strings.TrimSpace(c.Request.FormValue("model"))
-	providerID := relayProviderIDFromForm(c.Request)
 	if model == "" {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "model is required")
 		return
 	}
-	resolved, err := h.svc.Resolve(providerID, model)
+	globalModel, candidates, err := h.svc.Candidates(model)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
 	}
-	h.setLogModel(c, resolved)
+	if globalModel.Category != CategoryOCR {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not an OCR model")
+		return
+	}
 	file, _, err := c.Request.FormFile("file")
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "file is required")
@@ -327,11 +423,7 @@ func (h *Handler) OCR(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to read file")
 		return
 	}
-	if normalizeAPIType(resolved.Provider.APIFormat) == APIFormatVivoOCR {
-		h.forwardVivoOCR(c, resolved, image)
-		return
-	}
-	h.forwardVisionOCR(c, resolved, image)
+	h.forwardOCRCandidates(c, candidates, image)
 }
 
 // SpeechCreate starts a managed long-running speech transcription session.
@@ -346,29 +438,36 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid JSON body")
 		return
 	}
-	if _, ok := body["api_type"]; ok {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "api_type is not supported; use providerId")
-		return
-	}
-	if _, ok := body["provider_id"]; ok {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "provider_id is not supported; use providerId")
-		return
-	}
 	model := strings.TrimSpace(fmt.Sprint(body["model"]))
-	providerID := relayProviderID(body)
-	resolved, err := h.svc.Resolve(providerID, model)
+	if _, exists := body["providerId"]; exists {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "only model may select a relay route")
+		return
+	}
+	if _, exists := body["provider_id"]; exists {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "only model may select a relay route")
+		return
+	}
+	if _, exists := body["api_type"]; exists {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "only model may select a relay route")
+		return
+	}
+	globalModel, candidates, err := h.svc.Candidates(model)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
 	}
-	h.setLogModel(c, resolved)
-	if normalizeAPIType(resolved.Provider.APIFormat) != APIFormatVivoLASR {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "speech session is only supported for vivo_lasr")
+	if globalModel.Category != CategorySpeech {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not a speech model")
 		return
 	}
-	appID := relayProviderAppID(resolved.Provider, resolved.Model)
-	if appID == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_lasr requires provider AppID")
+	filtered := candidates[:0]
+	for _, candidate := range candidates {
+		if normalizeAPIType(candidate.Provider.APIFormat) == APIFormatVivoLASR {
+			filtered = append(filtered, candidate)
+		}
+	}
+	if len(filtered) == 0 {
+		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "speech session is only supported for vivo_lasr")
 		return
 	}
 	sessionID, err := newSpeechSessionID()
@@ -376,57 +475,71 @@ func (h *Handler) SpeechCreate(c *gin.Context) {
 		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to create speech session")
 		return
 	}
-	if err := h.speech.reserve(sessionID, c.GetString("userID"), resolved, appID); err != nil {
-		if errors.Is(err, errSpeechCapacity) {
-			writeOpenAIError(c, http.StatusTooManyRequests, "capacity_error", "speech session capacity reached")
+	for i, candidate := range filtered {
+		appID := candidateAppID(candidate)
+		if appID == "" {
+			continue
+		}
+		h.setLogCandidate(c, candidate, i+1)
+		if err := h.speech.reserve(sessionID, c.GetString("userID"), &candidate, &appID); err != nil {
+			if errors.Is(err, errSpeechCapacity) {
+				writeOpenAIError(c, http.StatusTooManyRequests, "capacity_error", "speech session capacity reached")
+				return
+			}
+			writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to reserve speech session")
 			return
 		}
-		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to reserve speech session")
-		return
-	}
-	reserved := true
-	defer func() {
-		if reserved {
+		query := vivoSpeechQuery(candidate.Config, appID, candidate.Binding.UpstreamModel)
+		raw, ok := marshalRelayJSON(c, map[string]interface{}{"audio_type": fmt.Sprint(body["audio_type"]), "x-sessionId": sessionID, "slice_num": body["slice_num"]})
+		if !ok {
 			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+			return
 		}
-	}()
-	query := vivoSpeechQuery(resolved.Provider, appID, resolved.Model.ModelID)
-	upstreamBody := map[string]interface{}{
-		"audio_type":  fmt.Sprint(body["audio_type"]),
-		"x-sessionId": sessionID,
-		"slice_num":   body["slice_num"],
-	}
-	raw, ok := marshalRelayJSON(c, upstreamBody)
-	if !ok {
+		resp, forwardErr := h.svc.ForwardVivoJSON(c.Request.Context(), &candidate, "/lasr/create", query, raw)
+		if forwardErr != nil {
+			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+			writeForwardError(c, forwardErr)
+			return
+		}
+		setUpstreamStatus(c, resp.StatusCode)
+		rawResp, readErr := readBoundedUpstreamBody(resp.Body)
+		_ = resp.Body.Close()
+		if retryableStatus(resp.StatusCode) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+			h.svc.router.Cooldown(candidate, resp.StatusCode, resp.Header.Get("Retry-After"), false)
+			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+			continue
+		}
+		if readErr != nil {
+			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+			writeForwardError(c, readErr)
+			return
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+			writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(rawResp))
+			return
+		}
+		var upstream map[string]interface{}
+		if err := json.Unmarshal(rawResp, &upstream); err != nil {
+			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+			writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(rawResp))
+			return
+		}
+		upstreamAudioID, _ := nestedString(upstream, "data", "audio_id")
+		if upstreamAudioID == "" {
+			h.speech.deleteReservation(sessionID, c.GetString("userID"))
+			writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "vivo_lasr create did not return audio_id")
+			return
+		}
+		if err := h.speech.completeReservation(sessionID, c.GetString("userID"), upstreamAudioID); err != nil {
+			writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to save speech session")
+			return
+		}
+		h.svc.router.Success(candidate)
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"audio_id": sessionID}})
 		return
 	}
-	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &resolved.Provider, "/lasr/create", query, raw)
-	if err != nil {
-		writeForwardError(c, err)
-		return
-	}
-	setUpstreamStatus(c, resp.StatusCode)
-	defer resp.Body.Close()
-	upstream, rawResp, err := decodeJSONResponse(resp)
-	if errors.Is(err, ErrUpstreamTimeout) {
-		writeForwardError(c, err)
-		return
-	}
-	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(rawResp))
-		return
-	}
-	upstreamAudioID, _ := nestedString(upstream, "data", "audio_id")
-	if upstreamAudioID == "" {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "vivo_lasr create did not return audio_id")
-		return
-	}
-	if err := h.speech.completeReservation(sessionID, c.GetString("userID"), upstreamAudioID); err != nil {
-		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to save speech session")
-		return
-	}
-	reserved = false
-	c.JSON(http.StatusOK, gin.H{"data": gin.H{"audio_id": sessionID}})
+	writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "no vivo_lasr provider succeeded")
 }
 
 func (h *Handler) SpeechUpload(c *gin.Context) {
@@ -443,11 +556,11 @@ func (h *Handler) SpeechUpload(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "failed to prepare multipart request")
 		return
 	}
-	query := vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID)
+	query := vivoSpeechQuery(session.Candidate.Config, session.AppID, session.Candidate.Binding.UpstreamModel)
 	query.Set("audio_id", session.UpstreamAudioID)
 	query.Set("x-sessionId", c.Param("audioId"))
 	query.Set("slice_index", c.DefaultQuery("slice_index", c.Request.FormValue("slice_index")))
-	resp, err := h.svc.ForwardVivoMultipart(c.Request.Context(), &session.Provider, "/lasr/upload", query, body, contentType)
+	resp, err := h.svc.ForwardVivoMultipart(c.Request.Context(), &session.Candidate, "/lasr/upload", query, body, contentType)
 	if err != nil {
 		writeForwardError(c, err)
 		return
@@ -466,7 +579,7 @@ func (h *Handler) SpeechRun(c *gin.Context) {
 	if !ok {
 		return
 	}
-	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, "/lasr/run", vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID), raw)
+	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Candidate, "/lasr/run", vivoSpeechQuery(session.Candidate.Config, session.AppID, session.Candidate.Binding.UpstreamModel), raw)
 	if err != nil {
 		writeForwardError(c, err)
 		return
@@ -505,43 +618,63 @@ func (h *Handler) ImageGenerations(c *gin.Context) {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "request body is too large or unreadable")
 		return
 	}
-	forwardBody, model, providerID, _, err := prepareRoutedBody(body)
+	forwardBody, modelID, _, err := prepareRoutedBody(body)
 	if err != nil {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	resolved, err := h.svc.Resolve(providerID, model)
+	model, candidates, err := h.svc.Candidates(modelID)
 	if err != nil {
 		h.writeResolveError(c, err)
 		return
 	}
-	h.setLogModel(c, resolved)
-	if resolved.Model.Category != CategoryImageGeneration {
+	if model.Category != CategoryImageGeneration {
 		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "requested model is not an image generation model")
 		return
 	}
-	forwardBody, err = ApplyModelDefaults(resolved.Provider.APIFormat, forwardBody, resolved.Model)
-	if err != nil {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+	for i := range candidates {
+		candidate := candidates[i]
+		apiType := normalizeAPIType(candidate.Provider.APIFormat)
+		if apiType != APIFormatVivoImage && apiType != APIFormatOpenAIImage {
+			continue
+		}
+		h.setLogCandidate(c, candidate, i+1)
+		attemptBody, mapErr := replaceJSONModel(forwardBody, candidate.Binding.UpstreamModel)
+		if mapErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+			return
+		}
+		attemptBody, mapErr = ApplyModelDefaults(candidate.Provider.APIFormat, attemptBody, model)
+		if mapErr != nil {
+			writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "invalid request body")
+			return
+		}
+		var resp *http.Response
+		if apiType == APIFormatVivoImage {
+			resp, err = h.svc.ForwardVivoImage(c.Request.Context(), &candidate, attemptBody)
+		} else {
+			resp, err = h.svc.ForwardJSON(c.Request.Context(), &candidate, "/images/generations", attemptBody)
+		}
+		if err != nil {
+			writeForwardError(c, err)
+			return
+		}
+		setUpstreamStatus(c, resp.StatusCode)
+		if retryableStatus(resp.StatusCode) || resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusNotFound {
+			h.svc.router.Cooldown(candidate, resp.StatusCode, resp.Header.Get("Retry-After"), false)
+			_ = resp.Body.Close()
+			continue
+		}
+		h.svc.router.Success(candidate)
+		defer resp.Body.Close()
+		if apiType == APIFormatVivoImage {
+			h.writeVivoImageResponse(c, resp)
+		} else {
+			writeBoundedUpstreamResponse(c, resp)
+		}
 		return
 	}
-	var resp *http.Response
-	if normalizeAPIType(resolved.Provider.APIFormat) == APIFormatVivoImage {
-		resp, err = h.svc.ForwardVivoImage(c.Request.Context(), &resolved.Provider, forwardBody)
-	} else {
-		resp, err = h.svc.ForwardJSON(c.Request.Context(), &resolved.Provider, "/images/generations", forwardBody)
-	}
-	if err != nil {
-		writeForwardError(c, err)
-		return
-	}
-	setUpstreamStatus(c, resp.StatusCode)
-	defer resp.Body.Close()
-	if normalizeAPIType(resolved.Provider.APIFormat) == APIFormatVivoImage {
-		h.writeVivoImageResponse(c, resp)
-		return
-	}
-	writeBoundedUpstreamResponse(c, resp)
+	writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "no image provider succeeded")
 }
 
 func (h *Handler) writeVivoImageResponse(c *gin.Context, resp *http.Response) {
@@ -600,69 +733,109 @@ func writeUpstreamResponse(c *gin.Context, resp *http.Response, stream bool) {
 	writeBoundedUpstreamResponse(c, resp)
 }
 
-// Config returns schema v3 provider-to-model configuration without upstream details.
+// Config returns the schema v4 flat global model configuration.
 func (h *Handler) Config(c *gin.Context) {
-	providers, err := h.svc.ListConfig()
+	models, err := h.svc.ListConfig()
 	if err != nil {
 		writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to list relay config")
 		return
 	}
-	data := make([]gin.H, 0, len(providers))
-	for _, provider := range providers {
-		models := make([]gin.H, 0, len(provider.Entries))
-		for _, entry := range provider.Entries {
-			models = append(models, modelPayload(provider, entry))
+	data := make([]gin.H, 0, len(models))
+	for _, model := range models {
+		payload := modelPayload(model)
+		var formats []string
+		_ = h.svc.db.Table("relay_model_bindings b").Select("DISTINCT p.api_format").Joins("JOIN relay_providers p ON p.id = b.provider_id").Joins("JOIN relay_provider_credentials c ON c.provider_id = p.id").Where("b.relay_model_id = ? AND b.enabled = ? AND p.enabled = ? AND c.enabled = ?", model.ID, true, true, true).Pluck("p.api_format", &formats).Error
+		if NormalizeCategory(model.Category) == CategorySpeech && len(formats) > 0 {
+			allLASR := true
+			for _, format := range formats {
+				if normalizeAPIType(format) != APIFormatVivoLASR {
+					allLASR = false
+				}
+			}
+			if allLASR {
+				payload["workflow"] = APIFormatVivoLASR
+			}
 		}
-		data = append(data, gin.H{
-			"providerId": fmt.Sprintf("%d", provider.ID),
-			"name":       provider.Name,
-			"models":     models,
-			"updatedAt":  provider.UpdatedAt,
-		})
+		data = append(data, payload)
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"object":        "relay_config",
-		"schemaVersion": 3,
+		"schemaVersion": 4,
 		"data":          data,
 	})
 }
 
-func (h *Handler) forwardVivoOCR(c *gin.Context, resolved *ResolvedModel, image []byte) {
-	appID := relayProviderAppID(resolved.Provider, resolved.Model)
-	if appID == "" {
-		writeOpenAIError(c, http.StatusBadRequest, "invalid_request_error", "vivo_ocr requires provider AppID")
+func (h *Handler) forwardOCRCandidates(c *gin.Context, candidates []Candidate, image []byte) {
+	for i := range candidates {
+		candidate := candidates[i]
+		h.setLogCandidate(c, candidate, i+1)
+		var resp *http.Response
+		var payload map[string]interface{}
+		var raw []byte
+		var err error
+		if normalizeAPIType(candidate.Provider.APIFormat) == APIFormatVivoOCR {
+			resp, payload, raw, err = h.doVivoOCR(c, candidate, image)
+		} else {
+			resp, payload, raw, err = h.doVisionOCR(c, candidate, image)
+		}
+		if err != nil && resp == nil {
+			h.svc.router.Cooldown(candidate, 0, "", true)
+			continue
+		}
+		setUpstreamStatus(c, resp.StatusCode)
+		if retryableStatus(resp.StatusCode) || resp.StatusCode == 401 || resp.StatusCode == 403 || resp.StatusCode == 404 {
+			h.svc.router.Cooldown(candidate, resp.StatusCode, resp.Header.Get("Retry-After"), false)
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(raw))
+			return
+		}
+		if err != nil {
+			h.svc.router.Cooldown(candidate, 0, "", true)
+			continue
+		}
+		h.svc.router.Success(candidate)
+		if normalizeAPIType(candidate.Provider.APIFormat) == APIFormatVivoOCR {
+			c.JSON(http.StatusOK, gin.H{"text": extractVivoOCRText(payload), "raw": payload})
+		} else {
+			c.JSON(http.StatusOK, gin.H{"text": extractChatText(normalizeAPIType(candidate.Provider.APIFormat), payload), "raw": payload})
+		}
 		return
+	}
+	writeOpenAIError(c, http.StatusBadGateway, "upstream_error", "no OCR provider succeeded")
+}
+
+func (h *Handler) doVivoOCR(c *gin.Context, candidate Candidate, image []byte) (*http.Response, map[string]interface{}, []byte, error) {
+	appID := candidateAppID(candidate)
+	if appID == "" {
+		return nil, nil, nil, errors.New("vivo_ocr requires AppID")
 	}
 	query := url.Values{}
 	query.Set("requestId", strconv.FormatInt(time.Now().UnixNano(), 10))
 	form := url.Values{}
 	form.Set("image", base64.StdEncoding.EncodeToString(image))
-	config := DecodeProviderConfig(resolved.Provider.Config)
+	config := candidate.Config
 	form.Set("pos", defaultProviderValue(config.OCRPos, "2"))
 	form.Set("businessid", defaultProviderValue(config.BusinessIDPrefix, "aigc")+appID)
-	resp, err := h.svc.ForwardVivoForm(c.Request.Context(), &resolved.Provider, "", query, form)
+	resp, err := h.svc.ForwardVivoForm(c.Request.Context(), &candidate, "", query, form)
 	if err != nil {
-		writeForwardError(c, err)
-		return
+		return nil, nil, nil, err
 	}
-	setUpstreamStatus(c, resp.StatusCode)
-	defer resp.Body.Close()
-	payload, raw, err := decodeJSONResponse(resp)
-	if errors.Is(err, ErrUpstreamTimeout) {
-		writeForwardError(c, err)
-		return
-	}
+	raw, err := readBoundedUpstreamBody(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(raw))
-		return
+		return resp, nil, raw, err
 	}
-	c.JSON(http.StatusOK, gin.H{"text": extractVivoOCRText(payload), "raw": payload})
+	var payload map[string]interface{}
+	err = json.Unmarshal(raw, &payload)
+	return resp, payload, raw, err
 }
 
-func (h *Handler) forwardVisionOCR(c *gin.Context, resolved *ResolvedModel, image []byte) {
+func (h *Handler) doVisionOCR(c *gin.Context, candidate Candidate, image []byte) (*http.Response, map[string]interface{}, []byte, error) {
 	encoded := base64.StdEncoding.EncodeToString(image)
 	mime := "image/png"
-	apiType := normalizeAPIType(resolved.Provider.APIFormat)
+	apiType := normalizeAPIType(candidate.Provider.APIFormat)
 	prompt := "请识别图片中的文字，只返回识别到的文字内容。"
 	var body []byte
 	var resp *http.Response
@@ -670,40 +843,35 @@ func (h *Handler) forwardVisionOCR(c *gin.Context, resolved *ResolvedModel, imag
 	var ok bool
 	switch apiType {
 	case APIFormatAnthropic:
-		body, ok = marshalRelayJSON(c, gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image", "source": gin.H{"type": "base64", "media_type": mime, "data": encoded}}}}}})
+		body, ok = marshalRelayJSON(c, gin.H{"model": candidate.Binding.UpstreamModel, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image", "source": gin.H{"type": "base64", "media_type": mime, "data": encoded}}}}}})
 		if !ok {
-			return
+			return nil, nil, nil, errors.New("encode OCR request")
 		}
-		resp, err = h.svc.ForwardAnthropicMessages(c.Request.Context(), &resolved.Provider, body)
+		resp, err = h.svc.ForwardAnthropicMessages(c.Request.Context(), &candidate, body)
 	case APIFormatOllama:
-		body, ok = marshalRelayJSON(c, gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": prompt, "images": []string{encoded}}}})
+		body, ok = marshalRelayJSON(c, gin.H{"model": candidate.Binding.UpstreamModel, "stream": false, "messages": []gin.H{{"role": "user", "content": prompt, "images": []string{encoded}}}})
 		if !ok {
-			return
+			return nil, nil, nil, errors.New("encode OCR request")
 		}
-		resp, err = h.svc.ForwardOllamaChat(c.Request.Context(), &resolved.Provider, body)
+		resp, err = h.svc.ForwardOllamaChat(c.Request.Context(), &candidate, body)
 	default:
-		body, ok = marshalRelayJSON(c, gin.H{"model": resolved.Model.ModelID, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image_url", "image_url": gin.H{"url": "data:" + mime + ";base64," + encoded}}}}}})
+		body, ok = marshalRelayJSON(c, gin.H{"model": candidate.Binding.UpstreamModel, "stream": false, "messages": []gin.H{{"role": "user", "content": []gin.H{{"type": "text", "text": prompt}, {"type": "image_url", "image_url": gin.H{"url": "data:" + mime + ";base64," + encoded}}}}}})
 		if !ok {
-			return
+			return nil, nil, nil, errors.New("encode OCR request")
 		}
-		resp, err = h.svc.ForwardChat(c.Request.Context(), &resolved.Provider, body)
+		resp, err = h.svc.ForwardChat(c.Request.Context(), &candidate, body)
 	}
 	if err != nil {
-		writeForwardError(c, err)
-		return
+		return nil, nil, nil, err
 	}
-	setUpstreamStatus(c, resp.StatusCode)
-	defer resp.Body.Close()
-	payload, raw, err := decodeJSONResponse(resp)
-	if errors.Is(err, ErrUpstreamTimeout) {
-		writeForwardError(c, err)
-		return
-	}
+	raw, err := readBoundedUpstreamBody(resp.Body)
+	_ = resp.Body.Close()
 	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		writeOpenAIError(c, http.StatusBadGateway, "upstream_error", string(raw))
-		return
+		return resp, nil, raw, err
 	}
-	c.JSON(http.StatusOK, gin.H{"text": extractChatText(apiType, payload), "raw": payload})
+	var payload map[string]interface{}
+	err = json.Unmarshal(raw, &payload)
+	return resp, payload, raw, err
 }
 
 func (h *Handler) loadSpeechSession(c *gin.Context) (speechSession, bool) {
@@ -712,7 +880,7 @@ func (h *Handler) loadSpeechSession(c *gin.Context) (speechSession, bool) {
 		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "speech session not found")
 		return speechSession{}, false
 	}
-	h.setLogModel(c, &ResolvedModel{Provider: session.Provider, Model: session.Model})
+	h.setLogCandidate(c, session.Candidate, 1)
 	return session, true
 }
 
@@ -729,7 +897,7 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 	if !ok {
 		return
 	}
-	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Provider, path, vivoSpeechQuery(session.Provider, session.AppID, session.Model.ModelID), raw)
+	resp, err := h.svc.ForwardVivoJSON(c.Request.Context(), &session.Candidate, path, vivoSpeechQuery(session.Candidate.Config, session.AppID, session.Candidate.Binding.UpstreamModel), raw)
 	if err != nil {
 		writeForwardError(c, err)
 		return
@@ -755,11 +923,11 @@ func (h *Handler) forwardSpeechTaskJSON(c *gin.Context, path string, normalize b
 	c.JSON(resp.StatusCode, gin.H{"text": extractVivoSpeechText(payload), "raw": payload})
 }
 
-func relayProviderAppID(provider database.RelayProvider, model database.RelayModel) string {
-	if appID := strings.TrimSpace(DecodeProviderConfig(provider.Config).AppID); appID != "" {
+func candidateAppID(candidate Candidate) string {
+	if appID := strings.TrimSpace(candidate.Config.AppID); appID != "" {
 		return appID
 	}
-	params := DecodeAdvancedParams(model.AdvancedParams)
+	params := DecodeAdvancedParams(candidate.Model.AdvancedParams)
 	if params.AppID != nil {
 		if appID := strings.TrimSpace(*params.AppID); appID != "" {
 			return appID
@@ -771,8 +939,7 @@ func relayProviderAppID(provider database.RelayProvider, model database.RelayMod
 	return strings.TrimSpace(*params.User)
 }
 
-func vivoSpeechQuery(provider database.RelayProvider, appID, engineID string) url.Values {
-	config := DecodeProviderConfig(provider.Config)
+func vivoSpeechQuery(config ProviderConfig, appID, engineID string) url.Values {
 	query := url.Values{}
 	query.Set("client_version", defaultProviderValue(config.ClientVersion, "1.0.0"))
 	query.Set("package", defaultProviderValue(config.Package, "lynai"))
@@ -950,49 +1117,31 @@ func validVivoSpeechResult(payload map[string]interface{}) bool {
 	return true
 }
 
-func prepareRoutedBody(raw []byte) ([]byte, string, string, bool, error) {
+func prepareRoutedBody(raw []byte) ([]byte, string, bool, error) {
 	var body map[string]interface{}
 	if err := json.Unmarshal(raw, &body); err != nil {
-		return nil, "", "", false, fmt.Errorf("invalid JSON body")
+		return nil, "", false, fmt.Errorf("invalid JSON body")
 	}
-	if _, ok := body["api_type"]; ok {
-		return nil, "", "", false, fmt.Errorf("api_type is not supported; use providerId")
+	if _, exists := body["providerId"]; exists {
+		return nil, "", false, fmt.Errorf("only model may select a relay route")
 	}
-	if _, ok := body["provider_id"]; ok {
-		return nil, "", "", false, fmt.Errorf("provider_id is not supported; use providerId")
+	if _, exists := body["provider_id"]; exists {
+		return nil, "", false, fmt.Errorf("only model may select a relay route")
+	}
+	if _, exists := body["api_type"]; exists {
+		return nil, "", false, fmt.Errorf("only model may select a relay route")
 	}
 	model, _ := body["model"].(string)
 	model = strings.TrimSpace(model)
 	if model == "" {
-		return nil, "", "", false, fmt.Errorf("model is required")
-	}
-	providerID := relayProviderID(body)
-	if providerID == "" {
-		return nil, "", "", false, fmt.Errorf("providerId is required")
+		return nil, "", false, fmt.Errorf("model is required")
 	}
 	stream, _ := body["stream"].(bool)
-	delete(body, "providerId")
 	forwardBody, err := json.Marshal(body)
 	if err != nil {
-		return nil, "", "", false, fmt.Errorf("failed to encode request body")
+		return nil, "", false, fmt.Errorf("failed to encode request body")
 	}
-	return forwardBody, model, providerID, stream, nil
-}
-
-func relayProviderID(body map[string]interface{}) string {
-	value := strings.TrimSpace(fmt.Sprint(body["providerId"]))
-	if value == "<nil>" {
-		return ""
-	}
-	return value
-}
-
-func relayProviderIDFromForm(request *http.Request) string {
-	return strings.TrimSpace(request.FormValue("providerId"))
-}
-
-func hasLegacyFormRoute(request *http.Request) bool {
-	return strings.TrimSpace(request.FormValue("api_type")) != "" || strings.TrimSpace(request.FormValue("provider_id")) != ""
+	return forwardBody, model, stream, nil
 }
 
 func writeOpenAIError(c *gin.Context, status int, typ, message string) {
@@ -1009,24 +1158,16 @@ func writeForwardError(c *gin.Context, err error) {
 }
 
 func (h *Handler) writeResolveError(c *gin.Context, err error) {
-	if errors.Is(err, ErrProviderNotFound) {
-		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "no enabled relay model matches providerId and model")
+	if errors.Is(err, ErrModelNotFound) {
+		writeOpenAIError(c, http.StatusNotFound, "not_found_error", "no enabled relay model matches model")
 		return
 	}
 	writeOpenAIError(c, http.StatusInternalServerError, "server_error", "failed to resolve relay provider")
 }
 
-func modelPayload(provider database.RelayProvider, entry database.RelayModel) gin.H {
+func modelPayload(entry database.RelayModel) gin.H {
 	advancedParams := DecodeAdvancedParams(entry.AdvancedParams)
-	if isVivoAPIFormat(provider.APIFormat) {
-		appID := relayProviderAppID(provider, entry)
-		if appID != "" {
-			advancedParams.AppID = &appID
-		}
-		if advancedParams.User != nil && advancedParams.AppID != nil && *advancedParams.User == *advancedParams.AppID {
-			advancedParams.User = nil
-		}
-	}
+	advancedParams.AppID = nil
 	payload := gin.H{
 		"id":             entry.ModelID,
 		"category":       NormalizeCategory(entry.Category),
@@ -1034,21 +1175,18 @@ func modelPayload(provider database.RelayProvider, entry database.RelayModel) gi
 		"description":    entry.Description,
 		"capabilities":   DecodeCapabilities(entry.Capabilities),
 		"advancedParams": advancedParams,
-		"enabled":        entry.Enabled && provider.Enabled,
-	}
-	if normalizeAPIType(provider.APIFormat) == APIFormatVivoLASR {
-		payload["workflow"] = APIFormatVivoLASR
+		"enabled":        entry.Enabled,
 	}
 	return payload
 }
 
-func isVivoAPIFormat(apiFormat string) bool {
-	switch normalizeAPIType(apiFormat) {
-	case APIFormatVivoOCR, APIFormatVivoLASR:
-		return true
-	default:
-		return false
+func replaceJSONModel(raw []byte, model string) ([]byte, error) {
+	var body map[string]interface{}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		return nil, err
 	}
+	body["model"] = model
+	return json.Marshal(body)
 }
 
 func copyResponseHeaders(c *gin.Context, headers http.Header) {

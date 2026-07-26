@@ -99,7 +99,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 
 	var adminHandler *admin.Handler
 	if withAdminPanel {
-		adminHandler, err = admin.NewHandlerWithEndpointPolicy(db, authSvc, marketSvc, jwtMgr, endpointPolicy)
+		adminHandler, err = admin.NewHandlerWithEndpointPolicyAndReleaser(db, authSvc, marketSvc, jwtMgr, endpointPolicy, relaySvc)
 		if err != nil {
 			panic("admin templates: " + err.Error())
 		}

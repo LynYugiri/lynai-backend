@@ -167,27 +167,15 @@ func TestAdminPanelRelayProviderManage(t *testing.T) {
 	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
 	csrf := extractCSRF(t, body)
 	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
-		"_csrf":          {csrf},
-		"name":           {"OpenAI Test"},
-		"endpoint":       {"https://api.example.com/v1"},
-		"apiFormat":      {"openai"},
-		"apiKey":         {"secret-key"},
-		"modelId":        {"gpt-test", "gpt-other"},
-		"category":       {"chat", "chat"},
-		"modelEnabled_0": {"on"},
-		"modelEnabled_1": {"on"},
-		"enabled":        {"on"},
+		"_csrf": {csrf}, "name": {"OpenAI Test"}, "endpoint": {"https://api.example.com/v1"}, "apiFormat": {"openai"}, "enabled": {"on"},
 	})
 	body = getAdminPage(t, client, ts.URL+"/admin/relay")
-	if !strings.Contains(body, "OpenAI Test") || !strings.Contains(body, "gpt-test") || !strings.Contains(body, "openai") {
+	if !strings.Contains(body, "OpenAI Test") || !strings.Contains(body, "openai") || !strings.Contains(body, "0 / 0") {
 		t.Fatal("created relay provider is not visible")
-	}
-	if strings.Contains(body, "secret-key") {
-		t.Fatal("relay provider page leaked api key")
 	}
 }
 
-func TestAdminPanelRelayProviderModelRows(t *testing.T) {
+func TestAdminPanelRelayCredentialsAndGlobalModels(t *testing.T) {
 	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
 	defer cleanup()
 
@@ -197,44 +185,27 @@ func TestAdminPanelRelayProviderModelRows(t *testing.T) {
 	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
 	csrf := extractCSRF(t, body)
 	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
-		"_csrf":            {csrf},
-		"name":             {"Rich OpenAI"},
-		"endpoint":         {"https://api.example.com/v1"},
-		"apiFormat":        {"openai"},
-		"apiKey":           {"secret-key"},
-		"modelId":          {"gpt-admin", "ocr-admin"},
-		"displayName":      {"GPT Admin", "OCR Admin"},
-		"description":      {"chat entry", "ocr entry"},
-		"category":         {"chat", "ocr"},
-		"maxTokens":        {"4096", ""},
-		"temperature":      {"0.2", ""},
-		"topP":             {"0.9", ""},
-		"presencePenalty":  {"0.1", ""},
-		"frequencyPenalty": {"0.2", ""},
-		"seed":             {"42", ""},
-		"stop":             {"END", ""},
-		"user":             {"local-user", ""},
-		"supportsVision_0": {"on"},
-		"supportsTools_0":  {"on"},
-		"debugSse_0":       {"on"},
-		"modelEnabled_0":   {"on"},
-		"modelEnabled_1":   {"on"},
-		"enabled":          {"on"},
+		"_csrf": {csrf}, "name": {"Rich OpenAI"}, "endpoint": {"https://api.example.com/v1"}, "apiFormat": {"openai"}, "enabled": {"on"},
 	})
-
 	body = getAdminPage(t, client, ts.URL+"/admin/relay")
-	if !strings.Contains(body, "Rich OpenAI") || !strings.Contains(body, "gpt-admin (chat)") || !strings.Contains(body, "ocr-admin (ocr)") {
-		t.Fatalf("created relay model rows are not visible: %s", body)
-	}
 	match := regexp.MustCompile(`/admin/relay/(\d+)/edit`).FindStringSubmatch(body)
 	if len(match) != 2 {
 		t.Fatal("edit link not found")
 	}
-	body = getAdminPage(t, client, ts.URL+"/admin/relay/"+match[1]+"/edit")
-	for _, want := range []string{"GPT Admin", "OCR Admin", "value=\"4096\"", "value=\"0.2\"", "value=\"0.9\"", "value=\"42\"", ">END</textarea>", "value=\"local-user\""} {
-		if !strings.Contains(body, want) {
-			t.Fatalf("edit form missing %q", want)
-		}
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/"+match[1]+"/credentials/new")
+	csrf = extractCSRF(t, body)
+	postFormFollow(t, client, ts.URL+"/admin/relay/"+match[1]+"/credentials/new", url.Values{"_csrf": {csrf}, "name": {"Primary"}, "apiKey": {"secret-key"}, "priority": {"10"}, "enabled": {"on"}})
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/"+match[1]+"/credentials")
+	if !strings.Contains(body, "Primary") || strings.Contains(body, "secret-key") {
+		t.Fatalf("credential page missing name or leaked secret: %s", body)
+	}
+
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/models/new")
+	csrf = extractCSRF(t, body)
+	postFormFollow(t, client, ts.URL+"/admin/relay/models/new", url.Values{"_csrf": {csrf}, "modelId": {"gpt-admin"}, "displayName": {"GPT Admin"}, "category": {"chat"}, "maxTokens": {"4096"}, "enabled": {"on"}})
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/models")
+	if !strings.Contains(body, "gpt-admin") || !strings.Contains(body, "GPT Admin") {
+		t.Fatalf("global model missing: %s", body)
 	}
 }
 
@@ -248,15 +219,11 @@ func TestAdminPanelRelayVivoAppID(t *testing.T) {
 	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
 	csrf := extractCSRF(t, body)
 	resp := postForm(t, client, ts.URL+"/admin/relay/new", url.Values{
-		"_csrf":          {csrf},
-		"name":           {"Broken VIVO OCR"},
-		"endpoint":       {"https://api-ai.vivo.com.cn/ocr/general_recognition"},
-		"apiFormat":      {"vivo_ocr"},
-		"apiKey":         {"app-key"},
-		"modelId":        {"general_recognition"},
-		"category":       {"ocr"},
-		"modelEnabled_0": {"on"},
-		"enabled":        {"on"},
+		"_csrf":     {csrf},
+		"name":      {"Broken VIVO OCR"},
+		"endpoint":  {"https://api-ai.vivo.com.cn/ocr/general_recognition"},
+		"apiFormat": {"vivo_ocr"},
+		"enabled":   {"on"},
 	})
 	brokenBody := string(testutil.ReadAll(t, resp.Body))
 	resp.Body.Close()
@@ -267,20 +234,16 @@ func TestAdminPanelRelayVivoAppID(t *testing.T) {
 	body = getAdminPage(t, client, ts.URL+"/admin/relay/new")
 	csrf = extractCSRF(t, body)
 	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
-		"_csrf":          {csrf},
-		"name":           {"VIVO OCR"},
-		"endpoint":       {"https://api-ai.vivo.com.cn/ocr/general_recognition"},
-		"apiFormat":      {"vivo_ocr"},
-		"apiKey":         {"app-key"},
-		"modelId":        {"general_recognition"},
-		"category":       {"ocr"},
-		"appId":          {"vivo-app-id"},
-		"modelEnabled_0": {"on"},
-		"enabled":        {"on"},
+		"_csrf":     {csrf},
+		"name":      {"VIVO OCR"},
+		"endpoint":  {"https://api-ai.vivo.com.cn/ocr/general_recognition"},
+		"apiFormat": {"vivo_ocr"},
+		"appId":     {"vivo-app-id"},
+		"enabled":   {"on"},
 	})
 
 	body = getAdminPage(t, client, ts.URL+"/admin/relay")
-	if !strings.Contains(body, "VIVO OCR") || !strings.Contains(body, "general_recognition (ocr)") {
+	if !strings.Contains(body, "VIVO OCR") {
 		t.Fatalf("created vivo relay provider is not visible: %s", body)
 	}
 	match := regexp.MustCompile(`/admin/relay/(\d+)/edit`).FindStringSubmatch(body)
@@ -293,17 +256,24 @@ func TestAdminPanelRelayVivoAppID(t *testing.T) {
 	}
 }
 
-func TestAdminPanelRelayRejectsInvalidTypeAndCategory(t *testing.T) {
+func TestAdminPanelRelayBindingRejectsInvalidCategory(t *testing.T) {
 	adminPhone, adminPassword, ts, cleanup := testutil.SetupTestWithAdminPanel()
 	defer cleanup()
 	client := adminClient(t)
 	loginAdmin(t, client, ts.URL, adminPhone, adminPassword)
 	body := getAdminPage(t, client, ts.URL+"/admin/relay/new")
 	csrf := extractCSRF(t, body)
-	resp := postForm(t, client, ts.URL+"/admin/relay/new", url.Values{
-		"_csrf": {csrf}, "name": {"Bad"}, "endpoint": {"https://example.com"}, "apiFormat": {"vivo_image"},
-		"apiKey": {"key"}, "modelId": {"image"}, "category": {"chat"}, "modelEnabled_0": {"on"},
-	})
+	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{"_csrf": {csrf}, "name": {"Image"}, "endpoint": {"https://example.com"}, "apiFormat": {"vivo_image"}, "enabled": {"on"}})
+	body = getAdminPage(t, client, ts.URL+"/admin/relay")
+	provider := regexp.MustCompile(`/admin/relay/(\d+)/edit`).FindStringSubmatch(body)[1]
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/models/new")
+	csrf = extractCSRF(t, body)
+	postFormFollow(t, client, ts.URL+"/admin/relay/models/new", url.Values{"_csrf": {csrf}, "modelId": {"chat-model"}, "category": {"chat"}, "enabled": {"on"}})
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/models")
+	model := regexp.MustCompile(`/admin/relay/models/(\d+)/edit`).FindStringSubmatch(body)[1]
+	body = getAdminPage(t, client, ts.URL+"/admin/relay/models/"+model+"/edit")
+	csrf = extractCSRF(t, body)
+	resp := postForm(t, client, ts.URL+"/admin/relay/models/"+model+"/bindings", url.Values{"_csrf": {csrf}, "providerId": {provider}, "upstreamModel": {"image"}, "weight": {"1"}, "enabled": {"on"}})
 	raw := string(testutil.ReadAll(t, resp.Body))
 	resp.Body.Close()
 	if !strings.Contains(raw, "API Type") || !strings.Contains(raw, "模型分类") {
@@ -320,7 +290,7 @@ func TestAdminPanelRelayAllowsOllamaWithoutAPIKey(t *testing.T) {
 	csrf := extractCSRF(t, body)
 	postFormFollow(t, client, ts.URL+"/admin/relay/new", url.Values{
 		"_csrf": {csrf}, "name": {"Local Ollama"}, "endpoint": {"http://localhost:11434"}, "apiFormat": {"ollama"},
-		"modelId": {"qwen"}, "category": {"chat"}, "modelEnabled_0": {"on"}, "enabled": {"on"},
+		"enabled": {"on"},
 	})
 	body = getAdminPage(t, client, ts.URL+"/admin/relay")
 	if !strings.Contains(body, "Local Ollama") {
@@ -337,7 +307,6 @@ func TestAdminPanelRelayRejectsPublicHTTP(t *testing.T) {
 	csrf := extractCSRF(t, body)
 	resp := postForm(t, client, ts.URL+"/admin/relay/new", url.Values{
 		"_csrf": {csrf}, "name": {"Unsafe"}, "endpoint": {"http://api.example.com/v1"}, "apiFormat": {"openai"},
-		"apiKey": {"key"}, "modelId": {"gpt"}, "category": {"chat"}, "modelEnabled_0": {"on"},
 	})
 	raw := string(testutil.ReadAll(t, resp.Body))
 	resp.Body.Close()
