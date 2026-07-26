@@ -82,17 +82,14 @@ func verifySignedRequest(db *gorm.DB, headers map[string]string, userID int64, s
 }
 
 // SyncRequestMessage returns the exact CBE1 bytes signed for a sync request.
-func SyncRequestMessage(protocol uint16, userID, sessionID, deviceID string, timestampMS int64, requestID, method, target string, bodyHash []byte, expectedGeneration ...int64) []byte {
+func SyncRequestMessage(protocol uint16, userID, sessionID, deviceID string, timestampMS int64, requestID, method, target string, bodyHash []byte, expectedGeneration int64) []byte {
 	version := make([]byte, 2)
 	binary.BigEndian.PutUint16(version, protocol)
 	timestamp := make([]byte, 8)
 	binary.BigEndian.PutUint64(timestamp, uint64(timestampMS))
-	fields := [][]byte{version, []byte(userID), []byte(sessionID), []byte(deviceID), timestamp, []byte(requestID), []byte(method), []byte(target), bodyHash}
-	if len(expectedGeneration) > 0 {
-		generation := make([]byte, 8)
-		binary.BigEndian.PutUint64(generation, uint64(expectedGeneration[0]))
-		fields = append(fields, generation)
-	}
+	generation := make([]byte, 8)
+	binary.BigEndian.PutUint64(generation, uint64(expectedGeneration))
+	fields := [][]byte{version, []byte(userID), []byte(sessionID), []byte(deviceID), timestamp, []byte(requestID), []byte(method), []byte(target), bodyHash, generation}
 	message := []byte(syncRequestDomain)
 	for i, value := range fields {
 		header := make([]byte, 6)
