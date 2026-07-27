@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"errors"
 	"math/rand"
 	"net/http"
 	"testing"
@@ -94,6 +95,35 @@ func TestCooldownDurationRetryAfterAndExponentialCaps(t *testing.T) {
 	}
 	if got := cooldownDuration("", now, 10, time.Minute, 30*time.Minute); got != 30*time.Minute {
 		t.Fatalf("429 cap = %v", got)
+	}
+}
+
+func TestHandlerStreamResultDoesNotCoolDownClientDisconnect(t *testing.T) {
+	db := routerTestDB(t)
+	provider := database.RelayProvider{ID: 1, Name: "p", Endpoint: "https://example.com", APIFormat: APIFormatOpenAI, Enabled: true}
+	model := database.RelayModel{ID: 1, ModelID: "public", Category: CategoryChat, Enabled: true}
+	binding := database.RelayModelBinding{ID: 1, RelayModelID: 1, ProviderID: 1, UpstreamModel: "upstream", Weight: 1, Enabled: true}
+	credential := database.RelayProviderCredential{ID: 1, ProviderID: 1, Name: "key", APIKey: "key", Enabled: true}
+	for _, value := range []interface{}{&provider, &model, &binding, &credential} {
+		if err := db.Create(value).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	router := newRouterWithSource(db, rand.NewSource(1))
+	handler := &Handler{svc: &Service{router: router}}
+	_, candidates, err := router.Candidates("public")
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("initial candidates = %#v, err = %v", candidates, err)
+	}
+	handler.recordStreamResult(candidates[0], downstreamWriteError{err: errors.New("client disconnected")})
+	_, candidates, err = router.Candidates("public")
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates after disconnect = %#v, err = %v", candidates, err)
+	}
+	handler.recordStreamResult(candidates[0], errors.New("invalid upstream event"))
+	_, candidates, err = router.Candidates("public")
+	if err != nil || len(candidates) != 0 {
+		t.Fatalf("candidates after upstream failure = %#v, err = %v", candidates, err)
 	}
 }
 

@@ -46,8 +46,37 @@ func TestCanonicalChatFixture(t *testing.T) {
 	if fixture.Response.Message.Content != "sunny" || fixture.Response.FinishReason != "stop" {
 		t.Fatalf("fixture response = %#v", fixture.Response)
 	}
-	if len(fixture.SSE) != 3 || !fixture.SSE[2].Done || fixture.SSE[2].FinishReason != "stop" {
+	if len(fixture.SSE) != 3 || fixture.SSE[0].Sequence != 1 || fixture.SSE[2].Sequence != 3 || fixture.SSE[2].ResponseID != "response-1" || fixture.SSE[2].Type != "tool_calls" || fixture.SSE[2].Usage == nil || fixture.SSE[2].Usage.TotalTokens != 15 || !fixture.SSE[2].Done || fixture.SSE[2].FinishReason != "stop" {
 		t.Fatalf("fixture SSE = %#v", fixture.SSE)
+	}
+}
+
+func TestOpenAIStreamingRequestMergesUsageOptionAndProtectsCoreFields(t *testing.T) {
+	request, err := parseCanonicalChat([]byte(`{
+		"model":"test","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"stream":true,
+		"extraParams":{"model":"evil","stream":false,"tools":[{"evil":true}],"thinking":{"type":"disabled"},"parallel_tool_calls":false,"stream_options":{"include_usage":false,"vendor_flag":"kept"}}
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := (openAIChatAdapter{}).Request(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]interface{}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatal(err)
+	}
+	streamOptions := payload["stream_options"].(map[string]interface{})
+	if payload["model"] != "test" || payload["stream"] != true || payload["parallel_tool_calls"] != false || payload["tools"] != nil || payload["thinking"] != nil || streamOptions["include_usage"] != true || streamOptions["vendor_flag"] != "kept" {
+		t.Fatalf("OpenAI payload = %#v", payload)
+	}
+}
+
+func TestOpenAIStreamingRequestRejectsNonObjectStreamOptions(t *testing.T) {
+	request := ChatRequest{Model: "test", Stream: true, ExtraParams: map[string]interface{}{"stream_options": "invalid"}}
+	if _, err := (openAIChatAdapter{}).Request(request); err == nil || !strings.Contains(err.Error(), "stream_options must be an object") {
+		t.Fatalf("Request() error = %v", err)
 	}
 }
 
@@ -223,9 +252,30 @@ func TestOpenAIStreamSortsSparseToolIndices(t *testing.T) {
 	}
 }
 
+func TestOpenAIStreamCapturesResponseIDAndTerminalUsage(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"chatcmpl-1","choices":[{"delta":{"content":"hello"}}]}`,
+		`data: {"id":"chatcmpl-1","choices":[{"finish_reason":"stop","delta":{}}]}`,
+		`data: {"id":"chatcmpl-1","choices":[],"usage":{"prompt_tokens":4,"completion_tokens":2,"total_tokens":6}}`,
+		`data: [DONE]`,
+		``,
+	}, "\n\n")
+	var deltas []canonicalDelta
+	if err := (openAIChatAdapter{}).Stream(strings.NewReader(stream), func(delta canonicalDelta) error {
+		deltas = append(deltas, delta)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	terminal := deltas[len(deltas)-1]
+	if deltas[0].ResponseID != "chatcmpl-1" || terminal.ResponseID != "chatcmpl-1" || terminal.Usage == nil || terminal.Usage.InputTokens != 4 || terminal.Usage.OutputTokens != 2 || terminal.Usage.TotalTokens != 6 {
+		t.Fatalf("OpenAI deltas = %#v", deltas)
+	}
+}
+
 func TestAnthropicRealToolStreamUsesDeltaJSONTagsAndSparseIndices(t *testing.T) {
 	stream := strings.Join([]string{
-		"event: message_start\ndata: " + `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}}`,
+		"event: message_start\ndata: " + `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1,"cache_creation_input_tokens":2,"cache_read_input_tokens":3}}}`,
 		"event: content_block_start\ndata: " + `{"type":"content_block_start","index":3,"content_block":{"type":"tool_use","id":"toolu_b","name":"second","input":{}}}`,
 		"event: content_block_delta\ndata: " + `{"type":"content_block_delta","index":3,"delta":{"type":"input_json_delta","partial_json":"{\"b\":2}"}}`,
 		"event: content_block_start\ndata: " + `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_a","name":"first","input":{}}}`,
@@ -242,8 +292,27 @@ func TestAnthropicRealToolStreamUsesDeltaJSONTagsAndSparseIndices(t *testing.T) 
 		t.Fatal(err)
 	}
 	terminal := deltas[len(deltas)-1]
-	if terminal.FinishReason != "tool_use" || len(terminal.ToolCalls) != 2 || terminal.ToolCalls[0].Name != "first" || terminal.ToolCalls[1].Name != "second" {
+	if terminal.ResponseID != "msg_1" || terminal.Usage == nil || terminal.Usage.InputTokens != 6 || terminal.Usage.OutputTokens != 10 || terminal.Usage.TotalTokens != 16 || terminal.FinishReason != "tool_use" || len(terminal.ToolCalls) != 2 || terminal.ToolCalls[0].Name != "first" || terminal.ToolCalls[1].Name != "second" {
 		t.Fatalf("terminal delta = %#v", terminal)
+	}
+}
+
+func TestOllamaStreamCapturesTerminalUsage(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"message":{"content":"hello"},"done":false}`,
+		`{"done":true,"done_reason":"stop","prompt_eval_count":5,"eval_count":3}`,
+		``,
+	}, "\n")
+	var deltas []canonicalDelta
+	if err := (ollamaChatAdapter{}).Stream(strings.NewReader(stream), func(delta canonicalDelta) error {
+		deltas = append(deltas, delta)
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	terminal := deltas[len(deltas)-1]
+	if terminal.Usage == nil || terminal.Usage.InputTokens != 5 || terminal.Usage.OutputTokens != 3 || terminal.Usage.TotalTokens != 8 {
+		t.Fatalf("Ollama terminal delta = %#v", terminal)
 	}
 }
 
@@ -416,6 +485,70 @@ func TestWriteCanonicalSSEClassifiesTimeout(t *testing.T) {
 			if got := ctx.GetString("relayErrorType"); got != test.want {
 				t.Fatalf("relayErrorType = %q, want %q", got, test.want)
 			}
+			body := recorder.Body.String()
+			if !strings.Contains(body, "event: chunk") || !strings.Contains(body, `"sequence":1`) || !strings.Contains(body, `"type":"error"`) || !strings.Contains(body, `"errorInfo":{"type":"`+test.want+`"`) {
+				t.Fatalf("canonical error event = %s", body)
+			}
 		})
+	}
+}
+
+type deltaStreamAdapter struct{ deltas []canonicalDelta }
+
+func (deltaStreamAdapter) Request(ChatRequest) ([]byte, error)   { return nil, nil }
+func (deltaStreamAdapter) Response([]byte) (ChatResponse, error) { return ChatResponse{}, nil }
+func (a deltaStreamAdapter) Stream(_ io.Reader, emit func(canonicalDelta) error) error {
+	for _, delta := range a.deltas {
+		if err := emit(delta); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func TestWriteCanonicalSSEAddsStableTypedMetadata(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	usage := &ChatUsage{InputTokens: 2, OutputTokens: 3, TotalTokens: 5}
+	err := writeCanonicalSSE(ctx, deltaStreamAdapter{deltas: []canonicalDelta{
+		{ResponseID: "upstream-1", Content: "hello"},
+		{ResponseID: "ignored-late-id", Reasoning: "think"},
+		{ToolCalls: []ChatToolCall{{ID: "call-1", Name: "weather", Arguments: json.RawMessage(`{}`)}}, FinishReason: "tool_calls", Usage: usage, Done: true},
+	}}, strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`"sequence":1,"responseId":"upstream-1","type":"content"`,
+		`"sequence":2,"responseId":"upstream-1","type":"reasoning"`,
+		`"sequence":3,"responseId":"upstream-1","type":"tool_calls"`,
+		`"usage":{"inputTokens":2,"outputTokens":3,"totalTokens":5}`,
+	} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Fatalf("canonical stream missing %s: %s", want, recorder.Body.String())
+		}
+	}
+}
+
+type failingResponseWriter struct {
+	gin.ResponseWriter
+	err error
+}
+
+func (w failingResponseWriter) Write([]byte) (int, error) { return 0, w.err }
+
+func TestWriteCanonicalSSEClassifiesDownstreamWriteFailure(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	recorder := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(recorder)
+	wantErr := errors.New("client disconnected")
+	ctx.Writer = failingResponseWriter{ResponseWriter: ctx.Writer, err: wantErr}
+	err := writeCanonicalSSE(ctx, deltaStreamAdapter{deltas: []canonicalDelta{{Content: "hello"}}}, strings.NewReader(""))
+	if !errors.Is(err, wantErr) || !isDownstreamWriteError(err) {
+		t.Fatalf("writeCanonicalSSE error = %v", err)
+	}
+	if got := ctx.GetString("relayErrorType"); got != "client_disconnect" {
+		t.Fatalf("relayErrorType = %q", got)
 	}
 }

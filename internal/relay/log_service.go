@@ -190,8 +190,8 @@ func (s *LogService) Dashboard(rangeValue string, now time.Time) (LogDashboard, 
 		return result, err
 	}
 	if err := base.Select(`user_id, MAX(username) AS username, COUNT(*) AS total,
-		SUM(CASE WHEN http_status >= 200 AND http_status < 400 THEN 1 ELSE 0 END) AS success,
-		SUM(CASE WHEN http_status < 200 OR http_status >= 400 THEN 1 ELSE 0 END) AS failed,
+		SUM(CASE WHEN http_status >= 200 AND http_status < 400 AND COALESCE(error_type, '') = '' THEN 1 ELSE 0 END) AS success,
+		SUM(CASE WHEN http_status < 200 OR http_status >= 400 OR (COALESCE(error_type, '') <> '' AND error_type <> 'client_disconnect') THEN 1 ELSE 0 END) AS failed,
 		COALESCE(AVG(duration_ms), 0) AS average_ms, COALESCE(SUM(request_bytes), 0) AS request_bytes,
 		COALESCE(SUM(response_bytes), 0) AS response_bytes, CAST(MAX(created_at) AS TEXT) AS last_called_at`).
 		Group("user_id").Order("total DESC").Limit(20).Scan(&result.Users).Error; err != nil {
@@ -218,8 +218,8 @@ func (s *LogService) Summary(rangeValue string, now time.Time) (LogSummary, erro
 
 func (s *LogService) summaryQuery(base *gorm.DB, target *LogSummary) error {
 	return base.Select(`COUNT(*) AS total,
-		SUM(CASE WHEN http_status >= 200 AND http_status < 400 THEN 1 ELSE 0 END) AS success,
-		SUM(CASE WHEN http_status < 200 OR http_status >= 400 THEN 1 ELSE 0 END) AS failed,
+		SUM(CASE WHEN http_status >= 200 AND http_status < 400 AND COALESCE(error_type, '') = '' THEN 1 ELSE 0 END) AS success,
+		SUM(CASE WHEN http_status < 200 OR http_status >= 400 OR (COALESCE(error_type, '') <> '' AND error_type <> 'client_disconnect') THEN 1 ELSE 0 END) AS failed,
 		COUNT(DISTINCT user_id) AS active_users,
 		COALESCE(AVG(duration_ms), 0) AS average_ms,
 		COALESCE(SUM(request_bytes), 0) AS request_bytes,
@@ -228,7 +228,7 @@ func (s *LogService) summaryQuery(base *gorm.DB, target *LogSummary) error {
 
 func (s *LogService) namedSummary(base *gorm.DB, column string, target *[]NamedLogSummary) error {
 	return base.Where(column + " <> ''").Select(column + ` AS name, COUNT(*) AS total,
-		SUM(CASE WHEN http_status < 200 OR http_status >= 400 THEN 1 ELSE 0 END) AS failed,
+		SUM(CASE WHEN http_status < 200 OR http_status >= 400 OR (COALESCE(error_type, '') <> '' AND error_type <> 'client_disconnect') THEN 1 ELSE 0 END) AS failed,
 		COALESCE(AVG(duration_ms), 0) AS average_ms`).Group(column).Order("total DESC").Limit(10).Scan(target).Error
 }
 
@@ -245,8 +245,8 @@ func (s *LogService) trend(since time.Time, rangeValue string, target *[]TrendPo
 	}
 	return s.db.Model(&database.RelayRequestLog{}).Where("created_at >= ?", since).
 		Select(bucket + ` AS bucket, COUNT(*) AS total,
-			SUM(CASE WHEN http_status >= 200 AND http_status < 400 THEN 1 ELSE 0 END) AS success,
-			SUM(CASE WHEN http_status < 200 OR http_status >= 400 THEN 1 ELSE 0 END) AS failed,
+			SUM(CASE WHEN http_status >= 200 AND http_status < 400 AND COALESCE(error_type, '') = '' THEN 1 ELSE 0 END) AS success,
+			SUM(CASE WHEN http_status < 200 OR http_status >= 400 OR (COALESCE(error_type, '') <> '' AND error_type <> 'client_disconnect') THEN 1 ELSE 0 END) AS failed,
 			COALESCE(AVG(duration_ms), 0) AS average_ms`).
 		Group(bucket).Order("bucket ASC").Scan(target).Error
 }
@@ -282,10 +282,10 @@ func (s *LogService) List(filter LogFilter, now time.Time) (LogPage, error) {
 		query = query.Where("protocol = ?", filter.Protocol)
 	}
 	if filter.Result == "success" {
-		query = query.Where("http_status >= 200 AND http_status < 400")
+		query = query.Where("http_status >= 200 AND http_status < 400 AND COALESCE(error_type, '') = ''")
 	}
 	if filter.Result == "failed" {
-		query = query.Where("http_status < 200 OR http_status >= 400")
+		query = query.Where("http_status < 200 OR http_status >= 400 OR (COALESCE(error_type, '') <> '' AND error_type <> 'client_disconnect')")
 	}
 	page := LogPage{Page: filter.Page}
 	if err := query.Count(&page.Total).Error; err != nil {

@@ -3,7 +3,9 @@ package relay
 import (
 	"bufio"
 	"bytes"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +14,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/lynai/backend/internal/database"
@@ -32,6 +35,7 @@ type ChatRequest struct {
 	Seed             *int            `json:"seed,omitempty"`
 	Stop             []string        `json:"stop,omitempty"`
 	User             *string         `json:"user,omitempty"`
+	ExtraParams      map[string]any  `json:"extraParams,omitempty"`
 }
 
 type ChatReasoning struct {
@@ -100,12 +104,28 @@ type ChatResponseMessage struct {
 }
 
 type canonicalDelta struct {
+	Sequence     uint64         `json:"sequence,omitempty"`
+	ResponseID   string         `json:"responseId,omitempty"`
+	Type         string         `json:"type,omitempty"`
 	Content      string         `json:"content,omitempty"`
 	Reasoning    string         `json:"reasoning,omitempty"`
 	ToolCalls    []ChatToolCall `json:"toolCalls,omitempty"`
 	FinishReason string         `json:"finishReason,omitempty"`
+	Usage        *ChatUsage     `json:"usage,omitempty"`
 	Done         bool           `json:"done,omitempty"`
 	Error        string         `json:"error,omitempty"`
+	ErrorInfo    *StreamError   `json:"errorInfo,omitempty"`
+}
+
+type ChatUsage struct {
+	InputTokens  int64 `json:"inputTokens"`
+	OutputTokens int64 `json:"outputTokens"`
+	TotalTokens  int64 `json:"totalTokens"`
+}
+
+type StreamError struct {
+	Type    string `json:"type"`
+	Message string `json:"message"`
 }
 
 type chatAdapter interface {
@@ -342,6 +362,11 @@ func (openAIChatAdapter) Request(request ChatRequest) ([]byte, error) {
 		messages = append(messages, item)
 	}
 	payload := map[string]interface{}{"model": request.Model, "messages": messages, "stream": request.Stream}
+	for key, value := range request.ExtraParams {
+		if !openAICoreRequestField(key) {
+			payload[key] = value
+		}
+	}
 	setChatOptions(payload, request)
 	if request.Reasoning.Enabled {
 		payload["thinking"] = map[string]interface{}{"type": "enabled"}
@@ -363,7 +388,27 @@ func (openAIChatAdapter) Request(request ChatRequest) ([]byte, error) {
 			}
 		}
 	}
+	if request.Stream {
+		streamOptions, ok := payload["stream_options"].(map[string]interface{})
+		if !ok && payload["stream_options"] != nil {
+			return nil, errors.New("OpenAI extraParams.stream_options must be an object")
+		}
+		if streamOptions == nil {
+			streamOptions = map[string]interface{}{}
+		}
+		streamOptions["include_usage"] = true
+		payload["stream_options"] = streamOptions
+	}
 	return json.Marshal(payload)
+}
+
+func openAICoreRequestField(key string) bool {
+	switch key {
+	case "model", "messages", "stream", "max_tokens", "temperature", "top_p", "presence_penalty", "frequency_penalty", "seed", "stop", "user", "thinking", "tools", "tool_choice":
+		return true
+	default:
+		return false
+	}
 }
 
 func (openAIChatAdapter) Response(raw []byte) (ChatResponse, error) {
@@ -409,6 +454,8 @@ func (openAIChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 	type accumulator struct{ id, name, arguments string }
 	calls := map[int]*accumulator{}
 	finish := ""
+	responseID := ""
+	var usage *ChatUsage
 	completed := false
 	err := scanSSE(reader, func(data string) error {
 		if data == "[DONE]" {
@@ -416,7 +463,13 @@ func (openAIChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 			return nil
 		}
 		var payload struct {
-			Error   interface{} `json:"error"`
+			ID    string      `json:"id"`
+			Error interface{} `json:"error"`
+			Usage *struct {
+				PromptTokens     int64 `json:"prompt_tokens"`
+				CompletionTokens int64 `json:"completion_tokens"`
+				TotalTokens      int64 `json:"total_tokens"`
+			} `json:"usage"`
 			Choices []struct {
 				FinishReason string `json:"finish_reason"`
 				Delta        struct {
@@ -437,6 +490,15 @@ func (openAIChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 		if payload.Error != nil {
 			return fmt.Errorf("OpenAI stream error: %v", payload.Error)
 		}
+		if payload.ID != "" {
+			responseID = payload.ID
+		}
+		if payload.Usage != nil {
+			usage = &ChatUsage{InputTokens: payload.Usage.PromptTokens, OutputTokens: payload.Usage.CompletionTokens, TotalTokens: payload.Usage.TotalTokens}
+			if usage.TotalTokens == 0 {
+				usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+			}
+		}
 		if len(payload.Choices) == 0 {
 			return nil
 		}
@@ -450,7 +512,7 @@ func (openAIChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 			reasoning = choice.Delta.Reasoning
 		}
 		if choice.Delta.Content != "" || reasoning != "" {
-			if err := emit(canonicalDelta{Content: choice.Delta.Content, Reasoning: reasoning}); err != nil {
+			if err := emit(canonicalDelta{ResponseID: responseID, Content: choice.Delta.Content, Reasoning: reasoning}); err != nil {
 				return err
 			}
 		}
@@ -485,7 +547,7 @@ func (openAIChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 		}
 		toolCalls = append(toolCalls, canonical)
 	}
-	return emit(canonicalDelta{ToolCalls: toolCalls, FinishReason: finish, Done: true})
+	return emit(canonicalDelta{ResponseID: responseID, ToolCalls: toolCalls, FinishReason: finish, Usage: usage, Done: true})
 }
 
 type anthropicChatAdapter struct{}
@@ -598,6 +660,9 @@ func (anthropicChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) e
 	}
 	tools := map[int]*toolState{}
 	finish := ""
+	responseID := ""
+	usage := &ChatUsage{}
+	hasUsage := false
 	completed := false
 	err := scanSSE(reader, func(data string) error {
 		var event struct {
@@ -611,7 +676,19 @@ func (anthropicChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) e
 				PartialJSON string `json:"partial_json"`
 				StopReason  string `json:"stop_reason"`
 			} `json:"delta"`
-			Error interface{} `json:"error"`
+			Error   interface{} `json:"error"`
+			Message struct {
+				ID    string `json:"id"`
+				Usage *struct {
+					InputTokens              int64 `json:"input_tokens"`
+					OutputTokens             int64 `json:"output_tokens"`
+					CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
+					CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+				} `json:"usage"`
+			} `json:"message"`
+			Usage *struct {
+				OutputTokens int64 `json:"output_tokens"`
+			} `json:"usage"`
 		}
 		if err := json.Unmarshal([]byte(data), &event); err != nil {
 			return errors.New("invalid Anthropic SSE event")
@@ -619,6 +696,13 @@ func (anthropicChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) e
 		switch event.Type {
 		case "error":
 			return fmt.Errorf("Anthropic stream error: %v", event.Error)
+		case "message_start":
+			responseID = event.Message.ID
+			if event.Message.Usage != nil {
+				usage.InputTokens = event.Message.Usage.InputTokens + event.Message.Usage.CacheCreationInputTokens + event.Message.Usage.CacheReadInputTokens
+				usage.OutputTokens = event.Message.Usage.OutputTokens
+				hasUsage = true
+			}
 		case "content_block_start":
 			if event.ContentBlock.Type == "tool_use" {
 				tools[event.Index] = &toolState{id: event.ContentBlock.ID, name: event.ContentBlock.Name}
@@ -626,9 +710,9 @@ func (anthropicChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) e
 		case "content_block_delta":
 			switch event.Delta.Type {
 			case "text_delta":
-				return emit(canonicalDelta{Content: event.Delta.Text})
+				return emit(canonicalDelta{ResponseID: responseID, Content: event.Delta.Text})
 			case "thinking_delta":
-				return emit(canonicalDelta{Reasoning: event.Delta.Thinking})
+				return emit(canonicalDelta{ResponseID: responseID, Reasoning: event.Delta.Thinking})
 			case "input_json_delta":
 				if tool := tools[event.Index]; tool != nil {
 					tool.arguments.WriteString(event.Delta.PartialJSON)
@@ -636,6 +720,10 @@ func (anthropicChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) e
 			}
 		case "message_delta":
 			finish = event.Delta.StopReason
+			if event.Usage != nil {
+				usage.OutputTokens = event.Usage.OutputTokens
+				hasUsage = true
+			}
 		case "message_stop":
 			completed = true
 		}
@@ -656,7 +744,11 @@ func (anthropicChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) e
 		}
 		calls = append(calls, call)
 	}
-	return emit(canonicalDelta{ToolCalls: calls, FinishReason: finish, Done: true})
+	usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+	if !hasUsage {
+		usage = nil
+	}
+	return emit(canonicalDelta{ResponseID: responseID, ToolCalls: calls, FinishReason: finish, Usage: usage, Done: true})
 }
 
 type ollamaChatAdapter struct{}
@@ -748,16 +840,19 @@ func (ollamaChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 	scanner.Buffer(make([]byte, 64*1024), maxRelayUpstreamResponseBytes)
 	var calls []ChatToolCall
 	finish := ""
+	var usage *ChatUsage
 	completed := false
 	for scanner.Scan() {
 		if strings.TrimSpace(scanner.Text()) == "" {
 			continue
 		}
 		var payload struct {
-			Done       bool   `json:"done"`
-			DoneReason string `json:"done_reason"`
-			Error      string `json:"error"`
-			Message    struct {
+			Done            bool   `json:"done"`
+			DoneReason      string `json:"done_reason"`
+			Error           string `json:"error"`
+			PromptEvalCount *int64 `json:"prompt_eval_count"`
+			EvalCount       *int64 `json:"eval_count"`
+			Message         struct {
 				Content, Thinking string
 				ToolCalls         []struct {
 					Function struct {
@@ -787,6 +882,16 @@ func (ollamaChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 		}
 		if payload.Done {
 			finish = payload.DoneReason
+			if payload.PromptEvalCount != nil || payload.EvalCount != nil {
+				usage = &ChatUsage{}
+				if payload.PromptEvalCount != nil {
+					usage.InputTokens = *payload.PromptEvalCount
+				}
+				if payload.EvalCount != nil {
+					usage.OutputTokens = *payload.EvalCount
+				}
+				usage.TotalTokens = usage.InputTokens + usage.OutputTokens
+			}
 			completed = true
 		}
 	}
@@ -796,7 +901,7 @@ func (ollamaChatAdapter) Stream(reader io.Reader, emit func(canonicalDelta) erro
 	if !completed {
 		return errors.New("Ollama stream ended before done=true")
 	}
-	return emit(canonicalDelta{ToolCalls: calls, FinishReason: finish, Done: true})
+	return emit(canonicalDelta{ToolCalls: calls, FinishReason: finish, Usage: usage, Done: true})
 }
 
 func setChatOptions(payload map[string]interface{}, request ChatRequest) {
@@ -971,13 +1076,22 @@ func writeCanonicalSSE(c *gin.Context, adapter chatAdapter, body io.Reader) erro
 	c.Header("X-Accel-Buffering", "no")
 	c.Status(http.StatusOK)
 	flusher, _ := c.Writer.(http.Flusher)
+	responseID := newCanonicalResponseID()
+	var sequence uint64
 	emit := func(delta canonicalDelta) error {
+		if sequence == 0 && delta.ResponseID != "" {
+			responseID = delta.ResponseID
+		}
+		sequence++
+		delta.Sequence = sequence
+		delta.ResponseID = responseID
+		delta.Type = canonicalDeltaType(delta)
 		raw, err := json.Marshal(delta)
 		if err != nil {
 			return err
 		}
 		if _, err := fmt.Fprintf(c.Writer, "event: chunk\ndata: %s\n\n", raw); err != nil {
-			return err
+			return downstreamWriteError{err: err}
 		}
 		if flusher != nil {
 			flusher.Flush()
@@ -985,13 +1099,52 @@ func writeCanonicalSSE(c *gin.Context, adapter chatAdapter, body io.Reader) erro
 		return nil
 	}
 	if err := adapter.Stream(body, emit); err != nil {
+		if isDownstreamWriteError(err) {
+			c.Set("relayErrorType", "client_disconnect")
+			return err
+		}
 		errorType := "upstream_protocol_error"
 		if errors.Is(err, ErrUpstreamTimeout) {
 			errorType = "upstream_timeout"
 		}
 		c.Set("relayErrorType", errorType)
-		_ = emit(canonicalDelta{Error: err.Error(), Done: true})
+		_ = emit(canonicalDelta{Error: err.Error(), ErrorInfo: &StreamError{Type: errorType, Message: err.Error()}, Done: true})
 		return err
 	}
 	return nil
+}
+
+func canonicalDeltaType(delta canonicalDelta) string {
+	switch {
+	case delta.ErrorInfo != nil || delta.Error != "":
+		return "error"
+	case len(delta.ToolCalls) > 0:
+		return "tool_calls"
+	case delta.Done:
+		return "completed"
+	case delta.Content != "" && delta.Reasoning == "":
+		return "content"
+	case delta.Reasoning != "" && delta.Content == "":
+		return "reasoning"
+	default:
+		return "delta"
+	}
+}
+
+type downstreamWriteError struct{ err error }
+
+func (e downstreamWriteError) Error() string { return e.err.Error() }
+func (e downstreamWriteError) Unwrap() error { return e.err }
+
+func isDownstreamWriteError(err error) bool {
+	var target downstreamWriteError
+	return errors.As(err, &target)
+}
+
+func newCanonicalResponseID() string {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return fmt.Sprintf("relay-%d", time.Now().UnixNano())
+	}
+	return "relay-" + hex.EncodeToString(raw[:])
 }

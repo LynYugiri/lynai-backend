@@ -718,6 +718,8 @@ func TestRelayLogDashboardAndRetention(t *testing.T) {
 	entries := []database.RelayRequestLog{
 		{UserID: 1, Username: "alice", Operation: "chat", Route: "/relay/chat", Protocol: "canonical", HTTPStatus: 200, DurationMS: 100, RequestBytes: 10, ResponseBytes: 20, CreatedAt: now.Add(-time.Hour)},
 		{UserID: 1, Username: "alice", Operation: "chat", Route: "/relay/chat", Protocol: "canonical", HTTPStatus: 500, DurationMS: 300, RequestBytes: 30, ResponseBytes: 40, CreatedAt: now.Add(-2 * time.Hour)},
+		{UserID: 1, Username: "alice", Operation: "chat", Route: "/relay/chat", Protocol: "canonical", HTTPStatus: 200, ErrorType: "upstream_protocol_error", DurationMS: 200, CreatedAt: now.Add(-3 * time.Hour)},
+		{UserID: 1, Username: "alice", Operation: "chat", Route: "/relay/chat", Protocol: "canonical", HTTPStatus: 200, ErrorType: "client_disconnect", DurationMS: 50, CreatedAt: now.Add(-4 * time.Hour)},
 		{UserID: 2, Username: "bob", Operation: "ocr", Route: "/relay/ocr", Protocol: "canonical", HTTPStatus: 200, DurationMS: 50, CreatedAt: now.Add(-8 * 24 * time.Hour)},
 	}
 	if err := db.Create(&entries).Error; err != nil {
@@ -727,8 +729,12 @@ func TestRelayLogDashboardAndRetention(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dashboard: %v", err)
 	}
-	if dashboard.Summary.Total != 2 || dashboard.Summary.Success != 1 || dashboard.Summary.Failed != 1 || len(dashboard.Users) != 1 || dashboard.Users[0].Username != "alice" {
+	if dashboard.Summary.Total != 4 || dashboard.Summary.Success != 1 || dashboard.Summary.Failed != 2 || len(dashboard.Users) != 1 || dashboard.Users[0].Username != "alice" || dashboard.Users[0].Success != 1 || dashboard.Users[0].Failed != 2 {
 		t.Fatalf("unexpected dashboard: %#v", dashboard)
+	}
+	failed, err := logs.List(relay.LogFilter{Range: "7d", Result: "failed", PageSize: 50}, now)
+	if err != nil || failed.Total != 2 {
+		t.Fatalf("failed logs = %#v, err = %v", failed, err)
 	}
 	if len(dashboard.Trend) == 0 {
 		t.Fatal("dashboard trend is empty")
@@ -738,8 +744,8 @@ func TestRelayLogDashboardAndRetention(t *testing.T) {
 	}
 	var count int64
 	db.Model(&database.RelayRequestLog{}).Count(&count)
-	if count != 2 {
-		t.Fatalf("retained logs = %d, want 2", count)
+	if count != 4 {
+		t.Fatalf("retained logs = %d, want 4", count)
 	}
 }
 

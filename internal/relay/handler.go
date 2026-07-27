@@ -299,7 +299,7 @@ func (h *Handler) Chat(c *gin.Context) {
 		if request.Stream {
 			defer resp.Body.Close()
 			if streamErr := writeCanonicalSSE(c, adapter, resp.Body); streamErr != nil {
-				h.svc.router.Cooldown(candidate, 0, "", true)
+				h.recordStreamResult(candidate, streamErr)
 				return
 			}
 			h.svc.router.Success(candidate)
@@ -331,6 +331,14 @@ func (h *Handler) Chat(c *gin.Context) {
 		return
 	}
 	writeForwardError(c, terminalErr)
+}
+
+func (h *Handler) recordStreamResult(candidate Candidate, err error) {
+	if isDownstreamWriteError(err) {
+		h.svc.router.Success(candidate)
+		return
+	}
+	h.svc.router.Cooldown(candidate, 0, "", true)
 }
 
 // Transcribe forwards an OpenAI-compatible audio transcription request.

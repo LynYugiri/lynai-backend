@@ -31,13 +31,17 @@
     "finishReason": "stop"
   },
   "sse": [
-    {"content": "sun", "reasoning": "check"},
-    {"content": "ny"},
+    {"sequence": 1, "responseId": "response-1", "type": "delta", "content": "sun", "reasoning": "check"},
+    {"sequence": 2, "responseId": "response-1", "type": "content", "content": "ny"},
     {
+      "sequence": 3,
+      "responseId": "response-1",
+      "type": "tool_calls",
       "toolCalls": [
         {"id": "call-1", "name": "weather", "arguments": {"city": "Shanghai"}}
       ],
       "finishReason": "stop",
+      "usage": {"inputTokens": 12, "outputTokens": 3, "totalTokens": 15},
       "done": true
     }
   ]
