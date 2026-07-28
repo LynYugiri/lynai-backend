@@ -27,6 +27,11 @@ type Config struct {
 	RelayNonStreamTimeout     time.Duration
 	RelayStreamIdleTimeout    time.Duration
 	RelayStreamMaxDuration    time.Duration
+	SearchTavilyAPIKey        string
+	SearchTavilyOrigin        string
+	SearchSearXNGOrigin       string
+	SearchPrivateAllowlist    []string
+	SearchTimeout             time.Duration
 }
 
 // Load reads configuration from environment variables with sensible defaults.
@@ -75,6 +80,13 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	searchTimeout, err := positiveDuration("SEARCH_TIMEOUT", "15s")
+	if err != nil {
+		return nil, err
+	}
+	if searchTimeout > time.Minute {
+		return nil, fmt.Errorf("SEARCH_TIMEOUT must be at most 1m")
+	}
 	perUser, err := positiveInt("RELAY_SPEECH_PER_USER_CAPACITY", "5")
 	if err != nil {
 		return nil, err
@@ -105,6 +117,11 @@ func Load() (*Config, error) {
 		RelayNonStreamTimeout:     nonStreamTimeout,
 		RelayStreamIdleTimeout:    streamIdleTimeout,
 		RelayStreamMaxDuration:    streamMaxDuration,
+		SearchTavilyAPIKey:        strings.TrimSpace(os.Getenv("TAVILY_API_KEY")),
+		SearchTavilyOrigin:        envOr("TAVILY_ORIGIN", "https://api.tavily.com"),
+		SearchSearXNGOrigin:       strings.TrimSpace(os.Getenv("SEARXNG_ORIGIN")),
+		SearchPrivateAllowlist:    splitList(os.Getenv("SEARCH_PRIVATE_HOST_ALLOWLIST")),
+		SearchTimeout:             searchTimeout,
 	}
 
 	if cfg.DBDSN == "" {

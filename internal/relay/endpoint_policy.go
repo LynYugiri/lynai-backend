@@ -118,6 +118,11 @@ func (p *EndpointPolicy) httpClient() *http.Client {
 	}
 }
 
+// HTTPClient creates a redirect-free client whose connections are checked by the policy.
+func (p *EndpointPolicy) HTTPClient() *http.Client {
+	return p.httpClient()
+}
+
 func (p *EndpointPolicy) dialContext(ctx context.Context, network, address string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {

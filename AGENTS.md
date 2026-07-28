@@ -18,5 +18,6 @@
 ## 安全与路由
 
 - Relay 上游默认 HTTPS，私网或 HTTP 只能通过精确 allowlist。禁止重定向和 URL 凭据，并保留 DNS rebinding 防护。
+- Search 上游 origin 只能来自服务端配置，客户端仅可选择固定 provider ID；保持 HTTPS 默认、精确私网 allowlist、禁止重定向、DNS rebinding 防护和 secret-safe 错误。
 - 请求、上传、SSE frame 和上游响应必须在解析或大内存分配前执行大小限制。
 - 普通 server 启动只验证 schema，不自动迁移；migration 必须使用连续新文件，不修改已发布 migration。

@@ -19,6 +19,7 @@ import (
 	"github.com/lynai/backend/internal/device"
 	"github.com/lynai/backend/internal/market"
 	"github.com/lynai/backend/internal/relay"
+	"github.com/lynai/backend/internal/search"
 	"github.com/lynai/backend/internal/server"
 	"github.com/lynai/backend/internal/sync"
 )
@@ -132,6 +133,17 @@ func run(args []string) error {
 	if err := relay.NewLogService(db).DeleteExpired(time.Now()); err != nil {
 		log.Printf("relay log cleanup: %v", err)
 	}
+	searchPolicy, err := relay.NewEndpointPolicy(cfg.SearchPrivateAllowlist)
+	if err != nil {
+		return fmt.Errorf("search endpoint policy: %w", err)
+	}
+	searchSvc, err := search.NewService(search.Config{
+		TavilyAPIKey: cfg.SearchTavilyAPIKey, TavilyOrigin: cfg.SearchTavilyOrigin,
+		SearXNGOrigin: cfg.SearchSearXNGOrigin, Timeout: cfg.SearchTimeout,
+	}, searchPolicy)
+	if err != nil {
+		return fmt.Errorf("search service: %w", err)
+	}
 
 	// Handlers
 	authHandler := auth.NewHandler(authSvc)
@@ -140,6 +152,7 @@ func run(args []string) error {
 	communityHandler := community.NewHandler(communitySvc)
 	syncHandler := sync.NewHandlerWithClockSkew(syncSvc, cfg.SyncClockSkew)
 	relayHandler := relay.NewHandlerWithConfig(relaySvc, cfg.RelaySpeechSessionTTL, cfg.RelaySpeechPerUser, cfg.RelaySpeechGlobal, cfg.RelayNonStreamTimeout, cfg.RelayStreamIdleTimeout, cfg.RelayStreamMaxDuration)
+	searchHandler := search.NewHandler(searchSvc)
 	defer relayHandler.Close()
 
 	// Admin panel
@@ -150,7 +163,7 @@ func run(args []string) error {
 	defer adminHandler.Close()
 
 	// Server
-	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, communityHandler, syncHandler, relayHandler, adminHandler)
+	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, communityHandler, syncHandler, relayHandler, searchHandler, adminHandler)
 
 	addr := ":" + cfg.Port
 	httpServer := &http.Server{

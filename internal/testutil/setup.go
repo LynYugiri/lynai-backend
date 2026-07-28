@@ -12,6 +12,7 @@ import (
 	"github.com/lynai/backend/internal/device"
 	"github.com/lynai/backend/internal/market"
 	"github.com/lynai/backend/internal/relay"
+	"github.com/lynai/backend/internal/search"
 	"github.com/lynai/backend/internal/server"
 	"github.com/lynai/backend/internal/sync"
 	"gorm.io/driver/sqlite"
@@ -96,6 +97,11 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 	communityHandler := community.NewHandler(communitySvc)
 	syncHandler := sync.NewHandlerWithClockSkew(syncSvc, 5*time.Minute)
 	relayHandler := relay.NewHandler(relaySvc)
+	searchSvc, err := search.NewService(search.Config{Timeout: 15 * time.Second}, endpointPolicy)
+	if err != nil {
+		panic("search service: " + err.Error())
+	}
+	searchHandler := search.NewHandler(searchSvc)
 
 	var adminHandler *admin.Handler
 	if withAdminPanel {
@@ -105,7 +111,7 @@ func setupTest(withAdminPanel bool) (adminPhone, adminPassword string, ts *TestS
 		}
 	}
 
-	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, communityHandler, syncHandler, relayHandler, adminHandler)
+	r := server.Setup(authHandler, jwtMgr, deviceHandler, marketHandler, communityHandler, syncHandler, relayHandler, searchHandler, adminHandler)
 	ts = NewTestServer(r)
 
 	cleanup = func() {

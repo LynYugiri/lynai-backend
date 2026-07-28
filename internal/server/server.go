@@ -8,6 +8,7 @@ import (
 	"github.com/lynai/backend/internal/device"
 	"github.com/lynai/backend/internal/market"
 	"github.com/lynai/backend/internal/relay"
+	"github.com/lynai/backend/internal/search"
 	"github.com/lynai/backend/internal/sync"
 )
 
@@ -20,6 +21,7 @@ func Setup(
 	communityHandler *community.Handler,
 	syncHandler *sync.Handler,
 	relayHandler *relay.Handler,
+	searchHandler *search.Handler,
 	adminHandler *admin.Handler,
 ) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
@@ -178,6 +180,12 @@ func Setup(
 			relayAuth.POST("/images/generations", relayHandler.ImageGenerations)
 			relayAuth.GET("/config", relayHandler.Config)
 		}
+	}
+
+	if searchHandler != nil {
+		searchAuth := r.Group("/search")
+		searchAuth.Use(auth.AuthMiddleware(jwtMgr, authHandler.Service()))
+		searchAuth.POST("/web", searchHandler.Web)
 	}
 
 	// --- Admin Web Panel ---

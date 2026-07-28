@@ -1,6 +1,6 @@
 # LynAI Backend
 
-LynAI 后端服务，提供账号认证、社区和插件市场 API。
+LynAI 后端服务，提供账号认证、社区、插件市场、模型中转和 Web 搜索 API。
 
 ## 技术栈
 
@@ -53,6 +53,11 @@ make build
 | `RELAY_NON_STREAM_TIMEOUT` | 否 | `2m` | relay 非流式请求从连接到读完响应的总超时 |
 | `RELAY_STREAM_IDLE_TIMEOUT` | 否 | `45s` | relay 流式响应两次读取之间的最大空闲时间 |
 | `RELAY_STREAM_MAX_DURATION` | 否 | `30m` | relay 单次流式响应的最长持续时间 |
+| `TAVILY_API_KEY` | 否 | 空 | Tavily API key；设置后启用 `tavily` 搜索 provider。不会返回给客户端或写入日志 |
+| `TAVILY_ORIGIN` | 否 | `https://api.tavily.com` | Tavily API origin，只允许 scheme、host 和可选 port；客户端不能覆盖 |
+| `SEARXNG_ORIGIN` | 否 | 空 | SearXNG origin；设置后启用 `searxng` 搜索 provider，只允许 scheme、host 和可选 port |
+| `SEARCH_PRIVATE_HOST_ALLOWLIST` | 否 | 空 | 允许搜索 provider 使用 HTTP 和访问私网地址的精确 host/host:port 列表；仅用于服务端配置的 origins |
+| `SEARCH_TIMEOUT` | 否 | `15s` | 单次 `/search/web` 操作（包含 `auto` 回退）的总超时，Go duration，范围 `(0, 1m]` |
 
 ### 4. 启动
 
@@ -214,6 +219,54 @@ curl -X POST http://localhost:8080/relay/chat \
   -H "Authorization: Bearer <accessToken>" \
   -H "Content-Type: application/json" \
   -d '{"model":"gpt-4o-mini","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}],"stream":true}'
+```
+
+### Web 搜索
+
+| 方法 | 路径 | 鉴权 | 说明 |
+|------|------|------|------|
+| POST | `/search/web` | Bearer | 使用服务端配置的 Tavily 或 SearXNG 执行 Web 搜索并返回统一结果 |
+
+请求是严格 JSON，字段为 `query`、可选 `provider`、`maxResults`、`language`、`timeRange`；未知字段和 snake_case 别名会返回 HTTP 400。空 query、超过 1000 字符的 query、`maxResults` 不在 1-10 范围、无效语言标签或 `timeRange` 不为 `day`、`month`、`year` 也会返回 HTTP 400。`provider` 可选值只有 `auto`、`tavily`、`searxng`，默认 `auto`；客户端不能传上游 URL、origin 或 API key。`maxResults` 默认 5。SearXNG 接收语言和时间范围，Tavily 接收其支持的时间范围。
+
+```json
+{
+  "query": "LynAI agent runtime",
+  "provider": "auto",
+  "maxResults": 5,
+  "language": "zh-CN",
+  "timeRange": "month"
+}
+```
+
+响应统一为实际使用的 provider 和规范化结果数组：
+
+```json
+{
+  "provider": "tavily",
+  "results": [
+    {
+      "title": "Example result",
+      "url": "https://example.com/page",
+      "snippet": "Result summary",
+      "score": 0.91,
+      "publishedAt": "2026-07-01"
+    }
+  ]
+}
+```
+
+`auto` 按 Tavily、SearXNG 顺序尝试已配置 provider，并在 provider 请求失败时回退；显式选择 provider 时不回退。没有可用 provider 或显式 provider 未配置时返回 HTTP 503，上游超时、非 2xx、无效/超大响应返回 HTTP 502，且响应不会包含上游正文、origin 或 secret。
+
+搜索 origins 仅从环境配置读取，必须是无 path/query/fragment/credentials 的 HTTP(S) origin。默认要求 HTTPS；HTTP 或解析到 loopback/private/link-local/reserved 地址的 origin 必须通过 `SEARCH_PRIVATE_HOST_ALLOWLIST` 精确放行。连接前会重新解析并校验全部 DNS 地址，且禁止上游重定向。请求体上限 16 KiB，上游响应上限 2 MiB。
+
+**搜索请求示例：**
+
+```bash
+curl -X POST http://localhost:8080/search/web \
+  -H "Authorization: Bearer <accessToken>" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"LynAI agent runtime","provider":"auto","maxResults":5}'
 ```
 
 ### 社区

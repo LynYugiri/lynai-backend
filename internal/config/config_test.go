@@ -32,6 +32,9 @@ func TestLoadDefaultsAndMachineID(t *testing.T) {
 	if cfg.AdminSessionTTL != 30*24*time.Hour || cfg.RelaySpeechSessionTTL != 2*time.Hour || cfg.RelaySpeechPerUser != 5 || cfg.RelaySpeechGlobal != 500 {
 		t.Fatalf("session defaults = admin %s, speech %s, per-user %d, global %d", cfg.AdminSessionTTL, cfg.RelaySpeechSessionTTL, cfg.RelaySpeechPerUser, cfg.RelaySpeechGlobal)
 	}
+	if cfg.SearchTavilyOrigin != "https://api.tavily.com" || cfg.SearchTimeout != 15*time.Second {
+		t.Fatalf("search defaults = tavily origin %q, timeout %s", cfg.SearchTavilyOrigin, cfg.SearchTimeout)
+	}
 
 	for _, machineID := range []string{"0", "1023"} {
 		t.Run(machineID, func(t *testing.T) {
@@ -89,6 +92,7 @@ func TestLoadValidatesSessionAndRelayLimits(t *testing.T) {
 		{key: "RELAY_SPEECH_PER_USER_CAPACITY", value: "0"},
 		{key: "RELAY_NON_STREAM_TIMEOUT", value: "-1s"},
 		{key: "SNOWFLAKE_ROLLBACK_TIMEOUT", value: "0s"},
+		{key: "SEARCH_TIMEOUT", value: "0s"},
 	} {
 		t.Run(tc.key, func(t *testing.T) {
 			t.Setenv(tc.key, tc.value)
@@ -102,6 +106,33 @@ func TestLoadValidatesSessionAndRelayLimits(t *testing.T) {
 	t.Setenv("RELAY_SPEECH_GLOBAL_CAPACITY", "5")
 	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "RELAY_SPEECH_GLOBAL_CAPACITY") {
 		t.Fatalf("Load() error = %v, want global capacity validation", err)
+	}
+}
+
+func TestLoadSearchConfiguration(t *testing.T) {
+	t.Setenv("DB_DSN", "test-dsn")
+	t.Setenv("JWT_SECRET", validTestJWTSecret)
+	t.Setenv("MACHINE_ID", "0")
+	t.Setenv("TAVILY_API_KEY", " tavily-secret ")
+	t.Setenv("TAVILY_ORIGIN", "https://tavily.example")
+	t.Setenv("SEARXNG_ORIGIN", "https://search.example")
+	t.Setenv("SEARCH_PRIVATE_HOST_ALLOWLIST", "localhost:8888, search.internal")
+	t.Setenv("SEARCH_TIMEOUT", "20s")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.SearchTavilyAPIKey != "tavily-secret" || cfg.SearchTavilyOrigin != "https://tavily.example" || cfg.SearchSearXNGOrigin != "https://search.example" {
+		t.Fatalf("search configuration = %#v", cfg)
+	}
+	if cfg.SearchTimeout != 20*time.Second || len(cfg.SearchPrivateAllowlist) != 2 {
+		t.Fatalf("search limits = timeout %s, allowlist %#v", cfg.SearchTimeout, cfg.SearchPrivateAllowlist)
+	}
+
+	t.Setenv("SEARCH_TIMEOUT", "61s")
+	if _, err := Load(); err == nil || !strings.Contains(err.Error(), "SEARCH_TIMEOUT") {
+		t.Fatalf("Load() error = %v, want SEARCH_TIMEOUT validation", err)
 	}
 }
 
