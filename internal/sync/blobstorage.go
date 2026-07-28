@@ -9,11 +9,14 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
+	"syscall"
 	"time"
 )
 
 var ErrBlobHashMismatch = errors.New("blob SHA-256 mismatch")
+var ErrBlobTooLarge = errors.New("blob file exceeds the read limit")
 
 // BlobStorage manages sync blob files on disk.
 type BlobStorage struct {
@@ -95,6 +98,9 @@ func (p *PreparedBlob) Commit() (BlobCommit, error) {
 	defer p.Close()
 	finalPath := p.storage.BlobPath(p.userID, p.sha256)
 	if err := os.Link(p.temp, finalPath); err == nil {
+		if err := syncDirectory(filepath.Dir(finalPath)); err != nil {
+			return BlobCommit{}, fmt.Errorf("sync blob directory: %w", err)
+		}
 		return BlobCommit{Size: p.size, Created: true}, nil
 	} else if !errors.Is(err, fs.ErrExist) {
 		return BlobCommit{}, fmt.Errorf("commit blob: %w", err)
@@ -115,6 +121,9 @@ func (p *PreparedBlob) Commit() (BlobCommit, error) {
 		return BlobCommit{}, fmt.Errorf("commit blob: %w", err)
 	}
 	p.temp = ""
+	if err := syncDirectory(filepath.Dir(finalPath)); err != nil {
+		return BlobCommit{}, fmt.Errorf("sync blob directory: %w", err)
+	}
 	return BlobCommit{Size: p.size, Created: true}, nil
 }
 
@@ -142,7 +151,35 @@ func (s *BlobStorage) SaveBlob(userID int64, expectedSHA256 string, src io.Reade
 
 // LoadBlob reads blob bytes from disk.
 func (s *BlobStorage) LoadBlob(userID int64, sha256 string) ([]byte, error) {
-	return os.ReadFile(s.BlobPath(userID, sha256))
+	file, err := os.Open(s.BlobPath(userID, sha256))
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, MaxBlobBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > MaxBlobBytes {
+		return nil, ErrBlobTooLarge
+	}
+	return data, nil
+}
+
+func syncDirectory(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	err = dir.Sync()
+	if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOTSUP) {
+		return nil
+	}
+	return err
 }
 
 func verifyBlobFile(path, expectedSHA256 string) (bool, error) {

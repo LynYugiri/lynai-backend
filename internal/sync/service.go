@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -34,8 +35,10 @@ var (
 	ErrChangeConflict     = errors.New("change ID conflicts with an existing change")
 	ErrReplayConflict     = errors.New("request ID conflicts with an existing request")
 	ErrBlobNotFound       = errors.New("blob not found")
+	ErrBlobCorrupt        = errors.New("blob storage is corrupt")
 	ErrGenerationConflict = errors.New("sync generation conflict")
 	ErrFutureCursor       = errors.New("sync cursor is ahead of the current generation")
+	ErrStaleCursor        = errors.New("sync cursor is older than the available change history")
 	allowedTables         = map[string]struct{}{
 		"resources": {}, "conversations": {}, "messages": {}, "message_attachments": {},
 		"calendar_events": {}, "anniversaries": {}, "tasks": {}, "task_lists": {}, "task_list_entries": {},
@@ -79,13 +82,22 @@ func NewServiceWithReplayRetention(db *gorm.DB, blob *BlobStorage, retention tim
 
 // SyncStatus is the response for GET /sync/status.
 type SyncStatus struct {
-	LastSeq         int64     `json:"lastSeq"`
-	Generation      int64     `json:"generation"`
-	IndexRevision   int64     `json:"indexRevision"`
-	MinAvailableSeq int64     `json:"minAvailableSeq"`
-	BlobCount       int64     `json:"blobCount"`
-	Usage           SyncUsage `json:"usage"`
-	Limits          Limits    `json:"limits"`
+	LastSeq         int64            `json:"lastSeq"`
+	Generation      int64            `json:"generation"`
+	IndexRevision   int64            `json:"indexRevision"`
+	MinAvailableSeq int64            `json:"minAvailableSeq"`
+	BlobCount       int64            `json:"blobCount"`
+	Usage           SyncUsage        `json:"usage"`
+	Limits          Limits           `json:"limits"`
+	Capabilities    SyncCapabilities `json:"capabilities"`
+}
+
+// SyncCapabilities advertises optional sync management behavior.
+type SyncCapabilities struct {
+	Index          bool `json:"index"`
+	SelectivePurge bool `json:"selectivePurge"`
+	FullPurge      bool `json:"fullPurge"`
+	OperationAck   bool `json:"operationAck"`
 }
 
 // SyncUsage contains basic per-user sync storage counters.
@@ -119,12 +131,14 @@ func (s *Service) GetStatus(userID int64) (*SyncStatus, error) {
 	return &SyncStatus{
 		LastSeq: meta.LastSeq, Generation: metadataGeneration(meta), IndexRevision: meta.IndexRevision,
 		MinAvailableSeq: meta.MinAvailableSeq, BlobCount: usage.BlobCount, Usage: usage, Limits: syncLimits,
+		Capabilities: SyncCapabilities{Index: true, SelectivePurge: true, FullPurge: true, OperationAck: true},
 	}, nil
 }
 
 // ChangeRecord is a single change in the sync log, as transmitted over the API.
 type ChangeRecord struct {
 	ChangeID        string          `json:"changeId,omitempty"`
+	DeviceID        string          `json:"deviceId,omitempty"`
 	Table           string          `json:"table"`
 	Op              string          `json:"op"`
 	RecordID        string          `json:"recordId"`
@@ -346,6 +360,8 @@ func validateChange(change ChangeRecord) error {
 		if err := validateSpecialRecord(change.Table, data); err != nil {
 			return err
 		}
+	} else if len(change.Data) != 0 {
+		return errors.New("delete data must be omitted")
 	}
 	return nil
 }
@@ -494,6 +510,8 @@ type ChangesPage struct {
 	HasMore         bool
 	GlobalLatestSeq int64
 	Generation      int64
+	IndexRevision   int64
+	MinAvailableSeq int64
 }
 
 // GetChangesPage reads metadata and a bounded page from one snapshot.
@@ -505,8 +523,12 @@ func (s *Service) GetChangesPage(userID int64, since int64, limit int) (ChangesP
 			return err
 		}
 		page.Generation, page.GlobalLatestSeq = metadataGeneration(meta), meta.LastSeq
+		page.IndexRevision, page.MinAvailableSeq = meta.IndexRevision, meta.MinAvailableSeq
 		if since > meta.LastSeq {
 			return ErrFutureCursor
+		}
+		if since < meta.MinAvailableSeq {
+			return ErrStaleCursor
 		}
 		var changes []database.SyncChange
 		if err := tx.Where("user_id = ? AND seq > ?", userID, since).Order("seq ASC").Limit(limit + 1).Find(&changes).Error; err != nil {
@@ -521,7 +543,7 @@ func (s *Service) GetChangesPage(userID int64, since int64, limit int) (ChangesP
 			page.Changes = append(page.Changes, changeFromModel(ch))
 		}
 		return nil
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	return page, err
 }
 
@@ -780,7 +802,7 @@ func (s *Service) LoadBlob(userID int64, sha256 string) ([]byte, error) {
 		return nil
 	})
 	if err == nil && corrupt {
-		return nil, ErrBlobNotFound
+		return nil, ErrBlobCorrupt
 	}
 	return data, err
 }

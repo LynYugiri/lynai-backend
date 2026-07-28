@@ -2,13 +2,16 @@ package sync
 
 import (
 	"bytes"
+	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/lynai/backend/internal/database"
 	"gorm.io/gorm"
@@ -114,7 +117,8 @@ type IndexObjectsPage struct {
 
 type IndexObjectDetail struct {
 	IndexObject
-	Records []ChangeRecord `json:"records"`
+	IndexRevision int64          `json:"indexRevision"`
+	Records       []ChangeRecord `json:"records"`
 }
 
 type PurgePreview struct {
@@ -183,7 +187,7 @@ func (s *Service) ListIndexObjects(userID int64, category, after string, limit i
 	}
 	var page IndexObjectsPage
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		meta, err := s.readMetadataLocked(tx, userID)
+		meta, err := s.readMetadata(tx, userID)
 		if err != nil {
 			return err
 		}
@@ -223,15 +227,8 @@ func (s *Service) ListIndexObjects(userID int64, category, after string, limit i
 		if len(page.Objects) > 0 {
 			page.NextAfter = page.Objects[len(page.Objects)-1].ObjectID
 		}
-		var current database.SyncMetadata
-		if err := tx.First(&current, "user_id = ?", userID).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
-			return err
-		}
-		if current.IndexRevision != expectedRevision {
-			return ErrIndexRevisionConflict
-		}
 		return nil
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	return page, err
 }
 
@@ -241,7 +238,7 @@ func (s *Service) GetIndexObject(userID int64, category, objectID string, expect
 	}
 	var detail IndexObjectDetail
 	err := s.db.Transaction(func(tx *gorm.DB) error {
-		meta, err := s.readMetadataLocked(tx, userID)
+		meta, err := s.readMetadata(tx, userID)
 		if err != nil {
 			return err
 		}
@@ -256,6 +253,7 @@ func (s *Service) GetIndexObject(userID int64, category, objectID string, expect
 			return gorm.ErrRecordNotFound
 		}
 		detail = IndexObjectDetail{IndexObject: IndexObject{Category: category, ObjectID: objectID}, Records: make([]ChangeRecord, 0, len(records))}
+		detail.IndexRevision = meta.IndexRevision
 		for _, record := range records {
 			detail.RecordCount++
 			if record.Seq > detail.LatestSeq {
@@ -271,7 +269,7 @@ func (s *Service) GetIndexObject(userID int64, category, objectID string, expect
 			return err
 		}
 		return nil
-	})
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	return detail, err
 }
 
@@ -279,14 +277,22 @@ func (s *Service) PreviewPurge(userID int64, selector PurgeSelector, expectedRev
 	if err := validateSelector(selector); err != nil {
 		return PurgePreview{}, err
 	}
-	meta, err := s.readMetadata(s.db, userID)
-	if err != nil {
-		return PurgePreview{}, err
-	}
-	if meta.IndexRevision != expectedRevision {
-		return PurgePreview{}, ErrIndexRevisionConflict
-	}
-	return s.previewPurgeDB(s.db, userID, selector, meta)
+	var preview PurgePreview
+	err := s.db.Transaction(func(tx *gorm.DB) error {
+		meta, err := s.readMetadata(tx, userID)
+		if err != nil {
+			return err
+		}
+		if meta.IndexRevision != expectedRevision {
+			return ErrIndexRevisionConflict
+		}
+		preview, err = s.previewPurgeDB(tx, userID, selector, meta)
+		if err != nil {
+			return err
+		}
+		return nil
+	}, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
+	return preview, err
 }
 
 func (s *Service) previewPurgeDB(db *gorm.DB, userID int64, selector PurgeSelector, meta database.SyncMetadata) (PurgePreview, error) {
@@ -295,10 +301,11 @@ func (s *Service) previewPurgeDB(db *gorm.DB, userID int64, selector PurgeSelect
 	if err := records.Count(&preview.RecordCount).Error; err != nil {
 		return preview, err
 	}
-	changes := scopedChanges(db.Model(&database.SyncChange{}), userID, selector)
-	if err := changes.Count(&preview.ChangeCount).Error; err != nil {
+	changeCount, err := countScopedChanges(db, userID, selector)
+	if err != nil {
 		return preview, err
 	}
+	preview.ChangeCount = changeCount
 	refs := db.Model(&database.SyncRecordBlob{}).Where("user_id = ? AND (table_name, record_id) IN (?)", userID, records.Select("table_name, record_id"))
 	if err := refs.Count(&preview.BlobRefCount).Error; err != nil {
 		return preview, err
@@ -336,10 +343,10 @@ func scopedRecords(db *gorm.DB, userID int64, selector PurgeSelector) *gorm.DB {
 	return db
 }
 
-func scopedChanges(db *gorm.DB, userID int64, selector PurgeSelector) *gorm.DB {
-	db = db.Where("user_id = ?", userID)
+func scopedTableChanges(db *gorm.DB, userID int64, selector PurgeSelector) *gorm.DB {
+	query := db.Model(&database.SyncChange{}).Where("user_id = ?", userID)
 	if selector.Type == "all" {
-		return db
+		return query
 	}
 	tables := make([]string, 0)
 	for table, category := range tableCategories {
@@ -347,13 +354,98 @@ func scopedChanges(db *gorm.DB, userID int64, selector PurgeSelector) *gorm.DB {
 			tables = append(tables, table)
 		}
 	}
-	db = db.Where("table_name IN ?", tables)
-	if selector.Type == "object" {
-		db = db.Where(`EXISTS (SELECT 1 FROM sync_records sr
-			WHERE sr.user_id = sync_changes.user_id AND sr.table_name = sync_changes.table_name
-			AND sr.record_id = sync_changes.record_id AND sr.category = ? AND sr.object_id = ?)`, selector.Category, selector.ObjectID)
+	sort.Strings(tables)
+	return query.Where("table_name IN ?", tables)
+}
+
+func countScopedChanges(db *gorm.DB, userID int64, selector PurgeSelector) (int64, error) {
+	if selector.Type != "object" {
+		var count int64
+		return count, scopedTableChanges(db, userID, selector).Count(&count).Error
 	}
-	return db
+	ids, err := scopedObjectChangeIDs(db, userID, selector)
+	return int64(len(ids)), err
+}
+
+func scopedObjectChangeIDs(db *gorm.DB, userID int64, selector PurgeSelector) ([]int64, error) {
+	var changes []database.SyncChange
+	if err := scopedTableChanges(db, userID, selector).Order("seq ASC, id ASC").Find(&changes).Error; err != nil {
+		return nil, err
+	}
+	return historicalObjectChangeIDs(changes, selector.ObjectID), nil
+}
+
+type historicalMembership struct {
+	seq      int64
+	objectID string
+}
+
+func historicalObjectChangeIDs(changes []database.SyncChange, objectID string) []int64 {
+	pageMemberships := make(map[string][]historicalMembership)
+	for _, change := range changes {
+		if change.TableName != "note_pages" || change.Op != "upsert" || change.Data == nil {
+			continue
+		}
+		_, noteID := projectionIdentity(change.TableName, change.RecordID, json.RawMessage(*change.Data))
+		pageMemberships[change.RecordID] = append(pageMemberships[change.RecordID], historicalMembership{seq: change.Seq, objectID: noteID})
+	}
+
+	currentMembership := make(map[string]string)
+	ids := make([]int64, 0)
+	for _, change := range changes {
+		key := change.TableName + "\x00" + change.RecordID
+		membership := currentMembership[key]
+		if change.Op == "upsert" && change.Data != nil {
+			_, membership = projectionIdentity(change.TableName, change.RecordID, json.RawMessage(*change.Data))
+			if change.TableName == "note_page_heads" || change.TableName == "note_page_tombstones" {
+				if pageID := historicalPageID(*change.Data); pageID != "" {
+					membership = historicalPageMembership(pageMemberships[pageID], change.Seq, pageID)
+				}
+			}
+			currentMembership[key] = membership
+		} else if membership == "" {
+			membership = change.RecordID
+		}
+		if membership == objectID {
+			ids = append(ids, change.ID)
+		}
+	}
+	return ids
+}
+
+func historicalPageID(data string) string {
+	var value map[string]interface{}
+	if json.Unmarshal([]byte(data), &value) != nil {
+		return ""
+	}
+	pageID, _ := value["pageId"].(string)
+	return pageID
+}
+
+func historicalPageMembership(memberships []historicalMembership, seq int64, fallback string) string {
+	for i := len(memberships) - 1; i >= 0; i-- {
+		if memberships[i].seq <= seq {
+			return memberships[i].objectID
+		}
+	}
+	if len(memberships) > 0 {
+		return memberships[0].objectID
+	}
+	return fallback
+}
+
+func deleteObjectChanges(db *gorm.DB, userID int64, ids []int64) error {
+	const batchSize = 500
+	for start := 0; start < len(ids); start += batchSize {
+		end := start + batchSize
+		if end > len(ids) {
+			end = len(ids)
+		}
+		if err := db.Where("user_id = ? AND id IN ?", userID, ids[start:end]).Delete(&database.SyncChange{}).Error; err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *Service) PurgeIdempotent(userID int64, requestID string, bodyHash []byte, operation, deviceID string, selector PurgeSelector, expectedRevision, expectedGeneration int64) (ReplayResponse, error) {
@@ -373,33 +465,35 @@ func (s *Service) PurgeIdempotent(userID int64, requestID string, bodyHash []byt
 		if err != nil {
 			return err
 		}
-		if meta.IndexRevision != expectedRevision {
-			return ErrIndexRevisionConflict
-		}
 		if metadataGeneration(meta) != expectedGeneration {
 			return generationConflictError{Expected: expectedGeneration, Current: metadataGeneration(meta)}
+		}
+		if meta.IndexRevision != expectedRevision {
+			return ErrIndexRevisionConflict
 		}
 		preview, err := s.previewPurgeDB(tx, userID, selector, meta)
 		if err != nil {
 			return err
 		}
+		meta.Generation = metadataGeneration(meta) + 1
 		if selector.Type == "all" {
-			if err := tx.Where("user_id = ?", userID).Delete(&database.SyncRequestReplay{}).Error; err != nil {
-				return err
-			}
 			for _, model := range []interface{}{&database.SyncRecordBlob{}, &database.SyncRecord{}, &database.SyncChange{}} {
 				if err := tx.Where("user_id = ?", userID).Delete(model).Error; err != nil {
 					return err
 				}
 			}
-			if err := tx.Where("user_id = ? AND status = ?", userID, "pending").Delete(&database.SyncManagementOperation{}).Error; err != nil {
-				return err
-			}
-			meta.Generation = metadataGeneration(meta) + 1
 			meta.LastSeq, meta.MinAvailableSeq = 0, 0
 		} else {
 			records := scopedRecords(tx.Model(&database.SyncRecord{}), userID, selector)
-			if err := scopedChanges(tx.Model(&database.SyncChange{}), userID, selector).Delete(&database.SyncChange{}).Error; err != nil {
+			if selector.Type == "object" {
+				changeIDs, err := scopedObjectChangeIDs(tx, userID, selector)
+				if err != nil {
+					return err
+				}
+				if err := deleteObjectChanges(tx, userID, changeIDs); err != nil {
+					return err
+				}
+			} else if err := scopedTableChanges(tx, userID, selector).Delete(&database.SyncChange{}).Error; err != nil {
 				return err
 			}
 			if err := tx.Where("user_id = ? AND (table_name, record_id) IN (?)", userID, records.Select("table_name, record_id")).Delete(&database.SyncRecordBlob{}).Error; err != nil {
@@ -408,13 +502,14 @@ func (s *Service) PurgeIdempotent(userID int64, requestID string, bodyHash []byt
 			if err := records.Delete(&database.SyncRecord{}).Error; err != nil {
 				return err
 			}
-			if err := tx.Where("user_id = ?", userID).Delete(&database.SyncRequestReplay{}).Error; err != nil {
-				return err
-			}
+			meta.MinAvailableSeq = meta.LastSeq
 		}
 		meta.IndexRevision++
 		meta.UpdatedAt = s.now()
 		if err := tx.Save(&meta).Error; err != nil {
+			return err
+		}
+		if err := tx.Where("user_id = ? AND status = ?", userID, "pending").Delete(&database.SyncManagementOperation{}).Error; err != nil {
 			return err
 		}
 		category, objectID := nullableSelector(selector)
@@ -472,6 +567,9 @@ func (s *Service) AckOperationIdempotent(userID int64, requestID string, bodyHas
 		if err := tx.Where("id = ? AND user_id = ?", operationID, userID).First(&op).Error; err != nil {
 			return ErrOperationNotFound
 		}
+		if op.Generation != expectedGeneration {
+			return generationConflictError{Expected: expectedGeneration, Current: op.Generation}
+		}
 		if op.Status == "pending" {
 			now := s.now()
 			op.Status, op.AckedByDeviceID, op.AckedAt = "acked", &deviceID, &now
@@ -500,15 +598,6 @@ func (s *Service) AckOperationIdempotent(userID int64, requestID string, bodyHas
 func (s *Service) readMetadata(db *gorm.DB, userID int64) (database.SyncMetadata, error) {
 	var meta database.SyncMetadata
 	err := db.First(&meta, "user_id = ?", userID).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return database.SyncMetadata{UserID: userID, Generation: 1}, nil
-	}
-	return meta, err
-}
-
-func (s *Service) readMetadataLocked(db *gorm.DB, userID int64) (database.SyncMetadata, error) {
-	var meta database.SyncMetadata
-	err := db.Clauses(clause.Locking{Strength: "SHARE"}).First(&meta, "user_id = ?", userID).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return database.SyncMetadata{UserID: userID, Generation: 1}, nil
 	}
@@ -570,7 +659,8 @@ func decodeIndexCursor(value string) (string, error) {
 		return "", nil
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(value)
-	if err != nil || base64.RawURLEncoding.EncodeToString(raw) != value || strings.ContainsRune(string(raw), 0) {
+	if err != nil || len(raw) == 0 || len(raw) > maxRecordIDLength || !utf8.Valid(raw) ||
+		base64.RawURLEncoding.EncodeToString(raw) != value || strings.ContainsRune(string(raw), 0) {
 		return "", errors.New("invalid cursor")
 	}
 	return string(raw), nil

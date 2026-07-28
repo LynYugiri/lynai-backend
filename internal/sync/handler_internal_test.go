@@ -95,4 +95,73 @@ func TestInvalidBlobSignatureDoesNotStageBody(t *testing.T) {
 	}
 }
 
+func TestDownloadBlobDistinguishesMissingFromCorruptStorage(t *testing.T) {
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&database.SyncBlob{}); err != nil {
+		t.Fatal(err)
+	}
+	storage, err := NewBlobStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	const userID int64 = 42
+	handler := NewHandler(NewService(db, storage))
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(func(c *gin.Context) {
+		c.Set("userID", strconv.FormatInt(userID, 10))
+		c.Next()
+	})
+	router.GET("/sync/blobs/:sha256", handler.DownloadBlob)
+
+	missingSHA := strings.Repeat("0", 64)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/sync/blobs/"+missingSHA, nil))
+	if recorder.Code != http.StatusNotFound {
+		t.Fatalf("missing blob status = %d, want 404", recorder.Code)
+	}
+
+	for _, tc := range []struct {
+		name string
+		sha  string
+		make func(string) error
+	}{
+		{name: "hash mismatch", sha: strings.Repeat("1", 64), make: func(path string) error {
+			return os.WriteFile(path, []byte("corrupt"), 0o600)
+		}},
+		{name: "oversized", sha: strings.Repeat("2", 64), make: func(path string) error {
+			file, err := os.Create(path)
+			if err != nil {
+				return err
+			}
+			if err := file.Truncate(MaxBlobBytes + 1); err != nil {
+				_ = file.Close()
+				return err
+			}
+			return file.Close()
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := storage.BlobPath(userID, tc.sha)
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := tc.make(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Create(&database.SyncBlob{UserID: userID, SHA256: tc.sha, Size: 1, CreatedAt: time.Now()}).Error; err != nil {
+				t.Fatal(err)
+			}
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/sync/blobs/"+tc.sha, nil))
+			if recorder.Code != http.StatusInternalServerError {
+				t.Fatalf("status = %d, want 500", recorder.Code)
+			}
+		})
+	}
+}
+
 var _ io.ReadCloser = (*failOnReadBody)(nil)

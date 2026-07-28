@@ -128,8 +128,8 @@ func TestLoadBlobDeletesCorruptFileAndMetadata(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, err := service.LoadBlob(42, sha); !errors.Is(err, ErrBlobNotFound) {
-		t.Fatalf("LoadBlob error = %v, want ErrBlobNotFound", err)
+	if _, err := service.LoadBlob(42, sha); !errors.Is(err, ErrBlobCorrupt) {
+		t.Fatalf("LoadBlob error = %v, want ErrBlobCorrupt", err)
 	}
 	if _, err := os.Stat(storage.BlobPath(42, sha)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("corrupt file stat error = %v, want not exist", err)

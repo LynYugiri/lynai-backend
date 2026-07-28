@@ -104,6 +104,126 @@ func TestProjectionIdentityMapping(t *testing.T) {
 	}
 }
 
+func TestObjectPurgeIncludesUpsertAndDeleteHistoryWithoutProjection(t *testing.T) {
+	db, svc, now := newManagementTestService(t)
+	changes := []ChangeRecord{
+		{ChangeID: "message-upsert", Table: "messages", Op: "upsert", RecordID: "message-1", Data: rawJSON(t, map[string]interface{}{"id": "message-1", "conversationId": "conversation-1"}), ClientCreatedAt: now},
+		{ChangeID: "message-delete", Table: "messages", Op: "delete", RecordID: "message-1", ClientCreatedAt: now},
+	}
+	if _, err := svc.UploadChanges(42, changes); err != nil {
+		t.Fatal(err)
+	}
+	selector := PurgeSelector{Type: "object", Category: "messages", ObjectID: "conversation-1"}
+	preview, err := svc.PreviewPurge(42, selector, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.RecordCount != 0 || preview.ChangeCount != 2 {
+		t.Fatalf("preview = %+v, want 0 records and 2 changes", preview)
+	}
+	response, err := svc.PurgeIdempotent(42, "11111111111111111111111111111111", make([]byte, 32), "POST /sync/manage/purge", "device", selector, 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var result PurgeResult
+	if err := json.Unmarshal(response.Body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.Operation.DeletedRecordCount != 0 || result.Operation.DeletedChangeCount != 2 {
+		t.Fatalf("operation = %+v", result.Operation)
+	}
+	var remaining int64
+	if err := db.Model(&database.SyncChange{}).Where("user_id = ?", 42).Count(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if remaining != 0 {
+		t.Fatalf("remaining changes = %d, want 0", remaining)
+	}
+}
+
+func TestObjectPurgeUsesMembershipAtEachHistoricalChange(t *testing.T) {
+	db, svc, now := newManagementTestService(t)
+	changes := []ChangeRecord{
+		{ChangeID: "message-in-first", Table: "messages", Op: "upsert", RecordID: "message-1", Data: rawJSON(t, map[string]interface{}{"id": "message-1", "conversationId": "conversation-1"}), ClientCreatedAt: now},
+		{ChangeID: "message-moved", Table: "messages", Op: "upsert", RecordID: "message-1", Data: rawJSON(t, map[string]interface{}{"id": "message-1", "conversationId": "conversation-2"}), ClientCreatedAt: now},
+		{ChangeID: "message-deleted", Table: "messages", Op: "delete", RecordID: "message-1", ClientCreatedAt: now},
+	}
+	if _, err := svc.UploadChanges(42, changes); err != nil {
+		t.Fatal(err)
+	}
+	first := PurgeSelector{Type: "object", Category: "messages", ObjectID: "conversation-1"}
+	preview, err := svc.PreviewPurge(42, first, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.RecordCount != 0 || preview.ChangeCount != 1 {
+		t.Fatalf("first membership preview = %+v", preview)
+	}
+	if _, err := svc.PurgeIdempotent(42, "22222222222222222222222222222222", make([]byte, 32), "POST /sync/manage/purge", "device", first, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	var remaining []database.SyncChange
+	if err := db.Where("user_id = ?", 42).Order("seq").Find(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 2 || remaining[0].ChangeID != "message-moved" || remaining[1].ChangeID != "message-deleted" {
+		t.Fatalf("remaining history = %+v", remaining)
+	}
+	second := PurgeSelector{Type: "object", Category: "messages", ObjectID: "conversation-2"}
+	preview, err = svc.PreviewPurge(42, second, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.ChangeCount != 2 {
+		t.Fatalf("second membership preview = %+v", preview)
+	}
+}
+
+func TestCategoryPurgeIncludesHistoryWithoutProjection(t *testing.T) {
+	db, svc, now := newManagementTestService(t)
+	changes := []ChangeRecord{
+		{ChangeID: "message-upsert", Table: "messages", Op: "upsert", RecordID: "message-1", Data: rawJSON(t, map[string]interface{}{"id": "message-1", "conversationId": "conversation-1"}), ClientCreatedAt: now},
+		{ChangeID: "message-delete", Table: "messages", Op: "delete", RecordID: "message-1", ClientCreatedAt: now},
+		{ChangeID: "task-upsert", Table: "tasks", Op: "upsert", RecordID: "task-1", Data: rawJSON(t, map[string]interface{}{"id": "task-1"}), ClientCreatedAt: now},
+	}
+	if _, err := svc.UploadChanges(42, changes); err != nil {
+		t.Fatal(err)
+	}
+	selector := PurgeSelector{Type: "category", Category: "messages"}
+	preview, err := svc.PreviewPurge(42, selector, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.RecordCount != 0 || preview.ChangeCount != 2 {
+		t.Fatalf("preview = %+v, want 0 records and 2 changes", preview)
+	}
+	if _, err := svc.PurgeIdempotent(42, "33333333333333333333333333333333", make([]byte, 32), "POST /sync/manage/purge", "device", selector, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	var remaining []database.SyncChange
+	if err := db.Where("user_id = ?", 42).Order("seq").Find(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 || remaining[0].ChangeID != "task-upsert" {
+		t.Fatalf("remaining history = %+v", remaining)
+	}
+}
+
+func newManagementTestService(t *testing.T) (*gorm.DB, *Service, time.Time) {
+	t.Helper()
+	db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.AutoMigrate(&database.SyncMetadata{}, &database.SyncChange{}, &database.SyncRecord{}, &database.SyncRecordBlob{}, &database.SyncRequestReplay{}, &database.SyncManagementOperation{}); err != nil {
+		t.Fatal(err)
+	}
+	svc := NewService(db, nil)
+	now := time.Date(2026, 7, 24, 12, 0, 0, 0, time.UTC)
+	svc.now = func() time.Time { return now }
+	return db, svc, now
+}
+
 func rawJSON(t *testing.T, value interface{}) json.RawMessage {
 	t.Helper()
 	raw, err := json.Marshal(value)

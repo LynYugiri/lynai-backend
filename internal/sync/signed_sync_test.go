@@ -80,7 +80,12 @@ func TestSignedSyncReplayConflictRevocationAndCompatibility(t *testing.T) {
 	conflicting := signedBody(t, requestID, "change-signed-2", "message-2")
 	resp = doSignedSync(t, ts.URL+"/sync/changes", token, device, requestID, conflicting)
 	testutil.RequireStatus(t, resp, http.StatusConflict)
+	var replayConflict map[string]interface{}
+	testutil.DecodeJSON(t, resp, &replayConflict)
 	resp.Body.Close()
+	if replayConflict["code"] != "replay_conflict" {
+		t.Fatalf("replay conflict = %#v", replayConflict)
+	}
 	resp = doSignedSync(t, ts.URL+"/sync/v1/changes", token, device, requestID, body)
 	testutil.RequireStatus(t, resp, http.StatusConflict)
 	resp.Body.Close()
@@ -273,6 +278,17 @@ func TestSignedBlobUploadReplaysExactResponse(t *testing.T) {
 	resp.Body.Close()
 	if !result.Owned || result.Created || result.Size != int64(len(body)) {
 		t.Fatalf("duplicate blob result = %+v", result)
+	}
+
+	conflictingBody := []byte("different signed blob content")
+	conflictingDigest := sha256.Sum256(conflictingBody)
+	resp = doSignedBlob(t, ts.URL+"/sync/blobs/"+hex.EncodeToString(conflictingDigest[:]), token, device, requestID, conflictingBody)
+	testutil.RequireStatus(t, resp, http.StatusConflict)
+	var conflict map[string]interface{}
+	testutil.DecodeJSON(t, resp, &conflict)
+	resp.Body.Close()
+	if conflict["code"] != "replay_conflict" {
+		t.Fatalf("blob replay conflict = %#v", conflict)
 	}
 }
 

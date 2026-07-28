@@ -66,6 +66,7 @@ func (h *Handler) UploadChanges(c *gin.Context) {
 	}
 	var req uploadChangesRequest
 	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -145,7 +146,11 @@ func writeUploadError(c *gin.Context, err error) {
 	case errors.Is(err, ErrGenerationConflict):
 		writeGenerationConflict(c, err)
 	case errors.Is(err, ErrChangeConflict), errors.Is(err, ErrReplayConflict):
-		c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+		code := "change_conflict"
+		if errors.Is(err, ErrReplayConflict) {
+			code = "replay_conflict"
+		}
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": code})
 	default:
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 	}
@@ -175,16 +180,20 @@ func (h *Handler) GetChanges(c *gin.Context) {
 	}
 
 	page, err := h.svc.GetChangesPage(userID, since, limit)
+	if expectedGeneration > 0 && page.Generation > 0 && page.Generation != expectedGeneration {
+		writeGenerationConflict(c, generationConflictError{Expected: expectedGeneration, Current: page.Generation})
+		return
+	}
 	if err != nil {
 		if errors.Is(err, ErrFutureCursor) {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "future_cursor", "generation": page.Generation, "currentGeneration": page.Generation, "latestSeq": page.GlobalLatestSeq})
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "future_cursor", "generation": page.Generation, "currentGeneration": page.Generation, "latestSeq": page.GlobalLatestSeq, "indexRevision": page.IndexRevision, "minAvailableSeq": page.MinAvailableSeq})
+			return
+		}
+		if errors.Is(err, ErrStaleCursor) {
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "stale_cursor", "generation": page.Generation, "currentGeneration": page.Generation, "latestSeq": page.GlobalLatestSeq, "indexRevision": page.IndexRevision, "minAvailableSeq": page.MinAvailableSeq})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
-		return
-	}
-	if expectedGeneration > 0 && page.Generation != expectedGeneration {
-		writeGenerationConflict(c, generationConflictError{Expected: expectedGeneration, Current: page.Generation})
 		return
 	}
 	nextSince := since
@@ -196,6 +205,8 @@ func (h *Handler) GetChanges(c *gin.Context) {
 		"latestSeq":       nextSince,
 		"globalLatestSeq": page.GlobalLatestSeq,
 		"generation":      page.Generation,
+		"indexRevision":   page.IndexRevision,
+		"minAvailableSeq": page.MinAvailableSeq,
 	}
 	response["hasMore"] = page.HasMore
 	response["nextSince"] = nextSince
@@ -255,7 +266,7 @@ func (h *Handler) UploadBlob(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, ErrReplayConflict) {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "replay_conflict"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save blob"})
@@ -287,7 +298,7 @@ func (h *Handler) UploadBlob(c *gin.Context) {
 			return
 		}
 		if errors.Is(err, ErrReplayConflict) {
-			c.JSON(http.StatusConflict, gin.H{"error": err.Error()})
+			c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "replay_conflict"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save blob"})
@@ -310,7 +321,11 @@ func (h *Handler) DownloadBlob(c *gin.Context) {
 
 	data, err := h.svc.LoadBlob(userID, sha256)
 	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "blob not found"})
+		if errors.Is(err, ErrBlobNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "blob not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load blob"})
 		return
 	}
 	c.Data(http.StatusOK, "application/octet-stream", data)

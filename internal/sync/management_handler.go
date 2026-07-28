@@ -129,6 +129,7 @@ func (h *Handler) PendingOperations(c *gin.Context) {
 type ackOperationRequest struct {
 	RequestID          string `json:"requestId"`
 	ExpectedGeneration int64  `json:"expectedGeneration"`
+	OperationID        string `json:"operationId,omitempty"`
 }
 
 // AckOperation handles signed POST /sync/manage/operations/:id/ack.
@@ -153,6 +154,10 @@ func (h *Handler) AckOperation(c *gin.Context) {
 	}
 	if req.ExpectedGeneration != signed.ExpectedGeneration {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "body expectedGeneration does not match signed header"})
+		return
+	}
+	if req.OperationID != "" && req.OperationID != c.Param("id") {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body operationId does not match path operation ID"})
 		return
 	}
 	response, err := h.svc.AckOperationIdempotent(getUserID(c), signed.RequestID, signed.BodyHash, c.Request.Method+" "+c.FullPath(), signed.DeviceID, c.Param("id"), signed.ExpectedGeneration)
@@ -205,8 +210,10 @@ func writeManagementError(c *gin.Context, err error) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 	case errors.Is(err, ErrGenerationConflict):
 		writeGenerationConflict(c, err)
-	case errors.Is(err, ErrIndexRevisionConflict), errors.Is(err, ErrReplayConflict):
+	case errors.Is(err, ErrIndexRevisionConflict):
 		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "index_revision_conflict"})
+	case errors.Is(err, ErrReplayConflict):
+		c.JSON(http.StatusConflict, gin.H{"error": err.Error(), "code": "replay_conflict"})
 	case errors.Is(err, ErrOperationNotFound):
 		c.JSON(http.StatusNotFound, gin.H{"error": err.Error()})
 	default:

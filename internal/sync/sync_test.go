@@ -44,6 +44,10 @@ func TestSyncStatusEmpty(t *testing.T) {
 	if !ok || limits["maxBlobBytes"] != float64(64<<20) || limits["maxChangesRequestBytes"] != float64(2<<20) || limits["maxChangesPerRequest"] != float64(500) || limits["maxChangeDataBytes"] != float64(256<<10) || limits["maxChangesPageSize"] != float64(1000) || limits["maxBlobsPageSize"] != float64(1000) {
 		t.Fatalf("limits = %#v", result["limits"])
 	}
+	capabilities, ok := result["capabilities"].(map[string]interface{})
+	if !ok || capabilities["index"] != true || capabilities["selectivePurge"] != true || capabilities["fullPurge"] != true || capabilities["operationAck"] != true {
+		t.Fatalf("capabilities = %#v", result["capabilities"])
+	}
 }
 
 func TestUploadChanges(t *testing.T) {
@@ -150,6 +154,9 @@ func TestGetChanges(t *testing.T) {
 	}
 	if result["latestSeq"] != float64(2) {
 		t.Fatalf("latestSeq = %v, want 2", result["latestSeq"])
+	}
+	if result["indexRevision"] != float64(2) || result["minAvailableSeq"] != float64(0) {
+		t.Fatalf("pull metadata = %#v", result)
 	}
 
 	// Get changes since seq=1 — should only return seq=2
@@ -278,6 +285,7 @@ func TestChangesValidationAndLimits(t *testing.T) {
 		{name: "missing record id", changes: []map[string]interface{}{{"table": "messages", "op": "delete"}}},
 		{name: "long record id", changes: []map[string]interface{}{{"table": "messages", "op": "delete", "recordId": strings.Repeat("x", 257)}}},
 		{name: "missing upsert data", changes: []map[string]interface{}{{"table": "messages", "op": "upsert", "recordId": "1"}}},
+		{name: "delete with data", changes: []map[string]interface{}{{"table": "messages", "op": "delete", "recordId": "1", "data": map[string]interface{}{"id": "1"}}}},
 		{name: "mismatched data id", changes: []map[string]interface{}{{"table": "messages", "op": "upsert", "recordId": "1", "data": map[string]interface{}{"id": "2"}}}},
 		{name: "legacy planning table", changes: []map[string]interface{}{{"table": "schedules", "op": "delete", "recordId": "1"}}},
 		{name: "shared settings wrong id", changes: []map[string]interface{}{{"table": "shared_settings", "op": "delete", "recordId": "other"}}},
@@ -312,6 +320,44 @@ func TestChangesValidationAndLimits(t *testing.T) {
 	resp = doSignedSync(t, ts.URL+"/sync/changes", token, device, requestID, append(valid, []byte(` {}`)...))
 	testutil.RequireStatus(t, resp, http.StatusBadRequest)
 	resp.Body.Close()
+}
+
+func TestChangesStrictJSONAcceptsDeprecatedDeviceIDOnly(t *testing.T) {
+	_, _, ts, cleanup := testutil.SetupTest()
+	defer cleanup()
+	token := testutil.RegisterAndGetToken(t, ts.URL, "13100000017", testPassword)
+	device := enrollSyncDevice(t, ts.URL, token)
+
+	requestID := randomRequestID(t)
+	body, _ := json.Marshal(map[string]interface{}{
+		"requestId": requestID, "expectedGeneration": 1,
+		"changes": []map[string]interface{}{{
+			"changeId": "legacy-device-id", "deviceId": "deprecated-client-value", "clientCreatedAt": time.Now().UTC(),
+			"table": "messages", "op": "delete", "recordId": "legacy-device-record",
+		}},
+	})
+	resp := doSignedSync(t, ts.URL+"/sync/changes", token, device, requestID, body)
+	testutil.RequireStatus(t, resp, http.StatusOK)
+	resp.Body.Close()
+
+	for _, mutate := range []func(map[string]interface{}){
+		func(value map[string]interface{}) { value["unknown"] = true },
+		func(value map[string]interface{}) { value["changes"].([]map[string]interface{})[0]["unknown"] = true },
+	} {
+		requestID = randomRequestID(t)
+		value := map[string]interface{}{
+			"requestId": requestID, "expectedGeneration": 1,
+			"changes": []map[string]interface{}{{
+				"changeId": "strict-" + requestID, "clientCreatedAt": time.Now().UTC(),
+				"table": "messages", "op": "delete", "recordId": "strict-" + requestID,
+			}},
+		}
+		mutate(value)
+		body, _ = json.Marshal(value)
+		resp = doSignedSync(t, ts.URL+"/sync/changes", token, device, requestID, body)
+		testutil.RequireStatus(t, resp, http.StatusBadRequest)
+		resp.Body.Close()
+	}
 }
 
 func TestChangesAllowSharedSettingsAndSyncedModelConfigs(t *testing.T) {
@@ -508,6 +554,10 @@ func TestConcurrentUploadChanges(t *testing.T) {
 }
 
 func uploadSignedChanges(t testing.TB, baseURL, token string, device syncDevice, changes interface{}) *http.Response {
+	return uploadSignedChangesWithGeneration(t, baseURL, token, device, 1, changes)
+}
+
+func uploadSignedChangesWithGeneration(t testing.TB, baseURL, token string, device syncDevice, generation int64, changes interface{}) *http.Response {
 	t.Helper()
 	raw, err := json.Marshal(changes)
 	if err != nil {
@@ -526,11 +576,11 @@ func uploadSignedChanges(t testing.TB, baseURL, token string, device syncDevice,
 		changes = records
 	}
 	requestID := randomRequestID(t)
-	body, err := json.Marshal(map[string]interface{}{"requestId": requestID, "expectedGeneration": 1, "changes": changes})
+	body, err := json.Marshal(map[string]interface{}{"requestId": requestID, "expectedGeneration": generation, "changes": changes})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return doSignedSync(t, baseURL+"/sync/changes", token, device, requestID, body)
+	return doSignedSyncGeneration(t, baseURL+"/sync/changes", token, device, requestID, generation, body)
 }
 
 type statusError struct {

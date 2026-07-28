@@ -101,3 +101,28 @@ func TestBlobStorageConcurrentSameHashPublishesOnce(t *testing.T) {
 		t.Fatalf("stored content = %q, want %q", stored, content)
 	}
 }
+
+func TestBlobStorageLoadIsBounded(t *testing.T) {
+	storage, err := NewBlobStorage(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := storage.BlobPath(42, string(bytes.Repeat([]byte("0"), 64)))
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(MaxBlobBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.LoadBlob(42, string(bytes.Repeat([]byte("0"), 64))); !errors.Is(err, ErrBlobTooLarge) {
+		t.Fatalf("LoadBlob error = %v, want ErrBlobTooLarge", err)
+	}
+}

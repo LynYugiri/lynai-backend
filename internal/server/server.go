@@ -32,7 +32,7 @@ func Setup(
 	r.Use(func(c *gin.Context) {
 		c.Header("Access-Control-Allow-Origin", "*")
 		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS")
-		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-LynAI-Protocol, X-LynAI-Device-ID, X-LynAI-Timestamp, X-LynAI-Request-ID, X-LynAI-Body-SHA256, X-LynAI-Signature")
+		c.Header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-LynAI-Protocol, X-LynAI-Device-ID, X-LynAI-Timestamp, X-LynAI-Request-ID, X-LynAI-Body-SHA256, X-LynAI-Signature, X-LynAI-Expected-Generation")
 		if c.Request.Method == "OPTIONS" {
 			c.AbortWithStatus(204)
 			return
