@@ -47,8 +47,11 @@ var (
 		"note_page_heads": {}, "note_page_tombstones": {},
 		"shared_settings": {}, "synced_model_configs": {},
 		"plugin_files": {}, "plugin_settings": {}, "plugin_config": {},
+		"knowledge_bases": {}, "knowledge_categories": {}, "knowledge_entries": {},
+		"knowledge_sources": {}, "knowledge_explanations": {}, "knowledge_settings": {},
 	}
-	sha256ValuePattern = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	sha256ValuePattern    = regexp.MustCompile(`^[0-9a-f]{64}$`)
+	knowledgeAliasPattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,31}$`)
 )
 
 type generationConflictError struct {
@@ -287,6 +290,11 @@ func (s *Service) commitChanges(userID int64, requestID string, bodyHash []byte,
 			}
 			result = append(result, changeFromModel(change))
 		}
+		if containsKnowledgeChanges(changes) {
+			if err := validateKnowledgeProjection(tx, userID); err != nil {
+				return fmt.Errorf("%w: %v", ErrInvalidChange, err)
+			}
+		}
 		nextIndexRevision := meta.IndexRevision
 		if seq != meta.LastSeq {
 			nextIndexRevision++
@@ -343,6 +351,12 @@ func validateChange(change ChangeRecord) error {
 	if change.Table == "shared_settings" && change.RecordID != "app-settings" {
 		return errors.New("shared_settings recordId must be app-settings")
 	}
+	if change.Table == "knowledge_settings" && change.RecordID != "global" {
+		return errors.New("knowledge_settings recordId must be global")
+	}
+	if change.Table == "knowledge_bases" && change.RecordID == "global" {
+		return errors.New("knowledge_bases recordId global is reserved")
+	}
 	if len(change.Data) > MaxChangeDataBytes {
 		return fmt.Errorf("%w: change data is too large", ErrSyncLimit)
 	}
@@ -378,6 +392,285 @@ func validateSpecialRecord(table string, data map[string]interface{}) error {
 		}
 		if containsSecretKey(data) {
 			return errors.New("synced_model_configs data contains a secret-like key")
+		}
+	case "knowledge_bases":
+		return validateKnowledgeBase(data)
+	case "knowledge_categories":
+		return validateKnowledgeCategory(data)
+	case "knowledge_entries":
+		return validateKnowledgeEntry(data)
+	case "knowledge_sources":
+		return validateKnowledgeSource(data)
+	case "knowledge_explanations":
+		return validateKnowledgeExplanation(data)
+	case "knowledge_settings":
+		if err := validateKnowledgeOptionalID(data, "defaultKnowledgeBaseId"); err != nil {
+			return err
+		}
+		if err := validateKnowledgeOptionalID(data, "defaultCategoryId"); err != nil {
+			return err
+		}
+		_, hasBase := data["defaultKnowledgeBaseId"]
+		_, hasCategory := data["defaultCategoryId"]
+		if hasBase != hasCategory {
+			return errors.New("knowledge_settings default IDs must both be present or both be omitted")
+		}
+		return validateKnowledgeTime(data, "knowledge_settings", "updatedAt")
+	}
+	return nil
+}
+
+func validateKnowledgeBase(data map[string]interface{}) error {
+	if err := validateKnowledgeString(data, "knowledge_bases", "name", 1, MaxChangeDataBytes); err != nil {
+		return err
+	}
+	if err := validateKnowledgeNullableString(data, "knowledge_bases", "description", MaxChangeDataBytes); err != nil {
+		return err
+	}
+	return validateKnowledgeCommonFields(data, "knowledge_bases", []string{"enabled"}, []string{"sortOrder"})
+}
+
+func validateKnowledgeCategory(data map[string]interface{}) error {
+	if err := validateKnowledgeID(data, "knowledge_categories", "knowledgeBaseId"); err != nil {
+		return err
+	}
+	if err := validateKnowledgeString(data, "knowledge_categories", "name", 1, MaxChangeDataBytes); err != nil {
+		return err
+	}
+	alias, ok := data["alias"].(string)
+	if !ok || !knowledgeAliasPattern.MatchString(alias) {
+		return errors.New("knowledge_categories data.alias must match ^[a-z][a-z0-9_-]{0,31}$")
+	}
+	for _, field := range []string{"description", "modelConfigId"} {
+		if err := validateKnowledgeNullableString(data, "knowledge_categories", field, MaxChangeDataBytes); err != nil {
+			return err
+		}
+	}
+	for _, field := range []string{"annotationRule", "explanationPrompt"} {
+		if err := validateKnowledgeString(data, "knowledge_categories", field, 0, MaxChangeDataBytes); err != nil {
+			return err
+		}
+	}
+	return validateKnowledgeCommonFields(data, "knowledge_categories", []string{"autoAnnotate", "isDefault", "enabled"}, []string{"colorValue", "sortOrder"})
+}
+
+func validateKnowledgeEntry(data map[string]interface{}) error {
+	if err := validateKnowledgeID(data, "knowledge_entries", "knowledgeBaseId"); err != nil {
+		return err
+	}
+	if err := validateKnowledgeOptionalID(data, "categoryId"); err != nil {
+		return err
+	}
+	if err := validateKnowledgeString(data, "knowledge_entries", "title", 1, MaxChangeDataBytes); err != nil {
+		return err
+	}
+	if err := validateKnowledgeString(data, "knowledge_entries", "content", 0, MaxChangeDataBytes); err != nil {
+		return err
+	}
+	return validateKnowledgeCommonFields(data, "knowledge_entries", []string{"enabled"}, []string{"sortOrder"})
+}
+
+func validateKnowledgeSource(data map[string]interface{}) error {
+	if err := validateKnowledgeID(data, "knowledge_sources", "knowledgeBaseId"); err != nil {
+		return err
+	}
+	if err := validateKnowledgeID(data, "knowledge_sources", "entryId"); err != nil {
+		return err
+	}
+	if err := validateKnowledgeString(data, "knowledge_sources", "title", 0, MaxChangeDataBytes); err != nil {
+		return err
+	}
+	for _, field := range []string{"url", "note"} {
+		if err := validateKnowledgeNullableString(data, "knowledge_sources", field, MaxChangeDataBytes); err != nil {
+			return err
+		}
+	}
+	return validateKnowledgeCommonFields(data, "knowledge_sources", nil, []string{"sortOrder"})
+}
+
+func validateKnowledgeExplanation(data map[string]interface{}) error {
+	if err := validateKnowledgeID(data, "knowledge_explanations", "knowledgeBaseId"); err != nil {
+		return err
+	}
+	if err := validateKnowledgeID(data, "knowledge_explanations", "entryId"); err != nil {
+		return err
+	}
+	for _, field := range []string{"title", "content"} {
+		if err := validateKnowledgeString(data, "knowledge_explanations", field, 0, MaxChangeDataBytes); err != nil {
+			return err
+		}
+	}
+	return validateKnowledgeCommonFields(data, "knowledge_explanations", nil, []string{"sortOrder"})
+}
+
+func validateKnowledgeCommonFields(data map[string]interface{}, table string, boolFields, intFields []string) error {
+	for _, field := range boolFields {
+		if _, ok := data[field].(bool); !ok {
+			return fmt.Errorf("%s data.%s must be a bool", table, field)
+		}
+	}
+	for _, field := range intFields {
+		value, ok := data[field].(json.Number)
+		if !ok {
+			return fmt.Errorf("%s data.%s must be an integer", table, field)
+		}
+		if _, err := value.Int64(); err != nil {
+			return fmt.Errorf("%s data.%s must be a signed 64-bit integer", table, field)
+		}
+	}
+	if err := validateKnowledgeTime(data, table, "createdAt"); err != nil {
+		return err
+	}
+	return validateKnowledgeTime(data, table, "updatedAt")
+}
+
+func validateKnowledgeID(data map[string]interface{}, table, field string) error {
+	value, ok := data[field].(string)
+	if !ok || len(value) == 0 || len(value) > maxRecordIDLength {
+		return fmt.Errorf("%s data.%s must contain 1 to 256 bytes", table, field)
+	}
+	return nil
+}
+
+func validateKnowledgeOptionalID(data map[string]interface{}, field string) error {
+	value, exists := data[field]
+	if !exists || value == nil {
+		return nil
+	}
+	id, ok := value.(string)
+	if !ok || len(id) == 0 || len(id) > maxRecordIDLength {
+		return fmt.Errorf("knowledge data.%s must be null or contain 1 to 256 bytes", field)
+	}
+	return nil
+}
+
+func validateKnowledgeString(data map[string]interface{}, table, field string, minLength, maxLength int) error {
+	value, ok := data[field].(string)
+	if !ok || len(value) < minLength || len(value) > maxLength {
+		return fmt.Errorf("%s data.%s must be a string containing %d to %d bytes", table, field, minLength, maxLength)
+	}
+	return nil
+}
+
+func validateKnowledgeNullableString(data map[string]interface{}, table, field string, maxLength int) error {
+	value, exists := data[field]
+	if !exists || value == nil {
+		return nil
+	}
+	text, ok := value.(string)
+	if !ok || len(text) > maxLength {
+		return fmt.Errorf("%s data.%s must be null or a string containing at most %d bytes", table, field, maxLength)
+	}
+	return nil
+}
+
+func validateKnowledgeTime(data map[string]interface{}, table, field string) error {
+	value, ok := data[field].(string)
+	if !ok || len(value) == 0 || len(value) > 64 {
+		return fmt.Errorf("%s data.%s must be an RFC3339 string containing 1 to 64 bytes", table, field)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, value); err != nil {
+		return fmt.Errorf("%s data.%s must be RFC3339", table, field)
+	}
+	return nil
+}
+
+func containsKnowledgeChanges(changes []ChangeRecord) bool {
+	for _, change := range changes {
+		if tableCategories[change.Table] == "knowledge" {
+			return true
+		}
+	}
+	return false
+}
+
+func validateKnowledgeProjection(db *gorm.DB, userID int64) error {
+	var records []database.SyncRecord
+	if err := db.Where("user_id = ? AND category = ?", userID, "knowledge").Find(&records).Error; err != nil {
+		return err
+	}
+	bases := make(map[string]map[string]interface{})
+	categories := make(map[string]map[string]interface{})
+	entries := make(map[string]map[string]interface{})
+	settings := make([]map[string]interface{}, 0, 1)
+	children := make([]database.SyncRecord, 0, len(records))
+	for _, record := range records {
+		var data map[string]interface{}
+		decoder := json.NewDecoder(strings.NewReader(record.Data))
+		decoder.UseNumber()
+		if err := decoder.Decode(&data); err != nil || data == nil {
+			return fmt.Errorf("stored %s/%s projection is not a JSON object", record.TableName, record.RecordID)
+		}
+		if err := validateSpecialRecord(record.TableName, data); err != nil {
+			return fmt.Errorf("stored %s/%s projection is invalid: %v", record.TableName, record.RecordID, err)
+		}
+		switch record.TableName {
+		case "knowledge_bases":
+			bases[record.RecordID] = data
+		case "knowledge_categories":
+			categories[record.RecordID] = data
+			children = append(children, record)
+		case "knowledge_entries":
+			entries[record.RecordID] = data
+			children = append(children, record)
+		case "knowledge_sources", "knowledge_explanations":
+			children = append(children, record)
+		case "knowledge_settings":
+			settings = append(settings, data)
+		}
+	}
+
+	aliases := make(map[string]string, len(categories))
+	for categoryID, data := range categories {
+		baseID := data["knowledgeBaseId"].(string)
+		if _, ok := bases[baseID]; !ok {
+			return fmt.Errorf("knowledge category %s references missing base %s", categoryID, baseID)
+		}
+		alias := data["alias"].(string)
+		if existing, ok := aliases[alias]; ok && existing != categoryID {
+			return fmt.Errorf("knowledge category alias %s is duplicated", alias)
+		}
+		aliases[alias] = categoryID
+	}
+	for entryID, data := range entries {
+		baseID := data["knowledgeBaseId"].(string)
+		if _, ok := bases[baseID]; !ok {
+			return fmt.Errorf("knowledge entry %s references missing base %s", entryID, baseID)
+		}
+		categoryID, _ := data["categoryId"].(string)
+		if categoryID != "" {
+			category, ok := categories[categoryID]
+			if !ok || category["knowledgeBaseId"] != baseID {
+				return fmt.Errorf("knowledge entry %s category does not belong to base %s", entryID, baseID)
+			}
+		}
+	}
+	for _, record := range children {
+		if record.TableName != "knowledge_sources" && record.TableName != "knowledge_explanations" {
+			continue
+		}
+		var data map[string]interface{}
+		decoder := json.NewDecoder(strings.NewReader(record.Data))
+		decoder.UseNumber()
+		_ = decoder.Decode(&data)
+		baseID := data["knowledgeBaseId"].(string)
+		entryID := data["entryId"].(string)
+		entry, ok := entries[entryID]
+		if !ok || entry["knowledgeBaseId"] != baseID {
+			return fmt.Errorf("%s %s entry does not belong to base %s", record.TableName, record.RecordID, baseID)
+		}
+	}
+	for _, data := range settings {
+		baseID, _ := data["defaultKnowledgeBaseId"].(string)
+		categoryID, _ := data["defaultCategoryId"].(string)
+		if baseID == "" && categoryID == "" {
+			continue
+		}
+		base, baseOK := bases[baseID]
+		category, categoryOK := categories[categoryID]
+		if !baseOK || !categoryOK || category["knowledgeBaseId"] != baseID ||
+			base["enabled"] != true || category["enabled"] != true || category["autoAnnotate"] != true {
+			return errors.New("knowledge settings default category is not an enabled auto-annotate category in an enabled base")
 		}
 	}
 	return nil

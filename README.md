@@ -107,7 +107,7 @@ curl http://localhost:8080/health
 
 同步 blob 是每用户的 content-addressed 文件。共享同一 POSIX `STORAGE_DIR` 的 PostgreSQL 多实例通过数据库 transaction advisory lock 串行化同一用户/hash 的发布和损坏清理；SQLite 测试使用进程内锁。上传内容通过 SHA-256 验证后才发布，若同路径已有损坏文件会原子替换；metadata 或文件确实不存在返回 404，下载发现 hash 不符或文件超过服务端 blob 上限等服务端存储损坏返回不泄漏细节的 500，避免伪装成不存在。
 
-同步变更 allowlist 包含版本化的 `shared_settings`、`synced_model_configs`、`plugin_files`、`plugin_settings` 和 `plugin_config` 逻辑域。运行时 `plugin_storage` 有意保持设备本地，不进入云同步。客户端只上传共享设置投影和用户明确启用的非托管 Provider 非秘密配置；完整 `app_settings`、API key、secret 引用和后端托管 Relay 配置不属于云同步 payload。
+同步变更 allowlist 包含版本化的 `shared_settings`、`synced_model_configs`、`plugin_files`、`plugin_settings`、`plugin_config`，以及 `knowledge_bases`、`knowledge_categories`、`knowledge_entries`、`knowledge_sources`、`knowledge_explanations`、`knowledge_settings` 逻辑域。知识 payload 必须提供客户端落库所需的最小字段类型：必需文本、bool、signed 64-bit int 和带时区的 RFC3339 时间不得缺失或错型，可空文本必须为 string/null；所有 ID 最多 256 bytes，category alias 必须匹配 `^[a-z][a-z0-9_-]{0,31}$`。知识记录在管理索引中统一归入 `knowledge` category：`knowledge_bases` 以自身 `recordId` 为 object ID，但 `global` 是 settings 保留 ID，不得用作知识库 ID；知识子记录必须携带非空 `data.knowledgeBaseId` 并以其作为 object ID，source/explanation 还必须携带非空 `entryId`；全局 `knowledge_settings` 的 `recordId` 和 object ID 固定为 `global`，默认 base/category ID 成对省略或提供。服务端在同一 upload 应用完全部 change 后验证最终 projection 的 base/category/entry 归属、全局 alias 唯一性，以及默认 category 必须属于已启用 base 且自身启用并允许自动标注，因此同批次父子 upsert 不依赖上传顺序。purge `knowledge/<baseId>` 若删除当前 settings 引用的默认 base，会同时删除 `knowledge_settings/global` projection 和历史，避免 reseed 后残留不可应用设置。运行时 `plugin_storage` 有意保持设备本地，不进入云同步。客户端只上传共享设置投影和用户明确启用的非托管 Provider 非秘密配置；完整 `app_settings`、API key、secret 引用和后端托管 Relay 配置不属于云同步 payload。
 
 ### 认证
 

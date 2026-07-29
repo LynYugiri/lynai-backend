@@ -34,6 +34,8 @@ var tableCategories = map[string]string{
 	"roleplay_scenarios": "roleplay", "roleplay_threads": "roleplay", "recycle_bin": "recycle_bin",
 	"shared_settings": "settings", "synced_model_configs": "models",
 	"plugin_files": "plugins", "plugin_settings": "plugins", "plugin_config": "plugins",
+	"knowledge_bases": "knowledge", "knowledge_categories": "knowledge", "knowledge_entries": "knowledge",
+	"knowledge_sources": "knowledge", "knowledge_explanations": "knowledge", "knowledge_settings": "knowledge",
 }
 
 var objectParentFields = map[string][]string{
@@ -41,6 +43,8 @@ var objectParentFields = map[string][]string{
 	"note_pages": {"noteId"}, "note_revisions": {"noteId"},
 	"task_list_entries": {"listId", "taskListId"}, "roleplay_threads": {"scenarioId"},
 	"plugin_files": {"pluginId"}, "plugin_settings": {"pluginId"}, "plugin_config": {"pluginId"},
+	"knowledge_categories": {"knowledgeBaseId"}, "knowledge_entries": {"knowledgeBaseId"},
+	"knowledge_sources": {"knowledgeBaseId"}, "knowledge_explanations": {"knowledgeBaseId"},
 }
 
 func projectionIdentityDB(db *gorm.DB, userID int64, table, recordID string, raw json.RawMessage) (string, string, error) {
@@ -301,6 +305,13 @@ func (s *Service) previewPurgeDB(db *gorm.DB, userID int64, selector PurgeSelect
 	if err := records.Count(&preview.RecordCount).Error; err != nil {
 		return preview, err
 	}
+	settingsReferenced, err := knowledgeSettingsReferencesPurgedBase(db, userID, selector)
+	if err != nil {
+		return preview, err
+	}
+	if settingsReferenced {
+		preview.RecordCount++
+	}
 	changeCount, err := countScopedChanges(db, userID, selector)
 	if err != nil {
 		return preview, err
@@ -372,7 +383,36 @@ func scopedObjectChangeIDs(db *gorm.DB, userID int64, selector PurgeSelector) ([
 	if err := scopedTableChanges(db, userID, selector).Order("seq ASC, id ASC").Find(&changes).Error; err != nil {
 		return nil, err
 	}
-	return historicalObjectChangeIDs(changes, selector.ObjectID), nil
+	ids := historicalObjectChangeIDs(changes, selector.ObjectID)
+	settingsReferenced, err := knowledgeSettingsReferencesPurgedBase(db, userID, selector)
+	if err != nil || !settingsReferenced {
+		return ids, err
+	}
+	var settingsIDs []int64
+	if err := db.Model(&database.SyncChange{}).
+		Where("user_id = ? AND table_name = ?", userID, "knowledge_settings").Pluck("id", &settingsIDs).Error; err != nil {
+		return nil, err
+	}
+	return append(ids, settingsIDs...), nil
+}
+
+func knowledgeSettingsReferencesPurgedBase(db *gorm.DB, userID int64, selector PurgeSelector) (bool, error) {
+	if selector.Type != "object" || selector.Category != "knowledge" || selector.ObjectID == "global" {
+		return false, nil
+	}
+	var record database.SyncRecord
+	err := db.Where("user_id = ? AND table_name = ? AND record_id = ?", userID, "knowledge_settings", "global").First(&record).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(record.Data), &data); err != nil {
+		return false, err
+	}
+	return data["defaultKnowledgeBaseId"] == selector.ObjectID, nil
 }
 
 type historicalMembership struct {
@@ -485,6 +525,10 @@ func (s *Service) PurgeIdempotent(userID int64, requestID string, bodyHash []byt
 			meta.LastSeq, meta.MinAvailableSeq = 0, 0
 		} else {
 			records := scopedRecords(tx.Model(&database.SyncRecord{}), userID, selector)
+			settingsReferenced, err := knowledgeSettingsReferencesPurgedBase(tx, userID, selector)
+			if err != nil {
+				return err
+			}
 			if selector.Type == "object" {
 				changeIDs, err := scopedObjectChangeIDs(tx, userID, selector)
 				if err != nil {
@@ -501,6 +545,15 @@ func (s *Service) PurgeIdempotent(userID int64, requestID string, bodyHash []byt
 			}
 			if err := records.Delete(&database.SyncRecord{}).Error; err != nil {
 				return err
+			}
+			if settingsReferenced {
+				key := "user_id = ? AND table_name = ? AND record_id = ?"
+				if err := tx.Where(key, userID, "knowledge_settings", "global").Delete(&database.SyncRecordBlob{}).Error; err != nil {
+					return err
+				}
+				if err := tx.Where(key, userID, "knowledge_settings", "global").Delete(&database.SyncRecord{}).Error; err != nil {
+					return err
+				}
 			}
 			meta.MinAvailableSeq = meta.LastSeq
 		}

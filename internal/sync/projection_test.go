@@ -2,6 +2,7 @@ package sync
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -94,6 +95,12 @@ func TestProjectionIdentityMapping(t *testing.T) {
 		{table: "plugin_files", recordID: "p1/file", category: "plugins", objectID: "p1", data: map[string]interface{}{"pluginId": "p1"}},
 		{table: "plugin_settings", recordID: "p1", category: "plugins", objectID: "p1", data: map[string]interface{}{"pluginId": "p1"}},
 		{table: "plugin_config", recordID: "p1", category: "plugins", objectID: "p1", data: map[string]interface{}{"pluginId": "p1"}},
+		{table: "knowledge_bases", recordID: "kb1", category: "knowledge", objectID: "kb1"},
+		{table: "knowledge_categories", recordID: "category1", category: "knowledge", objectID: "kb1", data: map[string]interface{}{"knowledgeBaseId": "kb1"}},
+		{table: "knowledge_entries", recordID: "entry1", category: "knowledge", objectID: "kb1", data: map[string]interface{}{"knowledgeBaseId": "kb1"}},
+		{table: "knowledge_sources", recordID: "source1", category: "knowledge", objectID: "kb1", data: map[string]interface{}{"knowledgeBaseId": "kb1"}},
+		{table: "knowledge_explanations", recordID: "explanation1", category: "knowledge", objectID: "kb1", data: map[string]interface{}{"knowledgeBaseId": "kb1"}},
+		{table: "knowledge_settings", recordID: "global", category: "knowledge", objectID: "global"},
 	}
 	for _, test := range tests {
 		raw := rawJSON(t, test.data)
@@ -101,6 +108,202 @@ func TestProjectionIdentityMapping(t *testing.T) {
 		if category != test.category || objectID != test.objectID {
 			t.Errorf("%s identity = %s/%s, want %s/%s", test.table, category, objectID, test.category, test.objectID)
 		}
+	}
+}
+
+func TestValidateKnowledgeChanges(t *testing.T) {
+	now := time.Now().UTC()
+	for _, table := range []string{
+		"knowledge_bases",
+		"knowledge_categories",
+		"knowledge_entries",
+		"knowledge_sources",
+		"knowledge_explanations",
+		"knowledge_settings",
+	} {
+		data := validKnowledgeData(table, "record-1", now)
+		if table == "knowledge_settings" {
+			data["id"] = "global"
+		}
+		recordID := data["id"].(string)
+		change := ChangeRecord{ChangeID: table, Table: table, Op: "upsert", RecordID: recordID, Data: rawJSON(t, data), ClientCreatedAt: now}
+		if err := validateChange(change); err != nil {
+			t.Errorf("validateChange(%s) error = %v", table, err)
+		}
+	}
+
+	for _, knowledgeBaseID := range []interface{}{nil, "", 1, strings.Repeat("x", maxRecordIDLength+1)} {
+		data := validKnowledgeData("knowledge_entries", "entry-1", now)
+		if knowledgeBaseID != nil {
+			data["knowledgeBaseId"] = knowledgeBaseID
+		} else {
+			delete(data, "knowledgeBaseId")
+		}
+		change := ChangeRecord{ChangeID: "invalid-entry", Table: "knowledge_entries", Op: "upsert", RecordID: "entry-1", Data: rawJSON(t, data), ClientCreatedAt: now}
+		if err := validateChange(change); err == nil {
+			t.Errorf("validateChange accepted knowledgeBaseId %#v", knowledgeBaseID)
+		}
+	}
+
+	reservedBase := validKnowledgeData("knowledge_bases", "global", now)
+	if err := validateChange(ChangeRecord{
+		ChangeID:        "reserved-global-base",
+		Table:           "knowledge_bases",
+		Op:              "upsert",
+		RecordID:        "global",
+		Data:            rawJSON(t, reservedBase),
+		ClientCreatedAt: now,
+	}); err == nil {
+		t.Fatal("validateChange accepted reserved knowledge base id global")
+	}
+
+	validSettings := map[string]interface{}{
+		"id": "global", "defaultKnowledgeBaseId": "base-1", "defaultCategoryId": "category-1", "updatedAt": now.Format(time.RFC3339Nano),
+	}
+	for name, mutate := range map[string]func(map[string]interface{}){
+		"wrong record ID":   func(data map[string]interface{}) { data["id"] = "other" },
+		"missing paired ID": func(data map[string]interface{}) { delete(data, "defaultCategoryId") },
+		"invalid timestamp": func(data map[string]interface{}) { data["updatedAt"] = "today" },
+	} {
+		data := make(map[string]interface{}, len(validSettings))
+		for key, value := range validSettings {
+			data[key] = value
+		}
+		mutate(data)
+		change := ChangeRecord{ChangeID: "invalid-settings-" + name, Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, data), ClientCreatedAt: now}
+		if err := validateChange(change); err == nil {
+			t.Errorf("validateChange accepted knowledge settings with %s", name)
+		}
+	}
+
+	invalidFields := []struct {
+		table string
+		field string
+		value interface{}
+	}{
+		{table: "knowledge_bases", field: "name", value: ""},
+		{table: "knowledge_bases", field: "enabled", value: 1},
+		{table: "knowledge_bases", field: "sortOrder", value: 1.5},
+		{table: "knowledge_bases", field: "createdAt", value: "today"},
+		{table: "knowledge_categories", field: "alias", value: "Bad Alias"},
+		{table: "knowledge_categories", field: "autoAnnotate", value: "true"},
+		{table: "knowledge_categories", field: "colorValue", value: true},
+		{table: "knowledge_entries", field: "categoryId", value: 1},
+		{table: "knowledge_entries", field: "title", value: nil},
+		{table: "knowledge_sources", field: "entryId", value: ""},
+		{table: "knowledge_sources", field: "url", value: 1},
+		{table: "knowledge_explanations", field: "entryId", value: nil},
+		{table: "knowledge_explanations", field: "updatedAt", value: false},
+	}
+	for _, test := range invalidFields {
+		data := validKnowledgeData(test.table, "record-1", now)
+		data[test.field] = test.value
+		change := ChangeRecord{ChangeID: test.table + "-" + test.field, Table: test.table, Op: "upsert", RecordID: "record-1", Data: rawJSON(t, data), ClientCreatedAt: now}
+		if err := validateChange(change); err == nil {
+			t.Errorf("validateChange accepted %s.%s = %#v", test.table, test.field, test.value)
+		}
+	}
+}
+
+func TestKnowledgeBatchValidatesFinalProjectionRegardlessOfOrder(t *testing.T) {
+	_, svc, now := newManagementTestService(t)
+	changes := []ChangeRecord{
+		{ChangeID: "source", Table: "knowledge_sources", Op: "upsert", RecordID: "source-1", Data: rawJSON(t, validKnowledgeData("knowledge_sources", "source-1", now)), ClientCreatedAt: now},
+		{ChangeID: "entry", Table: "knowledge_entries", Op: "upsert", RecordID: "entry-1", Data: rawJSON(t, validKnowledgeData("knowledge_entries", "entry-1", now)), ClientCreatedAt: now},
+		{ChangeID: "settings", Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, map[string]interface{}{"id": "global", "defaultKnowledgeBaseId": "base-1", "defaultCategoryId": "category-1", "updatedAt": now.Format(time.RFC3339Nano)}), ClientCreatedAt: now},
+		{ChangeID: "category", Table: "knowledge_categories", Op: "upsert", RecordID: "category-1", Data: rawJSON(t, validKnowledgeData("knowledge_categories", "category-1", now)), ClientCreatedAt: now},
+		{ChangeID: "base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-1", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-1", now)), ClientCreatedAt: now},
+	}
+	if _, err := svc.UploadChanges(42, changes); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestKnowledgeBatchRejectsUnapplicableFinalProjection(t *testing.T) {
+	_, svc, now := newManagementTestService(t)
+	tests := []struct {
+		name    string
+		changes []ChangeRecord
+	}{
+		{name: "missing base", changes: []ChangeRecord{{ChangeID: "category", Table: "knowledge_categories", Op: "upsert", RecordID: "category-1", Data: rawJSON(t, validKnowledgeData("knowledge_categories", "category-1", now)), ClientCreatedAt: now}}},
+		{name: "entry category in another base", changes: []ChangeRecord{
+			{ChangeID: "base-1", Table: "knowledge_bases", Op: "upsert", RecordID: "base-1", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-1", now)), ClientCreatedAt: now},
+			{ChangeID: "base-2", Table: "knowledge_bases", Op: "upsert", RecordID: "base-2", Data: rawJSON(t, func() map[string]interface{} {
+				data := validKnowledgeData("knowledge_bases", "base-2", now)
+				return data
+			}()), ClientCreatedAt: now},
+			{ChangeID: "category-2", Table: "knowledge_categories", Op: "upsert", RecordID: "category-2", Data: rawJSON(t, func() map[string]interface{} {
+				data := validKnowledgeData("knowledge_categories", "category-2", now)
+				data["knowledgeBaseId"] = "base-2"
+				data["alias"] = "other"
+				return data
+			}()), ClientCreatedAt: now},
+			{ChangeID: "entry-1", Table: "knowledge_entries", Op: "upsert", RecordID: "entry-1", Data: rawJSON(t, func() map[string]interface{} {
+				data := validKnowledgeData("knowledge_entries", "entry-1", now)
+				data["categoryId"] = "category-2"
+				return data
+			}()), ClientCreatedAt: now},
+		}},
+		{name: "source entry in another base", changes: []ChangeRecord{
+			{ChangeID: "base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-1", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-1", now)), ClientCreatedAt: now},
+			{ChangeID: "entry", Table: "knowledge_entries", Op: "upsert", RecordID: "entry-1", Data: rawJSON(t, validKnowledgeData("knowledge_entries", "entry-1", now)), ClientCreatedAt: now},
+			{ChangeID: "source", Table: "knowledge_sources", Op: "upsert", RecordID: "source-1", Data: rawJSON(t, func() map[string]interface{} {
+				data := validKnowledgeData("knowledge_sources", "source-1", now)
+				data["knowledgeBaseId"] = "base-2"
+				return data
+			}()), ClientCreatedAt: now},
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := svc.UploadChanges(42, test.changes); !errors.Is(err, ErrInvalidChange) {
+				t.Fatalf("UploadChanges error = %v, want invalid change", err)
+			}
+		})
+	}
+}
+
+func TestKnowledgeObjectPurgeRemovesSettingsReferencingPurgedBase(t *testing.T) {
+	db, svc, now := newManagementTestService(t)
+	changes := []ChangeRecord{
+		{ChangeID: "base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-1", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-1", now)), ClientCreatedAt: now},
+		{ChangeID: "category", Table: "knowledge_categories", Op: "upsert", RecordID: "category-1", Data: rawJSON(t, validKnowledgeData("knowledge_categories", "category-1", now)), ClientCreatedAt: now},
+		{ChangeID: "settings", Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, map[string]interface{}{"id": "global", "defaultKnowledgeBaseId": "base-1", "defaultCategoryId": "category-1", "updatedAt": now.Format(time.RFC3339Nano)}), ClientCreatedAt: now},
+		{ChangeID: "other-base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-2", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-2", now)), ClientCreatedAt: now},
+	}
+	if _, err := svc.UploadChanges(42, changes); err != nil {
+		t.Fatal(err)
+	}
+	selector := PurgeSelector{Type: "object", Category: "knowledge", ObjectID: "base-1"}
+	preview, err := svc.PreviewPurge(42, selector, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.RecordCount != 3 || preview.ChangeCount != 3 {
+		t.Fatalf("preview = %+v, want 3 records and 3 changes", preview)
+	}
+	if _, err := svc.PurgeIdempotent(42, "44444444444444444444444444444444", make([]byte, 32), "POST /sync/manage/purge", "device", selector, 4, 1); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := db.Model(&database.SyncRecord{}).Where("user_id = ? AND category = ?", 42, "knowledge").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("remaining knowledge projections = %d, want only the unrelated base", count)
+	}
+	var remaining database.SyncRecord
+	if err := db.Where("user_id = ? AND category = ?", 42, "knowledge").First(&remaining).Error; err != nil {
+		t.Fatal(err)
+	}
+	if remaining.TableName != "knowledge_bases" || remaining.RecordID != "base-2" {
+		t.Fatalf("remaining knowledge projection = %+v, want base-2", remaining)
+	}
+	if err := db.Model(&database.SyncChange{}).Where("user_id = ? AND table_name = ?", 42, "knowledge_settings").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("remaining knowledge settings history = %d, want 0", count)
 	}
 }
 
@@ -231,4 +434,42 @@ func rawJSON(t *testing.T, value interface{}) json.RawMessage {
 		t.Fatal(err)
 	}
 	return raw
+}
+
+func validKnowledgeData(table, id string, now time.Time) map[string]interface{} {
+	timestamp := now.Format(time.RFC3339Nano)
+	common := map[string]interface{}{"id": id, "sortOrder": 0, "createdAt": timestamp, "updatedAt": timestamp}
+	switch table {
+	case "knowledge_bases":
+		common["name"] = "Base"
+		common["enabled"] = true
+	case "knowledge_categories":
+		common["knowledgeBaseId"] = "base-1"
+		common["name"] = "Category"
+		common["alias"] = "category"
+		common["annotationRule"] = ""
+		common["explanationPrompt"] = ""
+		common["colorValue"] = 0
+		common["autoAnnotate"] = true
+		common["isDefault"] = true
+		common["enabled"] = true
+	case "knowledge_entries":
+		common["knowledgeBaseId"] = "base-1"
+		common["categoryId"] = "category-1"
+		common["title"] = "Entry"
+		common["content"] = ""
+		common["enabled"] = true
+	case "knowledge_sources":
+		common["knowledgeBaseId"] = "base-1"
+		common["entryId"] = "entry-1"
+		common["title"] = "Source"
+	case "knowledge_explanations":
+		common["knowledgeBaseId"] = "base-1"
+		common["entryId"] = "entry-1"
+		common["title"] = "Explanation"
+		common["content"] = "Content"
+	case "knowledge_settings":
+		return map[string]interface{}{"id": id, "updatedAt": timestamp}
+	}
+	return common
 }
