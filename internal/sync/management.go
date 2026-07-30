@@ -301,16 +301,12 @@ func (s *Service) PreviewPurge(userID int64, selector PurgeSelector, expectedRev
 
 func (s *Service) previewPurgeDB(db *gorm.DB, userID int64, selector PurgeSelector, meta database.SyncMetadata) (PurgePreview, error) {
 	preview := PurgePreview{Selector: selector, Generation: metadataGeneration(meta), IndexRevision: meta.IndexRevision}
-	records := scopedRecords(db.Model(&database.SyncRecord{}), userID, selector)
-	if err := records.Count(&preview.RecordCount).Error; err != nil {
-		return preview, err
-	}
-	settingsReferenced, err := knowledgeSettingsReferencesPurgedBase(db, userID, selector)
+	records, err := purgeRecords(db, userID, selector)
 	if err != nil {
 		return preview, err
 	}
-	if settingsReferenced {
-		preview.RecordCount++
+	if err := records.Count(&preview.RecordCount).Error; err != nil {
+		return preview, err
 	}
 	changeCount, err := countScopedChanges(db, userID, selector)
 	if err != nil {
@@ -354,6 +350,15 @@ func scopedRecords(db *gorm.DB, userID int64, selector PurgeSelector) *gorm.DB {
 	return db
 }
 
+func purgeRecords(db *gorm.DB, userID int64, selector PurgeSelector) (*gorm.DB, error) {
+	records := scopedRecords(db.Model(&database.SyncRecord{}), userID, selector)
+	referenced, err := knowledgeSettingsReferencesPurgedBase(db, userID, selector)
+	if err != nil || !referenced {
+		return records, err
+	}
+	return records.Or("user_id = ? AND table_name = ? AND record_id = ?", userID, "knowledge_settings", "global"), nil
+}
+
 func scopedTableChanges(db *gorm.DB, userID int64, selector PurgeSelector) *gorm.DB {
 	query := db.Model(&database.SyncChange{}).Where("user_id = ?", userID)
 	if selector.Type == "all" {
@@ -384,8 +389,8 @@ func scopedObjectChangeIDs(db *gorm.DB, userID int64, selector PurgeSelector) ([
 		return nil, err
 	}
 	ids := historicalObjectChangeIDs(changes, selector.ObjectID)
-	settingsReferenced, err := knowledgeSettingsReferencesPurgedBase(db, userID, selector)
-	if err != nil || !settingsReferenced {
+	referenced, err := knowledgeSettingsReferencesPurgedBase(db, userID, selector)
+	if err != nil || !referenced {
 		return ids, err
 	}
 	var settingsIDs []int64
@@ -524,8 +529,7 @@ func (s *Service) PurgeIdempotent(userID int64, requestID string, bodyHash []byt
 			}
 			meta.LastSeq, meta.MinAvailableSeq = 0, 0
 		} else {
-			records := scopedRecords(tx.Model(&database.SyncRecord{}), userID, selector)
-			settingsReferenced, err := knowledgeSettingsReferencesPurgedBase(tx, userID, selector)
+			records, err := purgeRecords(tx, userID, selector)
 			if err != nil {
 				return err
 			}
@@ -545,15 +549,6 @@ func (s *Service) PurgeIdempotent(userID int64, requestID string, bodyHash []byt
 			}
 			if err := records.Delete(&database.SyncRecord{}).Error; err != nil {
 				return err
-			}
-			if settingsReferenced {
-				key := "user_id = ? AND table_name = ? AND record_id = ?"
-				if err := tx.Where(key, userID, "knowledge_settings", "global").Delete(&database.SyncRecordBlob{}).Error; err != nil {
-					return err
-				}
-				if err := tx.Where(key, userID, "knowledge_settings", "global").Delete(&database.SyncRecord{}).Error; err != nil {
-					return err
-				}
 			}
 			meta.MinAvailableSeq = meta.LastSeq
 		}

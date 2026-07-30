@@ -131,6 +131,11 @@ func TestValidateKnowledgeChanges(t *testing.T) {
 			t.Errorf("validateChange(%s) error = %v", table, err)
 		}
 	}
+	legacyCategory := validKnowledgeData("knowledge_categories", "legacy-category", now)
+	legacyCategory["isDefault"] = true
+	if err := validateChange(ChangeRecord{ChangeID: "legacy-category", Table: "knowledge_categories", Op: "upsert", RecordID: "legacy-category", Data: rawJSON(t, legacyCategory), ClientCreatedAt: now}); err != nil {
+		t.Fatalf("validateChange rejected legacy category isDefault: %v", err)
+	}
 
 	for _, knowledgeBaseID := range []interface{}{nil, "", 1, strings.Repeat("x", maxRecordIDLength+1)} {
 		data := validKnowledgeData("knowledge_entries", "entry-1", now)
@@ -187,6 +192,7 @@ func TestValidateKnowledgeChanges(t *testing.T) {
 		{table: "knowledge_bases", field: "createdAt", value: "today"},
 		{table: "knowledge_categories", field: "alias", value: "Bad Alias"},
 		{table: "knowledge_categories", field: "autoAnnotate", value: "true"},
+		{table: "knowledge_categories", field: "isDefault", value: "true"},
 		{table: "knowledge_categories", field: "colorValue", value: true},
 		{table: "knowledge_entries", field: "categoryId", value: 1},
 		{table: "knowledge_entries", field: "title", value: nil},
@@ -216,6 +222,17 @@ func TestKnowledgeBatchValidatesFinalProjectionRegardlessOfOrder(t *testing.T) {
 	}
 	if _, err := svc.UploadChanges(42, changes); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLegacyKnowledgeSettingsDoNotValidateDefaultRelationship(t *testing.T) {
+	_, svc, now := newManagementTestService(t)
+	changes := []ChangeRecord{
+		{ChangeID: "settings", Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, map[string]interface{}{"id": "global", "defaultKnowledgeBaseId": "missing-base", "defaultCategoryId": "missing-category", "updatedAt": now.Format(time.RFC3339Nano)}), ClientCreatedAt: now},
+		{ChangeID: "base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-1", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-1", now)), ClientCreatedAt: now},
+	}
+	if _, err := svc.UploadChanges(42, changes); err != nil {
+		t.Fatalf("UploadChanges rejected legacy settings relationship: %v", err)
 	}
 }
 
@@ -263,26 +280,30 @@ func TestKnowledgeBatchRejectsUnapplicableFinalProjection(t *testing.T) {
 	}
 }
 
-func TestKnowledgeObjectPurgeRemovesSettingsReferencingPurgedBase(t *testing.T) {
+func TestKnowledgeObjectPurgeRemovesLegacySettingsReferencingPurgedBase(t *testing.T) {
 	db, svc, now := newManagementTestService(t)
 	changes := []ChangeRecord{
 		{ChangeID: "base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-1", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-1", now)), ClientCreatedAt: now},
 		{ChangeID: "category", Table: "knowledge_categories", Op: "upsert", RecordID: "category-1", Data: rawJSON(t, validKnowledgeData("knowledge_categories", "category-1", now)), ClientCreatedAt: now},
-		{ChangeID: "settings", Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, map[string]interface{}{"id": "global", "defaultKnowledgeBaseId": "base-1", "defaultCategoryId": "category-1", "updatedAt": now.Format(time.RFC3339Nano)}), ClientCreatedAt: now},
+		{ChangeID: "settings-old", Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, map[string]interface{}{"id": "global", "defaultKnowledgeBaseId": "base-2", "defaultCategoryId": "category-2", "updatedAt": now.Format(time.RFC3339Nano)}), ClientCreatedAt: now},
+		{ChangeID: "settings-current", Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, map[string]interface{}{"id": "global", "defaultKnowledgeBaseId": "base-1", "defaultCategoryId": "category-1", "updatedAt": now.Format(time.RFC3339Nano)}), ClientCreatedAt: now},
 		{ChangeID: "other-base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-2", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-2", now)), ClientCreatedAt: now},
 	}
 	if _, err := svc.UploadChanges(42, changes); err != nil {
 		t.Fatal(err)
 	}
+	if err := db.Create(&database.SyncRecordBlob{UserID: 42, TableName: "knowledge_settings", RecordID: "global", SHA256: strings.Repeat("a", 64)}).Error; err != nil {
+		t.Fatal(err)
+	}
 	selector := PurgeSelector{Type: "object", Category: "knowledge", ObjectID: "base-1"}
-	preview, err := svc.PreviewPurge(42, selector, 4)
+	preview, err := svc.PreviewPurge(42, selector, 5)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if preview.RecordCount != 3 || preview.ChangeCount != 3 {
-		t.Fatalf("preview = %+v, want 3 records and 3 changes", preview)
+	if preview.RecordCount != 3 || preview.ChangeCount != 4 || preview.BlobRefCount != 1 || preview.ReleasedBlobCandidates != 1 {
+		t.Fatalf("preview = %+v, want 3 records, 4 changes, and the settings blob ref", preview)
 	}
-	if _, err := svc.PurgeIdempotent(42, "44444444444444444444444444444444", make([]byte, 32), "POST /sync/manage/purge", "device", selector, 4, 1); err != nil {
+	if _, err := svc.PurgeIdempotent(42, "44444444444444444444444444444444", make([]byte, 32), "POST /sync/manage/purge", "device", selector, 5, 1); err != nil {
 		t.Fatal(err)
 	}
 	var count int64
@@ -290,7 +311,7 @@ func TestKnowledgeObjectPurgeRemovesSettingsReferencingPurgedBase(t *testing.T) 
 		t.Fatal(err)
 	}
 	if count != 1 {
-		t.Fatalf("remaining knowledge projections = %d, want only the unrelated base", count)
+		t.Fatalf("remaining knowledge projections = %d, want only unrelated base", count)
 	}
 	var remaining database.SyncRecord
 	if err := db.Where("user_id = ? AND category = ?", 42, "knowledge").First(&remaining).Error; err != nil {
@@ -304,6 +325,47 @@ func TestKnowledgeObjectPurgeRemovesSettingsReferencingPurgedBase(t *testing.T) 
 	}
 	if count != 0 {
 		t.Fatalf("remaining knowledge settings history = %d, want 0", count)
+	}
+	if err := db.Model(&database.SyncRecordBlob{}).Where("user_id = ? AND table_name = ?", 42, "knowledge_settings").Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("remaining knowledge settings blob refs = %d, want 0", count)
+	}
+}
+
+func TestKnowledgeObjectPurgePreservesLegacySettingsReferencingOtherBase(t *testing.T) {
+	db, svc, now := newManagementTestService(t)
+	changes := []ChangeRecord{
+		{ChangeID: "base", Table: "knowledge_bases", Op: "upsert", RecordID: "base-1", Data: rawJSON(t, validKnowledgeData("knowledge_bases", "base-1", now)), ClientCreatedAt: now},
+		{ChangeID: "category", Table: "knowledge_categories", Op: "upsert", RecordID: "category-1", Data: rawJSON(t, validKnowledgeData("knowledge_categories", "category-1", now)), ClientCreatedAt: now},
+		{ChangeID: "settings", Table: "knowledge_settings", Op: "upsert", RecordID: "global", Data: rawJSON(t, map[string]interface{}{"id": "global", "defaultKnowledgeBaseId": "base-2", "defaultCategoryId": "category-2", "updatedAt": now.Format(time.RFC3339Nano)}), ClientCreatedAt: now},
+	}
+	if _, err := svc.UploadChanges(42, changes); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Create(&database.SyncRecordBlob{UserID: 42, TableName: "knowledge_settings", RecordID: "global", SHA256: strings.Repeat("b", 64)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	selector := PurgeSelector{Type: "object", Category: "knowledge", ObjectID: "base-1"}
+	preview, err := svc.PreviewPurge(42, selector, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.RecordCount != 2 || preview.ChangeCount != 2 || preview.BlobRefCount != 0 {
+		t.Fatalf("preview = %+v, want only the base and category", preview)
+	}
+	if _, err := svc.PurgeIdempotent(42, "55555555555555555555555555555555", make([]byte, 32), "POST /sync/manage/purge", "device", selector, 3, 1); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	for _, model := range []interface{}{&database.SyncRecord{}, &database.SyncChange{}, &database.SyncRecordBlob{}} {
+		if err := db.Model(model).Where("user_id = ? AND table_name = ?", 42, "knowledge_settings").Count(&count).Error; err != nil {
+			t.Fatal(err)
+		}
+		if count != 1 {
+			t.Fatalf("remaining %T settings rows = %d, want 1", model, count)
+		}
 	}
 }
 
@@ -451,7 +513,6 @@ func validKnowledgeData(table, id string, now time.Time) map[string]interface{} 
 		common["explanationPrompt"] = ""
 		common["colorValue"] = 0
 		common["autoAnnotate"] = true
-		common["isDefault"] = true
 		common["enabled"] = true
 	case "knowledge_entries":
 		common["knowledgeBaseId"] = "base-1"

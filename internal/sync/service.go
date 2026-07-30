@@ -451,7 +451,12 @@ func validateKnowledgeCategory(data map[string]interface{}) error {
 			return err
 		}
 	}
-	return validateKnowledgeCommonFields(data, "knowledge_categories", []string{"autoAnnotate", "isDefault", "enabled"}, []string{"colorValue", "sortOrder"})
+	if value, exists := data["isDefault"]; exists {
+		if _, ok := value.(bool); !ok {
+			return errors.New("knowledge_categories data.isDefault must be a bool when present")
+		}
+	}
+	return validateKnowledgeCommonFields(data, "knowledge_categories", []string{"autoAnnotate", "enabled"}, []string{"colorValue", "sortOrder"})
 }
 
 func validateKnowledgeEntry(data map[string]interface{}) error {
@@ -592,7 +597,6 @@ func validateKnowledgeProjection(db *gorm.DB, userID int64) error {
 	bases := make(map[string]map[string]interface{})
 	categories := make(map[string]map[string]interface{})
 	entries := make(map[string]map[string]interface{})
-	settings := make([]map[string]interface{}, 0, 1)
 	children := make([]database.SyncRecord, 0, len(records))
 	for _, record := range records {
 		var data map[string]interface{}
@@ -615,8 +619,6 @@ func validateKnowledgeProjection(db *gorm.DB, userID int64) error {
 			children = append(children, record)
 		case "knowledge_sources", "knowledge_explanations":
 			children = append(children, record)
-		case "knowledge_settings":
-			settings = append(settings, data)
 		}
 	}
 
@@ -658,19 +660,6 @@ func validateKnowledgeProjection(db *gorm.DB, userID int64) error {
 		entry, ok := entries[entryID]
 		if !ok || entry["knowledgeBaseId"] != baseID {
 			return fmt.Errorf("%s %s entry does not belong to base %s", record.TableName, record.RecordID, baseID)
-		}
-	}
-	for _, data := range settings {
-		baseID, _ := data["defaultKnowledgeBaseId"].(string)
-		categoryID, _ := data["defaultCategoryId"].(string)
-		if baseID == "" && categoryID == "" {
-			continue
-		}
-		base, baseOK := bases[baseID]
-		category, categoryOK := categories[categoryID]
-		if !baseOK || !categoryOK || category["knowledgeBaseId"] != baseID ||
-			base["enabled"] != true || category["enabled"] != true || category["autoAnnotate"] != true {
-			return errors.New("knowledge settings default category is not an enabled auto-annotate category in an enabled base")
 		}
 	}
 	return nil
